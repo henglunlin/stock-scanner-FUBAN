@@ -5,6 +5,7 @@ import copy
 import time
 import gc
 import requests
+import base64
 from html import escape
 from io import BytesIO
 from datetime import datetime, date, timedelta
@@ -19,12 +20,15 @@ try:
 except ImportError:
     yf = None
 
+# ===== 富邦 API 引入 =====
+try:
+    from fubon_neo.sdk import FubonSDK, Mode
+except ImportError:
+    st.error("請先安裝富邦 API 套件：執行 `pip install fubon-neo`")
+    st.stop()
+
 # ===== Streamlit UI 基本設定（一定要放最前面）=====
 st.set_page_config(layout="wide")
-
-if yf is None:
-    st.error("請先安裝 yfinance 套件：執行 `pip install yfinance`")
-    st.stop()
 
 # ===== 常數設定 =====
 REFRESH_SEC = 60
@@ -207,7 +211,49 @@ def check_telegram_push_command():
         pass
     return False
 
-# ===== Yahoo Finance / yfinance 行情工具 =====
+# ===== Fubon API 行情工具 =====
+@st.cache_data(ttl=REFRESH_SEC)
+def download_stock_data(symbol: str, _sdk):
+    """取得歷史日 K 線資料"""
+    if _sdk is None:
+        raise ValueError("富邦 API 尚未連線")
+        
+    fubon_symbol = str(symbol).split(".")[0] # 去除 .TW 後綴
+    end_date = date.today()
+    start_date = end_date - timedelta(days=90)
+    
+    try:
+        res = _sdk.marketdata.rest_client.stock.historical.candles(**{
+            "symbol": fubon_symbol,
+            "from": start_date.strftime("%Y-%m-%d"),
+            "to": end_date.strftime("%Y-%m-%d"),
+            "timeframe": "D",
+            "fields": "open,high,low,close,volume"
+        })
+        
+        if res and "data" in res and isinstance(res["data"], list):
+            df = pd.DataFrame(res["data"])
+            if not df.empty:
+                df.rename(columns={
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume"
+                }, inplace=True)
+                
+                if "date" in df.columns:
+                    df = df.sort_values("date").reset_index(drop=True)
+                    
+                for col in ["Open", "High", "Low", "Close", "Volume"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                    
+                return df
+    except Exception as e:
+        print(f"富邦 API 抓取 {fubon_symbol} 歷史 K 線失敗: {e}")
+        
+    return pd.DataFrame()
+
 def normalize_ohlc(df):
     if df is None or df.empty:
         return pd.DataFrame()
@@ -215,6 +261,26 @@ def normalize_ohlc(df):
     if set(required_cols).issubset(df.columns):
         return df[required_cols].copy()
     return pd.DataFrame()
+
+def get_last_price(symbol, df, _sdk):
+    """優先透過 snapshot 取得即時報價，若無則退回 K 線最新收盤價"""
+    fubon_symbol = str(symbol).split(".")[0]
+    
+    if _sdk is not None:
+        try:
+            res = _sdk.marketdata.rest_client.stock.snapshot.quotes(symbol=fubon_symbol)
+            if res and "data" in res and len(res["data"]) > 0:
+                quote = res["data"][0]
+                price = quote.get("closePrice") or quote.get("tradePrice") or quote.get("close")
+                if price is not None and pd.notna(price):
+                    return float(price)
+        except Exception:
+            pass
+
+    if not df.empty and "Close" in df.columns:
+        return float(df["Close"].iloc[-1])
+        
+    raise ValueError("無法取得即時價格")
 
 @st.cache_data(ttl=86400)
 def load_stock_name_map(file_path: str = STOCK_NAME_FILE) -> dict:
@@ -283,24 +349,67 @@ def download_stock_data_yfinance(symbol: str):
         return pd.DataFrame()
 
 def resolve_price_source(now_dt=None) -> str:
-    """固定使用 Yfinance。"""
-    return "Yfinance"
+    mode = st.session_state.get("price_source_mode", "自動")
+    if mode in ["WebSocket", "Yfinance"]:
+        return mode
+    if now_dt is None:
+        now_dt = datetime.now(ZoneInfo("Asia/Taipei"))
+    cutoff = now_dt.replace(hour=AUTO_YFINANCE_AFTER_HOUR, minute=AUTO_YFINANCE_AFTER_MINUTE, second=0, microsecond=0)
+    return "Yfinance" if now_dt >= cutoff else "WebSocket"
 
 def render_price_source_selector(now_dt):
-    """固定使用 Yfinance，不提供資料來源切換。"""
-    return "Yfinance"
+    active_source = resolve_price_source(now_dt)
+    source_mode = st.session_state.get("price_source_mode", "自動")
+    with st.sidebar.expander("🧭 價格來源模式", expanded=True):
+        st.markdown(
+            f"""
+            <div style="background:#2f4563; color:#35a8ff; border-radius:8px; padding:14px 16px; line-height:1.8; font-weight:600;">
+            目前價格模式：{source_mode}；<br>
+            13:30 後使用 yfinance；若為昨收則抓 Yahoo TW<br>
+            實際使用：{active_source}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("WebSocket", use_container_width=True, key="price_source_ws_btn"):
+                st.session_state.price_source_mode = "WebSocket"
+                st.cache_data.clear(); st.rerun()
+        with c2:
+            if st.button("Yfinance", use_container_width=True, key="price_source_yf_btn"):
+                st.session_state.price_source_mode = "Yfinance"
+                st.cache_data.clear(); st.rerun()
+        if st.button("恢復自動模式", use_container_width=True, key="price_source_auto_btn"):
+            st.session_state.price_source_mode = "自動"
+            st.cache_data.clear(); st.rerun()
+    with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
+        st.write(f"price_source_mode = {source_mode}")
+        st.write(f"active_source = {active_source}")
+        st.write(f"fubon_logged_in = {st.session_state.get('fubon_logged_in', False)}")
+        st.write(f"yfinance_installed = {yf is not None}")
+    return active_source
 
-def download_stock_data_by_source(symbol: str, _sdk=None, source: str = "Yfinance"):
-    """固定使用 yfinance / Yahoo Finance 取得日 K。"""
-    return download_stock_data_yfinance(symbol)
+def download_stock_data_by_source(symbol: str, _sdk, source: str):
+    if source == "Yfinance":
+        df = download_stock_data_yfinance(symbol)
+        if not df.empty:
+            return df
+        if _sdk is not None:
+            return download_stock_data(symbol, _sdk)
+        return pd.DataFrame()
+    return download_stock_data(symbol, _sdk)
 
-def get_last_price_by_source(symbol: str, df, _sdk=None, source: str = "Yfinance"):
-    """固定使用 yfinance 日 K 最新 Close 作為價格。"""
-    if df is not None and not df.empty and "Close" in df.columns:
-        price = pd.to_numeric(df["Close"], errors="coerce").dropna()
-        if not price.empty:
-            return float(price.iloc[-1])
-    raise ValueError("yfinance / Yahoo TW 無法取得價格")
+def get_last_price_by_source(symbol: str, df, _sdk, source: str):
+    if source == "Yfinance":
+        if df is not None and not df.empty and "Close" in df.columns:
+            price = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            if not price.empty:
+                return float(price.iloc[-1])
+        if _sdk is not None:
+            return get_last_price(symbol, df, _sdk)
+        raise ValueError("yfinance / Yahoo TW 無法取得價格")
+    return get_last_price(symbol, df, _sdk)
 
 def normalize_rows_for_excel(rows):
     columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "MA位置", "MA排列", "K值", "D值", "KD訊號", "跳空訊號", "訊號類型", "來源"]
@@ -356,12 +465,21 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
     return output.getvalue()
 
 @st.cache_data(ttl=86400)
-def get_stock_name(symbol: str, _sdk=None) -> str:
-    """股票名稱固定從 TWstocklistname2.txt 讀取；找不到則回傳股票代碼。"""
+def get_stock_name(symbol: str, _sdk) -> str:
     name_map = load_stock_name_map(STOCK_NAME_FILE)
     if symbol in name_map:
         return name_map[symbol]
-    return str(symbol).split(".")[0]
+        
+    fubon_symbol = str(symbol).split(".")[0]
+    if _sdk is not None:
+        try:
+            res = _sdk.marketdata.rest_client.stock.historical.stats(symbol=fubon_symbol)
+            if res and "name" in res:
+                return res["name"].strip()
+        except Exception:
+            pass
+            
+    return fubon_symbol
 
 # ===== 輔助工具函式 =====
 def make_anchor_id(group_name: str) -> str:
@@ -369,8 +487,8 @@ def make_anchor_id(group_name: str) -> str:
     return f"group-{anchor}"
 
 def yahoo_quote_url(symbol: str) -> str:
-    quote_symbol = str(symbol).split(".")[0]
-    return f"https://tw.stock.yahoo.com/quote/{quote_symbol}"
+    fubon_symbol = str(symbol).split(".")[0]
+    return f"https://tw.stock.yahoo.com/quote/{fubon_symbol}"
 
 def normalize_symbols_from_text(text: str):
     if not text:
@@ -483,6 +601,8 @@ if "stock_groups" not in st.session_state:
 
 if FORCE_SCAN_ALL_STOCKS_FROM_FILE:
     st.session_state.stock_groups = load_all_stock_group_from_file()
+if "price_source_mode" not in st.session_state:
+    st.session_state.price_source_mode = "自動"
 if "scan_enabled" not in st.session_state:
     st.session_state.scan_enabled = False
 if "scan_requested" not in st.session_state:
@@ -494,7 +614,11 @@ if "group_editor_unlocked" not in st.session_state:
 if "editing_mode" not in st.session_state:
     st.session_state.editing_mode = False
 
+if "fubon_sdk" not in st.session_state:
+    st.session_state.fubon_sdk = None
 
+if "fubon_logged_in" not in st.session_state:
+    st.session_state.fubon_logged_in = False
 
 if "selected_group_editor" not in st.session_state:
     group_names_init = list(st.session_state.stock_groups.keys())
@@ -543,6 +667,57 @@ def sync_editor_fields_from_selected_group():
     st.session_state.editing_mode = False
 
 # ===== UI 元件 =====
+def render_fubon_login():
+    st.sidebar.markdown("## 🔑 富邦 API 設定 (Fubon Neo)")
+    
+    # 已經登入成功就顯示狀態與登出按鈕
+    if st.session_state.fubon_logged_in:
+        st.sidebar.success("✅ 富邦 API 已成功連線")
+        if st.sidebar.button("登出 / 重新連線", use_container_width=True):
+            st.session_state.fubon_sdk = None
+            st.session_state.fubon_logged_in = False
+            st.rerun()
+        return
+
+    # 嘗試從 Secrets 讀取憑證檔案 (現在只需要讀取 Base64 字串)
+    try:
+        fubon_secrets = st.secrets["fubon"]
+        pfx_base64 = fubon_secrets["pfx_base64"]
+    except KeyError:
+        st.sidebar.error("❌ 找不到 Streamlit Secrets 中的 pfx_base64 憑證資料。")
+        return
+
+    # 在側邊欄顯示輸入框，讓使用者每次手動輸入完整登入資訊
+    st.sidebar.info("請輸入富邦證券登入資訊")
+    f_id = st.sidebar.text_input("身分證字號", key="f_id_input")
+    f_pw = st.sidebar.text_input("富邦登入密碼", key="f_pw_input", type="password")
+    f_cert_pw = st.sidebar.text_input("憑證密碼", key="f_cert_pw_input", type="password")
+
+    if st.sidebar.button("連線行情伺服器", use_container_width=True):
+        if not f_id or not f_pw or not f_cert_pw:
+            st.sidebar.warning("請填寫完整的身分證字號與密碼！")
+        else:
+            try:
+                # 1. 將 Base64 文字還原為暫存的 .pfx 檔案
+                temp_cert_path = "temp_cloud_cert.pfx"
+                with open(temp_cert_path, "wb") as f:
+                    f.write(base64.b64decode(pfx_base64))
+                    
+                # 2. 執行登入 (合併使用者輸入的帳密與雲端的檔案)
+                with st.spinner("連線富邦 API 中..."):
+                    sdk = FubonSDK()
+                    # 確保傳入的身分證字號英文是大寫 (.upper())
+                    sdk.login(f_id.strip().upper(), f_pw, temp_cert_path, f_cert_pw)
+                    sdk.init_realtime()
+                    st.session_state.fubon_sdk = sdk
+                    st.session_state.fubon_logged_in = True
+                    
+                st.sidebar.success("✅ 富邦 API 連線成功！")
+                st.rerun()
+                
+            except Exception as e:
+                st.sidebar.error(f"❌ 登入失敗: {e}")
+
 def render_group_editor_lock():
     st.sidebar.markdown("## 🔐 分組編輯鎖")
     if st.session_state.group_editor_unlocked:
@@ -887,13 +1062,15 @@ def render_summary_dashboard(group_up_summary, rise_threshold):
 # ==================== 主畫面開始 ====================
 title_col, scan_progress_col = st.columns([8, 1])
 with title_col:
-    st.title("📊 TWstocklistname2 全股票訊號掃描器")
+    st.title("📊 台股票訊號掃描器VerFB-告訴我你會買日月光")
 with scan_progress_col:
     scan_progress_card_placeholder = st.empty()
 render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
 st.markdown('<div id="dashboard-top"></div>', unsafe_allow_html=True)
 
 gc.collect()
+
+render_fubon_login()
 
 tw_now = datetime.now(ZoneInfo("Asia/Taipei"))
 active_price_source = render_price_source_selector(tw_now)
@@ -960,9 +1137,12 @@ if include_kd_signal_filter:
 if not selected_signal_names:
     st.warning("請至少勾選一種掃描訊號，否則不會列出訊號股票。")
 
-# 依價格來源檢查必要套件
-if yf is None:
-    st.warning("⚠️ 目前版本固定使用 Yfinance，請先安裝套件：pip install yfinance")
+# 依價格來源檢查必要套件與登入狀態
+if active_price_source == "WebSocket" and not st.session_state.fubon_logged_in:
+    st.warning("⚠️ 目前價格來源為 WebSocket，請先至左側面板連線「富邦 API」，才能開始抓取行情資料。")
+    st.stop()
+if active_price_source == "Yfinance" and yf is None:
+    st.warning("⚠️ 目前價格來源為 Yfinance，請先安裝套件：pip install yfinance")
     st.stop()
 
 should_run_scan = bool(st.session_state.pop("scan_requested", False))
@@ -1044,12 +1224,12 @@ if should_run_scan:
                 render_scan_progress_card(scan_progress_card_placeholder, progress_pct, "掃描進度")
                 progress_bar.progress(progress_value, text=f"掃描進度：{progress_pct:.1f}%（{processed_count}/{scan_total_count}：{symbol}）")
             try:
-                df = download_stock_data_by_source(symbol)
+                df = download_stock_data_by_source(symbol, st.session_state.fubon_sdk, active_price_source)
                 df = normalize_ohlc(df)
                 if df.empty: raise ValueError("無效的 K 線資料")
 
-                price = get_last_price_by_source(symbol, df)
-                stock_name = get_stock_name(symbol)
+                price = get_last_price_by_source(symbol, df, st.session_state.fubon_sdk, active_price_source)
+                stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
                 data = compute_indicators(df, price)
 
                 signal_types = []
@@ -1111,7 +1291,7 @@ if should_run_scan:
                 error_count += 1
                 if not show_only_signal_rows:
                     rows.append({
-                        "代碼": symbol, "代碼網址": "", "股票名稱": get_stock_name(symbol),
+                        "代碼": symbol, "代碼網址": "", "股票名稱": get_stock_name(symbol, st.session_state.fubon_sdk),
                         "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-",
                         "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-",
                         "KD訊號": "-", "跳空訊號": str(e), "訊號類型": "錯誤", "來源": active_price_source,
