@@ -1086,32 +1086,33 @@ def render_summary_dashboard(group_up_summary, rise_threshold):
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 # ==================== 主畫面開始 ====================
-if os.path.exists(APP_LOGO):
-    title_icon_col, title_text_col = st.columns([0.45, 8])
-    with title_icon_col:
+# 修正重點：原本後面有 `with scan_progress_col:`，但前面沒有建立 scan_progress_col，
+# 因此部署後會出現 NameError。這裡統一建立：LOGO欄 / 標題欄 / 掃描進度欄。
+st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
+
+title_icon_col, title_text_col, scan_progress_col = st.columns([0.45, 7.55, 1])
+
+with title_icon_col:
+    if os.path.exists(APP_LOGO):
         st.image(APP_LOGO, width=58)
-    with title_text_col:
-        st.markdown(
-            """
-            <h1 style="margin:0; padding-top:4px; font-size:42px; font-weight:800; line-height:1.2;">
-                台股掃描器 - 告訴我你會買日月光
-            </h1>
-            """,
-            unsafe_allow_html=True,
-        )
-else:
+    else:
+        st.markdown('<div style="font-size:42px; line-height:1.2;">📊</div>', unsafe_allow_html=True)
+
+with title_text_col:
     st.markdown(
         """
         <h1 style="margin:0; padding-top:4px; font-size:42px; font-weight:800; line-height:1.2;">
-            📊 台股掃描器 - 告訴我你會買日月光
+            台股掃描器 - 告訴我你會買日月光
         </h1>
         """,
         unsafe_allow_html=True,
     )
+
 with scan_progress_col:
     scan_progress_card_placeholder = st.empty()
+
 render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
-st.markdown('<div id="dashboard-top"></div>', unsafe_allow_html=True)
+st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
 
 gc.collect()
 
