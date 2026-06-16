@@ -1086,8 +1086,7 @@ def render_summary_dashboard(group_up_summary, rise_threshold):
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 # ==================== 主畫面開始 ====================
-# 修正重點：原本後面有 `with scan_progress_col:`，但前面沒有建立 scan_progress_col，
-# 因此部署後會出現 NameError。這裡統一建立：LOGO欄 / 標題欄 / 掃描進度欄。
+# 建立：Logo 欄 / 標題欄 / 右上掃描進度欄，避免 scan_progress_col 未定義。
 st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 
 title_icon_col, title_text_col, scan_progress_col = st.columns([0.45, 7.55, 1])
@@ -1420,7 +1419,10 @@ if all_signal_rows:
     signal_display_df["成交量(張)"] = signal_display_df["成交量(張)"].apply(format_volume)
     signal_display_df["跳空訊號"] = signal_display_df["跳空訊號"].apply(format_gap)
     signal_display_df["代碼"] = signal_display_df["代碼網址"]
-    signal_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    for col in ["MA位置", "MA排列"]:
+        if col not in signal_display_df.columns:
+            signal_display_df[col] = "-"
+    signal_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
     st.dataframe(signal_display_df[signal_columns], use_container_width=True, column_config={
         "代碼": st.column_config.LinkColumn("代碼", help="點擊前往台股 Yahoo", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
         "股票名稱": st.column_config.TextColumn("股票名稱")
@@ -1455,6 +1457,9 @@ if all_signal_rows:
                 bucket_display_df["成交量(張)"] = bucket_display_df["成交量(張)"].apply(format_volume)
                 bucket_display_df["跳空訊號"] = bucket_display_df["跳空訊號"].apply(format_gap)
                 bucket_display_df["代碼"] = bucket_display_df["代碼網址"]
+                for col in ["MA位置", "MA排列"]:
+                    if col not in bucket_display_df.columns:
+                        bucket_display_df[col] = "-"
                 st.dataframe(bucket_display_df[signal_columns], use_container_width=True, column_config={
                     "代碼": st.column_config.LinkColumn("代碼", help="點擊前往台股 Yahoo", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
                     "股票名稱": st.column_config.TextColumn("股票名稱")
