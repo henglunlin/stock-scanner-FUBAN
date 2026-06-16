@@ -1060,12 +1060,35 @@ def render_summary_dashboard(group_up_summary, rise_threshold):
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 # ==================== 主畫面開始 ====================
-title_col, scan_progress_col = st.columns([8, 1])
-with title_col:
-    st.title("📊 台股票訊號掃描器VerFB-告訴我你會買日月光")
+
+APP_LOGO = "jerry.png"
+
+title_icon_col, title_text_col, scan_progress_col = st.columns([0.35, 7.65, 1])
+
+with title_icon_col:
+    st.image(APP_LOGO, width=58)
+
+with title_text_col:
+    st.markdown(
+        """
+        <h1 style="
+            margin: 0;
+            padding-top: 4px;
+            font-size: 42px;
+            font-weight: 800;
+            line-height: 1.2;
+        ">
+            股票監控面板 - 告訴我你會買日月光
+        </h1>
+        """,
+        unsafe_allow_html=True
+    )
+
 with scan_progress_col:
     scan_progress_card_placeholder = st.empty()
+
 render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
+
 st.markdown('<div id="dashboard-top"></div>', unsafe_allow_html=True)
 
 gc.collect()
