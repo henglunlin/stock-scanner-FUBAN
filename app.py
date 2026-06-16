@@ -42,6 +42,7 @@ FORCE_SCAN_ALL_STOCKS_FROM_FILE = True
 ALL_STOCK_GROUP_NAME = "TWstocklistname2 全股票掃描"
 AUTO_YFINANCE_AFTER_HOUR = 13
 AUTO_YFINANCE_AFTER_MINUTE = 30
+APP_LOGO = "dog.jpg"
 
 # ===== Telegram 設定（請替換為你的資訊）=====
 TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
@@ -1085,9 +1086,28 @@ def render_summary_dashboard(group_up_summary, rise_threshold):
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 # ==================== 主畫面開始 ====================
-title_col, scan_progress_col = st.columns([8, 1])
-with title_col:
-    st.title("📊 TWstocklistname2 全股票訊號掃描器")
+if os.path.exists(APP_LOGO):
+    title_icon_col, title_text_col = st.columns([0.45, 8])
+    with title_icon_col:
+        st.image(APP_LOGO, width=58)
+    with title_text_col:
+        st.markdown(
+            """
+            <h1 style="margin:0; padding-top:4px; font-size:42px; font-weight:800; line-height:1.2;">
+                台股掃描器 - 告訴我你會買日月光
+            </h1>
+            """,
+            unsafe_allow_html=True,
+        )
+else:
+    st.markdown(
+        """
+        <h1 style="margin:0; padding-top:4px; font-size:42px; font-weight:800; line-height:1.2;">
+            📊 台股掃描器 - 告訴我你會買日月光
+        </h1>
+        """,
+        unsafe_allow_html=True,
+    )
 with scan_progress_col:
     scan_progress_card_placeholder = st.empty()
 render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
