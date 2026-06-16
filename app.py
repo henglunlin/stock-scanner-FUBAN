@@ -454,14 +454,18 @@ def apply_excel_fonts(workbook):
                     cell.font = Font(name=english_font_name)
 
 def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
+    """把 4 種訊號分開輸出成 4 個 Excel 分頁。"""
     gap_rows = signal_buckets.get("跳空", [])
-    golden_rows = signal_buckets.get("黃金交叉", []) + signal_buckets.get("即將黃金交叉", [])
+    golden_rows = signal_buckets.get("黃金交叉", [])
+    near_golden_rows = signal_buckets.get("即將黃金交叉", [])
     macd_rows = signal_buckets.get("MACD翻正", [])
+
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         normalize_rows_for_excel(gap_rows).to_excel(writer, sheet_name="跳空", index=False)
         normalize_rows_for_excel(golden_rows).to_excel(writer, sheet_name="黃金交叉", index=False)
-        normalize_rows_for_excel(macd_rows).to_excel(writer, sheet_name="MACD翻正", index=False)
+        normalize_rows_for_excel(near_golden_rows).to_excel(writer, sheet_name="即將黃金交叉", index=False)
+        normalize_rows_for_excel(macd_rows).to_excel(writer, sheet_name="MACD訊號", index=False)
         apply_excel_fonts(writer.book)
     output.seek(0)
     return output.getvalue()
@@ -1380,7 +1384,7 @@ with scan_action_placeholder.container():
         st.download_button("下載", data=excel_bytes, file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_signal_excel_btn")
     with bcol2:
         if st.button("推送到telegram", use_container_width=True, key="push_signal_excel_to_tg_btn"):
-            ok = send_telegram_document(excel_bytes, excel_filename, caption=f"TWstock 訊號掃描結果：跳空 / 黃金交叉 / MACD翻正｜成交量下限 {st.session_state.get('last_scan_result', {}).get('min_volume_lots', min_volume_lots)} 張｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
+            ok = send_telegram_document(excel_bytes, excel_filename, caption=f"TWstock 訊號掃描結果：跳空 / 黃金交叉 / 即將黃金交叉 / MACD訊號｜成交量下限 {st.session_state.get('last_scan_result', {}).get('min_volume_lots', min_volume_lots)} 張｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
             if ok:
                 st.success("已將 Excel 推送到 Telegram。")
 
@@ -1400,12 +1404,28 @@ if all_signal_rows:
         "代碼": st.column_config.LinkColumn("代碼", help="點擊前往台股 Yahoo", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
         "股票名稱": st.column_config.TextColumn("股票名稱")
     })
-    with st.expander("依訊號分類查看", expanded=True):
-        for sig_name, bucket_rows in signal_buckets.items():
-            if sig_name not in selected_signal_names:
-                continue
+    st.markdown("### 📑 依訊號分頁查看")
+
+    signal_tab_specs = [
+        ("跳空", "跳空"),
+        ("黃金交叉", "黃金交叉"),
+        ("即將黃金交叉", "即將黃金交叉"),
+        ("MACD 訊號", "MACD翻正"),
+    ]
+
+    tab_labels = []
+    for display_name, bucket_key in signal_tab_specs:
+        bucket_rows = signal_buckets.get(bucket_key, [])
+        unique_count = len(pd.DataFrame(bucket_rows).drop_duplicates(subset=["代碼"])) if bucket_rows else 0
+        tab_labels.append(f"{display_name}（{unique_count}）")
+
+    signal_tabs = st.tabs(tab_labels)
+    for tab, (display_name, bucket_key) in zip(signal_tabs, signal_tab_specs):
+        with tab:
+            bucket_rows = signal_buckets.get(bucket_key, [])
             unique_count = len(pd.DataFrame(bucket_rows).drop_duplicates(subset=["代碼"])) if bucket_rows else 0
-            st.markdown(f"#### {sig_name}（{unique_count} 檔）")
+            st.markdown(f"#### {display_name}（{unique_count} 檔）")
+
             if bucket_rows:
                 bucket_df = pd.DataFrame(bucket_rows).drop_duplicates(subset=["代碼"])
                 bucket_display_df = bucket_df.copy()
@@ -1419,7 +1439,7 @@ if all_signal_rows:
                     "股票名稱": st.column_config.TextColumn("股票名稱")
                 })
             else:
-                st.caption("目前沒有符合此訊號的股票。")
+                st.caption(f"目前沒有符合「{display_name}」的股票。")
 else:
     st.info("目前沒有掃描到符合勾選條件的股票。")
 
