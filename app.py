@@ -1061,7 +1061,7 @@ def render_summary_dashboard(group_up_summary, rise_threshold):
 
 # ==================== 主畫面開始 ====================
 
-APP_LOGO = "jerry.png"
+APP_LOGO = "jerry.jpg"
 
 title_icon_col, title_text_col, scan_progress_col = st.columns([0.35, 7.65, 1])
 
