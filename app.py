@@ -20,6 +20,8 @@ try:
 except ImportError:
     yf = None
 
+st.set_page_config(page_title="股票監控面板", layout="wide")
+	
 # ===== 富邦 API 引入 =====
 try:
     from fubon_neo.sdk import FubonSDK, Mode
@@ -31,7 +33,7 @@ except ImportError:
 st.set_page_config(layout="wide")
 
 # ===== 常數設定 =====
-REFRESH_SEC = 60
+REFRESH_SEC = 3
 ENABLE_GAP_SIGNAL = True
 GROUP_EDIT_PIN = "1219"
 GROUPS_FILE = "stock_groups.json"
