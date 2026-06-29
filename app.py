@@ -20,8 +20,6 @@ try:
 except ImportError:
     yf = None
 
-st.set_page_config(page_title="股票監控面板", layout="wide")
-	
 # ===== 富邦 API 引入 =====
 try:
     from fubon_neo.sdk import FubonSDK, Mode
@@ -596,6 +594,9 @@ def compact_name_list(names, max_show=3):
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = False
 
+if "refresh_sec" not in st.session_state:
+    st.session_state.refresh_sec = REFRESH_SEC
+
 if "tg_push_enabled" not in st.session_state:
     st.session_state.tg_push_enabled = False 
 
@@ -676,6 +677,22 @@ def sync_editor_fields_from_selected_group():
     st.session_state.editing_mode = False
 
 # ===== UI 元件 =====
+def render_auto_refresh_settings():
+    with st.sidebar.expander("🔄 自動刷新設定", expanded=True):
+        st.toggle(
+            "啟用自動刷新",
+            key="auto_refresh_enabled",
+            help="開啟後會依照下方秒數自動重新整理；分組編輯解鎖或編輯中會自動暫停。",
+        )
+        st.number_input(
+            "刷新秒數",
+            min_value=1,
+            max_value=300,
+            step=1,
+            key="refresh_sec",
+            help="自動刷新間隔秒數，預設 3 秒。",
+        )
+
 def render_fubon_login():
     st.sidebar.markdown("## 🔑 富邦 API 設定 (Fubon Neo)")
     
@@ -1121,6 +1138,7 @@ render_fubon_login()
 
 tw_now = datetime.now(ZoneInfo("Asia/Taipei"))
 active_price_source = render_price_source_selector(tw_now)
+render_auto_refresh_settings()
 
 if FORCE_SCAN_ALL_STOCKS_FROM_FILE:
     all_symbols_count = len(st.session_state.stock_groups.get(ALL_STOCK_GROUP_NAME, []))
@@ -1491,5 +1509,6 @@ for group_name, info in group_tables.items():
     st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
 
 if (st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode):
-    time.sleep(REFRESH_SEC)
+    refresh_sec = max(1, int(st.session_state.get("refresh_sec", REFRESH_SEC)))
+    time.sleep(refresh_sec)
     st.rerun()
