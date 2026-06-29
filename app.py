@@ -32,6 +32,7 @@ st.set_page_config(layout="wide")
 
 # ===== 常數設定 =====
 REFRESH_SEC = 3
+YFINANCE_HISTORY_CACHE_TTL_SEC = 60 * 60  # yfinance 今日以前歷史資料每小時更新一次
 ENABLE_GAP_SIGNAL = True
 GROUP_EDIT_PIN = "1219"
 GROUPS_FILE = "stock_groups.json"
@@ -327,27 +328,72 @@ def load_all_stock_group_from_file() -> dict:
     symbols = load_stock_symbols_from_file(STOCK_SCAN_FILE)
     return {ALL_STOCK_GROUP_NAME: symbols}
 
-@st.cache_data(ttl=REFRESH_SEC)
-def download_stock_data_yfinance(symbol: str):
-    """使用 yfinance / Yahoo Finance 取得歷史日 K。"""
+def _normalize_yfinance_ohlcv(df):
+    """標準化 yfinance 回傳的日 K，保留 Date 方便切分今日 / 今日以前。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    df = df.reset_index()
+    required_cols = ["Open", "High", "Low", "Close", "Volume"]
+    if not set(required_cols).issubset(df.columns):
+        return pd.DataFrame()
+    date_col = "Date" if "Date" in df.columns else df.columns[0]
+    df["Date"] = pd.to_datetime(df[date_col], errors="coerce").dt.date
+    for col in required_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[["Date"] + required_cols].dropna(subset=["Date", "Open", "High", "Low", "Close"]).reset_index(drop=True)
+
+@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
+def download_stock_data_yfinance_history(symbol: str, today_str: str):
+    """yfinance 今日以前歷史日 K：每小時抓一次並存入 Streamlit 快取。"""
     if yf is None:
         return pd.DataFrame()
     try:
         df = yf.download(str(symbol).strip().upper(), period="4mo", interval="1d", auto_adjust=False, progress=False, threads=False)
-        if df is None or df.empty:
+        df = _normalize_yfinance_ohlcv(df)
+        if df.empty:
             return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        df = df.reset_index()
-        required_cols = ["Open", "High", "Low", "Close", "Volume"]
-        if not set(required_cols).issubset(df.columns):
-            return pd.DataFrame()
-        for col in required_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df[required_cols].dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
+        today = pd.to_datetime(today_str).date()
+        return df[df["Date"] < today].reset_index(drop=True)
     except Exception as e:
-        print(f"yfinance 抓取 {symbol} 歷史 K 線失敗: {e}")
+        print(f"yfinance 抓取 {symbol} 今日以前歷史 K 線失敗: {e}")
         return pd.DataFrame()
+
+@st.cache_data(ttl=REFRESH_SEC)
+def download_stock_data_yfinance_today(symbol: str, today_str: str):
+    """yfinance 今日價格 / 今日 K：維持短 TTL，配合畫面刷新秒數更新。"""
+    if yf is None:
+        return pd.DataFrame()
+    try:
+        df = yf.download(str(symbol).strip().upper(), period="5d", interval="1d", auto_adjust=False, progress=False, threads=False)
+        df = _normalize_yfinance_ohlcv(df)
+        if df.empty:
+            return pd.DataFrame()
+        today = pd.to_datetime(today_str).date()
+        return df[df["Date"] >= today].reset_index(drop=True)
+    except Exception as e:
+        print(f"yfinance 抓取 {symbol} 今日價格失敗: {e}")
+        return pd.DataFrame()
+
+def download_stock_data_yfinance(symbol: str):
+    """使用 yfinance / Yahoo Finance 取得日 K。
+
+    快取策略：
+    - 今日以前的歷史資料：每小時抓一次，避免全市場掃描時頻繁重抓。
+    - 今日價格 / 今日 K：依 REFRESH_SEC 短 TTL 更新，保留即時性。
+    """
+    today_str = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d")
+    history_df = download_stock_data_yfinance_history(symbol, today_str)
+    today_df = download_stock_data_yfinance_today(symbol, today_str)
+
+    frames = [df for df in [history_df, today_df] if df is not None and not df.empty]
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    if "Date" in df.columns:
+        df = df.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
+    return df.reset_index(drop=True)
 
 def resolve_price_source(now_dt=None) -> str:
     mode = st.session_state.get("price_source_mode", "自動")
