@@ -929,6 +929,149 @@ def render_stock_group_editor():
             st.markdown(f"**{g}**（{len(symbols)}檔）")
             st.caption(", ".join(symbols) if symbols else "（空）")
 
+
+# ===== 下降趨勢線偵測參數 =====
+TREND_LOOKBACK_DAYS = 60          # 用最近 60 根 K 棒找下降壓力線；比 40 天更容易抓到台表科這種型態
+TREND_SWING_LEFT = 2              # 局部高點左側比較 K 數
+TREND_SWING_RIGHT = 2             # 局部高點右側比較 K 數
+TREND_MIN_PEAK_GAP = 5            # P1 與 P2 至少間隔幾根 K 棒
+TREND_MIN_DROP_PCT = 3.0          # P1 到 P2 至少下降幾 %，避免太水平的線
+TREND_BREAKOUT_BUFFER_PCT = 0.0   # 突破緩衝；0 表示站上即算，若想嚴格可改 0.3
+TREND_REQUIRE_MA60_UP = True      # 是否要求 60MA 上揚，降低空頭反彈誤判
+
+
+def find_swing_highs(values, left=2, right=2):
+    """找局部高點 swing high。
+
+    判斷方式：第 i 根 High 必須等於/大於左右指定區間內的最高值。
+    這比直接找「最高點 + 次高點」更接近人工畫下降趨勢線的方式。
+    """
+    s = pd.Series(values, dtype="float64").reset_index(drop=True)
+    peaks = []
+    if len(s) < left + right + 1:
+        return peaks
+
+    for i in range(left, len(s) - right):
+        center = s.iloc[i]
+        if pd.isna(center):
+            continue
+        window = s.iloc[i-left:i+right+1]
+        if window.isna().any():
+            continue
+        if center >= window.max():
+            # 避免連續同價平台重複記錄：只取平台最右邊那根，較貼近突破判斷
+            if peaks and abs(s.iloc[peaks[-1]] - center) < 1e-9 and i - peaks[-1] <= right:
+                peaks[-1] = i
+            else:
+                peaks.append(i)
+    return peaks
+
+
+def detect_downtrend_breakout(
+    high_series,
+    close_series,
+    price_val,
+    lookback=TREND_LOOKBACK_DAYS,
+    swing_left=TREND_SWING_LEFT,
+    swing_right=TREND_SWING_RIGHT,
+    min_peak_gap=TREND_MIN_PEAK_GAP,
+    min_drop_pct=TREND_MIN_DROP_PCT,
+    breakout_buffer_pct=TREND_BREAKOUT_BUFFER_PCT,
+):
+    """偵測「下降趨勢線突破」。
+
+    回傳 dict：
+    - signal: 是否突破
+    - p1_pos / p2_pos: P1、P2 在觀察區間內的位置
+    - p1_val / p2_val: P1、P2 價格
+    - slope_pct: P1 到 P2 的下降幅度 %
+    - trendline_now: 今日趨勢線價格
+
+    設計重點：
+    1. 用 swing high 找 P1 / P2，而不是最高點 + 次高點。
+    2. P2 必須在 P1 右側，且比 P1 低。
+    3. 今日收盤價站上今日趨勢線，昨日收盤價尚未站上昨日趨勢線，才算突破。
+    """
+    high = pd.to_numeric(pd.Series(high_series), errors="coerce").dropna().reset_index(drop=True)
+    close = pd.to_numeric(pd.Series(close_series), errors="coerce").dropna().reset_index(drop=True)
+
+    n_all = min(len(high), len(close))
+    if n_all < max(20, min_peak_gap + swing_left + swing_right + 3):
+        return {"signal": "-"}
+
+    lookback = min(int(lookback), n_all)
+    high = high.iloc[-lookback:].reset_index(drop=True)
+    close = close.iloc[-lookback:].reset_index(drop=True)
+    n = len(high)
+    x_today = n - 1
+    x_yesterday = n - 2
+
+    peaks = find_swing_highs(high.values, left=swing_left, right=swing_right)
+
+    # 若局部高點太少，放寬右側判斷，避免最近 P2 因為太靠近今天而漏掉
+    if len(peaks) < 2 and swing_right > 1:
+        peaks = find_swing_highs(high.values, left=swing_left, right=1)
+
+    # 排除今天，避免把突破當天的高點誤認成 P2
+    peaks = [p for p in peaks if p <= x_yesterday]
+    if len(peaks) < 2:
+        return {"signal": "-"}
+
+    best = None
+    for p1_pos in peaks:
+        p1_v = float(high.iloc[p1_pos])
+        if p1_pos > x_today - min_peak_gap:
+            continue
+
+        for p2_pos in peaks:
+            if p2_pos <= p1_pos + min_peak_gap:
+                continue
+            if p2_pos >= x_today:
+                continue
+
+            p2_v = float(high.iloc[p2_pos])
+            if p2_v >= p1_v:
+                continue
+
+            drop_pct = (p1_v - p2_v) / p1_v * 100
+            if drop_pct < min_drop_pct:
+                continue
+
+            slope = (p2_v - p1_v) / (p2_pos - p1_pos)
+            if slope >= 0:
+                continue
+
+            trendline_today = p1_v + slope * (x_today - p1_pos)
+            trendline_yesterday = p1_v + slope * (x_yesterday - p1_pos)
+            today_close = float(price_val)
+            yesterday_close = float(close.iloc[-2])
+            buffer = 1 + breakout_buffer_pct / 100
+
+            is_breakout = (
+                today_close > trendline_today * buffer
+                and yesterday_close <= trendline_yesterday * buffer
+            )
+            if not is_breakout:
+                continue
+
+            # 分數：越近的 P2 越優先，其次下降幅度越明顯越好
+            score = p2_pos * 100 + drop_pct
+            candidate = {
+                "signal": "趨勢突破",
+                "p1_pos": int(p1_pos),
+                "p2_pos": int(p2_pos),
+                "p1_val": p1_v,
+                "p2_val": p2_v,
+                "slope": slope,
+                "slope_pct": drop_pct,
+                "trendline_now": trendline_today,
+                "score": score,
+            }
+            if best is None or candidate["score"] > best["score"]:
+                best = candidate
+
+    return best if best else {"signal": "-"}
+
 def compute_indicators(df, price):
     if df is None or df.empty:
         raise ValueError("下載資料為空")
@@ -1012,48 +1155,42 @@ def compute_indicators(df, price):
         gap_signal = "跳空"
 
     # ==========================================
-    # ===== 新增：趨勢突破策略 (40日 + 8%坡度) =====
+    # ===== 改良：下降趨勢線突破策略 =====
     # ==========================================
     trend_signal = "-"
     p1_val = p2_val = slope_pct = tl_val = 0.0
 
-    if len(df) >= 61:
+    # 設計邏輯：
+    # 1) 保留 60MA 上揚過濾，避免空頭反彈假突破。
+    # 2) 用 swing high 找 P1 / P2，接近人工畫下降趨勢線。
+    # 3) P1 必須高於 P2，且今日收盤突破趨勢線、昨日尚未突破。
+    enough_for_trend = len(df) >= max(61, TREND_LOOKBACK_DAYS + 1)
+    ma60_ok = True
+    if enough_for_trend and TREND_REQUIRE_MA60_UP:
         ma60 = close.rolling(window=60).mean()
         ma60_today = float(ma60.iloc[-1])
         ma60_yesterday = float(ma60.iloc[-2])
-        
-        # 條件 1: 60MA 方向上揚
-        if pd.notna(ma60_today) and pd.notna(ma60_yesterday) and ma60_today > ma60_yesterday:
-            data_40 = df.tail(40).copy().reset_index(drop=True)
-            high_40 = pd.to_numeric(data_40['High'], errors='coerce')
-            close_40 = pd.to_numeric(data_40['Close'], errors='coerce')
-            
-            p1_pos = high_40.idxmax()
-            p1_v = float(high_40.max())
-            
-            # 條件 2: 確保 P1 不要離今天太近 (39 是最新的 index)
-            if p1_pos <= 30: 
-                after_p1_data = high_40.iloc[p1_pos + 5 : -1] # 需距離 P1 五天以上且排除今日
-                if not after_p1_data.empty:
-                    p2_pos = after_p1_data.idxmax()
-                    p2_v = float(after_p1_data.max())
-                    
-                    # 條件 3: P1 必須大於 P2 至少 8%
-                    if p1_v >= (p2_v * 1.08):
-                        slope = (p2_v - p1_v) / (p2_pos - p1_pos)
-                        x_now = 39 
-                        trendline_now = p2_v + slope * (x_now - p2_pos)
-                        
-                        today_close = float(price_val)
-                        yesterday_close = float(close_40.iloc[-2])
-                        
-                        # 條件 4: 今日收盤突破趨勢線
-                        if today_close > trendline_now and yesterday_close <= (trendline_now - slope):
-                            trend_signal = "趨勢突破"
-                            p1_val = p1_v
-                            p2_val = p2_v
-                            slope_pct = ((p1_v / p2_v) - 1) * 100
-                            tl_val = trendline_now
+        ma60_ok = pd.notna(ma60_today) and pd.notna(ma60_yesterday) and ma60_today > ma60_yesterday
+
+    if enough_for_trend and ma60_ok:
+        trend_result = detect_downtrend_breakout(
+            high_series=high,
+            close_series=close,
+            price_val=price_val,
+            lookback=TREND_LOOKBACK_DAYS,
+            swing_left=TREND_SWING_LEFT,
+            swing_right=TREND_SWING_RIGHT,
+            min_peak_gap=TREND_MIN_PEAK_GAP,
+            min_drop_pct=TREND_MIN_DROP_PCT,
+            breakout_buffer_pct=TREND_BREAKOUT_BUFFER_PCT,
+        )
+
+        if trend_result.get("signal") == "趨勢突破":
+            trend_signal = "趨勢突破"
+            p1_val = float(trend_result.get("p1_val", 0.0))
+            p2_val = float(trend_result.get("p2_val", 0.0))
+            slope_pct = float(trend_result.get("slope_pct", 0.0))
+            tl_val = float(trend_result.get("trendline_now", 0.0))
 
     return {
         "price": round(price_val, 2),
