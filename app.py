@@ -252,9 +252,21 @@ def download_stock_data(symbol: str, _sdk):
 def normalize_ohlc(df):
     if df is None or df.empty:
         return pd.DataFrame()
+
+    df = df.copy()
+    # 保留日期欄位，讓趨勢線可以回報 P1/P2 是哪一天。
+    if "date" in df.columns and "Date" not in df.columns:
+        df.rename(columns={"date": "Date"}, inplace=True)
+
     required_cols = ["Open", "High", "Low", "Close", "Volume"]
     if set(required_cols).issubset(df.columns):
-        return df[required_cols].copy()
+        cols = (["Date"] if "Date" in df.columns else []) + required_cols
+        out = df[cols].copy()
+        if "Date" in out.columns:
+            out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.date
+        for col in required_cols:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        return out.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
     return pd.DataFrame()
 
 def get_last_price(symbol, df, _sdk):
@@ -431,7 +443,7 @@ def get_last_price_by_source(symbol: str, df, _sdk, source: str):
     return get_last_price(symbol, df, _sdk)
 
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "區高P1", "近高P2", "坡度%", "趨勢價", "趨勢突破", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
     if not rows:
         return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
@@ -931,20 +943,31 @@ def render_stock_group_editor():
 
 
 # ===== 下降趨勢線偵測參數 =====
-TREND_LOOKBACK_DAYS = 60          # 用最近 60 根 K 棒找下降壓力線；比 40 天更容易抓到台表科這種型態
-TREND_SWING_LEFT = 2              # 局部高點左側比較 K 數
-TREND_SWING_RIGHT = 2             # 局部高點右側比較 K 數
-TREND_MIN_PEAK_GAP = 5            # P1 與 P2 至少間隔幾根 K 棒
-TREND_MIN_DROP_PCT = 3.0          # P1 到 P2 至少下降幾 %，避免太水平的線
-TREND_BREAKOUT_BUFFER_PCT = 0.0   # 突破緩衝；0 表示站上即算，若想嚴格可改 0.3
-TREND_REQUIRE_MA60_UP = True      # 是否要求 60MA 上揚，降低空頭反彈誤判
+TREND_LOOKBACK_DAYS = 70              # 找近期壓力線，70 根 K 棒較能涵蓋 3 個月圖的主要波段
+TREND_SWING_LEFT = 2                  # swing high 左側比較 K 數
+TREND_SWING_RIGHT = 2                 # swing high 右側比較 K 數
+TREND_MIN_PEAK_GAP = 5                # P1 與 P2 至少間隔 K 數
+TREND_MIN_DROP_PCT = 3.0              # P1 到 P2 至少下降幅度，避免水平線被誤判
+TREND_BREAKOUT_BUFFER_PCT = 0.0       # 收盤突破緩衝；0=站上即算，0.3=需站上 0.3%
+TREND_RESIST_TOL_PCT = 1.2            # 壓力線容忍誤差，避免一點點影線刺破就整條線失效
+TREND_TOUCH_TOL_PCT = 2.0             # 計算 touch count 的貼線誤差
+TREND_MAX_VIOLATIONS = 1              # P1~今日之間最多容許幾根 High 明顯站上壓力線
+TREND_REQUIRE_MA60_UP = False         # 先關閉；否則像光鋐這種 MA60 走平/下彎時會被濾掉
+
+
+def _format_date_for_table(value):
+    if value is None or value == "-" or pd.isna(value):
+        return "-"
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except Exception:
+        return str(value)
 
 
 def find_swing_highs(values, left=2, right=2):
     """找局部高點 swing high。
 
-    判斷方式：第 i 根 High 必須等於/大於左右指定區間內的最高值。
-    這比直接找「最高點 + 次高點」更接近人工畫下降趨勢線的方式。
+    不是找最高價與次高價，而是找像人眼在 K 線圖上會拿來畫下降壓力線的反彈高點。
     """
     s = pd.Series(values, dtype="float64").reset_index(drop=True)
     peaks = []
@@ -959,7 +982,7 @@ def find_swing_highs(values, left=2, right=2):
         if window.isna().any():
             continue
         if center >= window.max():
-            # 避免連續同價平台重複記錄：只取平台最右邊那根，較貼近突破判斷
+            # 同價平台只取最右邊一根，避免同一個高點重複入選
             if peaks and abs(s.iloc[peaks[-1]] - center) < 1e-9 and i - peaks[-1] <= right:
                 peaks[-1] = i
             else:
@@ -968,8 +991,7 @@ def find_swing_highs(values, left=2, right=2):
 
 
 def detect_downtrend_breakout(
-    high_series,
-    close_series,
+    df,
     price_val,
     lookback=TREND_LOOKBACK_DAYS,
     swing_left=TREND_SWING_LEFT,
@@ -977,42 +999,43 @@ def detect_downtrend_breakout(
     min_peak_gap=TREND_MIN_PEAK_GAP,
     min_drop_pct=TREND_MIN_DROP_PCT,
     breakout_buffer_pct=TREND_BREAKOUT_BUFFER_PCT,
+    resist_tol_pct=TREND_RESIST_TOL_PCT,
+    touch_tol_pct=TREND_TOUCH_TOL_PCT,
+    max_violations=TREND_MAX_VIOLATIONS,
 ):
-    """偵測「下降趨勢線突破」。
+    """偵測下降趨勢線突破。
 
-    回傳 dict：
-    - signal: 是否突破
-    - p1_pos / p2_pos: P1、P2 在觀察區間內的位置
-    - p1_val / p2_val: P1、P2 價格
-    - slope_pct: P1 到 P2 的下降幅度 %
-    - trendline_now: 今日趨勢線價格
-
-    設計重點：
-    1. 用 swing high 找 P1 / P2，而不是最高點 + 次高點。
-    2. P2 必須在 P1 右側，且比 P1 低。
-    3. 今日收盤價站上今日趨勢線，昨日收盤價尚未站上昨日趨勢線，才算突破。
+    修正版重點：
+    1. 先找 swing high，而不是用最高點/次高點硬連。
+    2. 候選 P1/P2 連線後，檢查 P1 到今日之間是否真的像「壓力線」：大多數 High 不應明顯站上線。
+    3. 候選線用 touch count、最近 P2、違規數評分，避免抓到 4956 那種錯誤的 4/30→6/16 線。
     """
-    high = pd.to_numeric(pd.Series(high_series), errors="coerce").dropna().reset_index(drop=True)
-    close = pd.to_numeric(pd.Series(close_series), errors="coerce").dropna().reset_index(drop=True)
-
-    n_all = min(len(high), len(close))
-    if n_all < max(20, min_peak_gap + swing_left + swing_right + 3):
+    if df is None or df.empty or not {"High", "Close"}.issubset(df.columns):
         return {"signal": "-"}
 
-    lookback = min(int(lookback), n_all)
-    high = high.iloc[-lookback:].reset_index(drop=True)
-    close = close.iloc[-lookback:].reset_index(drop=True)
-    n = len(high)
+    work = df.copy().reset_index(drop=True)
+    work["High"] = pd.to_numeric(work["High"], errors="coerce")
+    work["Close"] = pd.to_numeric(work["Close"], errors="coerce")
+    if "Date" not in work.columns:
+        work["Date"] = work.index.astype(str)
+
+    work = work.dropna(subset=["High", "Close"]).reset_index(drop=True)
+    if len(work) < max(25, min_peak_gap + swing_left + swing_right + 5):
+        return {"signal": "-"}
+
+    lookback = min(int(lookback), len(work))
+    work = work.iloc[-lookback:].reset_index(drop=True)
+    high = work["High"].reset_index(drop=True)
+    close = work["Close"].reset_index(drop=True)
+    n = len(work)
     x_today = n - 1
     x_yesterday = n - 2
 
     peaks = find_swing_highs(high.values, left=swing_left, right=swing_right)
-
-    # 若局部高點太少，放寬右側判斷，避免最近 P2 因為太靠近今天而漏掉
     if len(peaks) < 2 and swing_right > 1:
         peaks = find_swing_highs(high.values, left=swing_left, right=1)
 
-    # 排除今天，避免把突破當天的高點誤認成 P2
+    # 不讓今天當 P2，避免突破當天的高點被拿來畫線。
     peaks = [p for p in peaks if p <= x_yesterday]
     if len(peaks) < 2:
         return {"signal": "-"}
@@ -1041,8 +1064,41 @@ def detect_downtrend_breakout(
             if slope >= 0:
                 continue
 
-            trendline_today = p1_v + slope * (x_today - p1_pos)
-            trendline_yesterday = p1_v + slope * (x_yesterday - p1_pos)
+            xs = pd.Series(range(n), dtype="float64")
+            line = p1_v + slope * (xs - p1_pos)
+
+            # 「壓力線有效性」：P1 後到昨日，多數高點不可明顯超過壓力線。
+            check_start = p1_pos + 1
+            check_end = x_yesterday
+            if check_start <= check_end:
+                segment_high = high.iloc[check_start:check_end+1].reset_index(drop=True)
+                segment_line = line.iloc[check_start:check_end+1].reset_index(drop=True)
+                above = segment_high > segment_line * (1 + resist_tol_pct / 100)
+                # P2 是錨點，允許 P2 貼線，不算違規
+                p2_segment_idx = p2_pos - check_start
+                if 0 <= p2_segment_idx < len(above):
+                    above.iloc[p2_segment_idx] = False
+                violations = int(above.sum())
+            else:
+                violations = 0
+
+            if violations > max_violations:
+                continue
+
+            # touch count：有幾個 swing high 貼近這條線，貼線越多越像人工畫的壓力線。
+            touch_count = 0
+            for p in peaks:
+                if p < p1_pos or p > x_yesterday:
+                    continue
+                line_p = float(line.iloc[p])
+                if line_p <= 0:
+                    continue
+                dist_pct = abs(float(high.iloc[p]) - line_p) / line_p * 100
+                if dist_pct <= touch_tol_pct:
+                    touch_count += 1
+
+            trendline_today = float(line.iloc[x_today])
+            trendline_yesterday = float(line.iloc[x_yesterday])
             today_close = float(price_val)
             yesterday_close = float(close.iloc[-2])
             buffer = 1 + breakout_buffer_pct / 100
@@ -1054,17 +1110,27 @@ def detect_downtrend_breakout(
             if not is_breakout:
                 continue
 
-            # 分數：越近的 P2 越優先，其次下降幅度越明顯越好
-            score = p2_pos * 100 + drop_pct
+            # 評分：壓力線有效性 > 貼線次數 > P2 越近越好 > 下降幅度
+            score = (
+                (max_violations - violations) * 100000
+                + touch_count * 10000
+                + p2_pos * 100
+                + drop_pct
+            )
+
             candidate = {
                 "signal": "趨勢突破",
                 "p1_pos": int(p1_pos),
                 "p2_pos": int(p2_pos),
+                "p1_date": _format_date_for_table(work.loc[p1_pos, "Date"]),
+                "p2_date": _format_date_for_table(work.loc[p2_pos, "Date"]),
                 "p1_val": p1_v,
                 "p2_val": p2_v,
                 "slope": slope,
                 "slope_pct": drop_pct,
                 "trendline_now": trendline_today,
+                "touch_count": touch_count,
+                "violations": violations,
                 "score": score,
             }
             if best is None or candidate["score"] > best["score"]:
@@ -1159,12 +1225,10 @@ def compute_indicators(df, price):
     # ==========================================
     trend_signal = "-"
     p1_val = p2_val = slope_pct = tl_val = 0.0
+    p1_date = p2_date = "-"
+    trend_touch_count = trend_violations = "-"
 
-    # 設計邏輯：
-    # 1) 保留 60MA 上揚過濾，避免空頭反彈假突破。
-    # 2) 用 swing high 找 P1 / P2，接近人工畫下降趨勢線。
-    # 3) P1 必須高於 P2，且今日收盤突破趨勢線、昨日尚未突破。
-    enough_for_trend = len(df) >= max(61, TREND_LOOKBACK_DAYS + 1)
+    enough_for_trend = len(df) >= max(61, TREND_MIN_PEAK_GAP + TREND_SWING_LEFT + TREND_SWING_RIGHT + 5)
     ma60_ok = True
     if enough_for_trend and TREND_REQUIRE_MA60_UP:
         ma60 = close.rolling(window=60).mean()
@@ -1173,24 +1237,17 @@ def compute_indicators(df, price):
         ma60_ok = pd.notna(ma60_today) and pd.notna(ma60_yesterday) and ma60_today > ma60_yesterday
 
     if enough_for_trend and ma60_ok:
-        trend_result = detect_downtrend_breakout(
-            high_series=high,
-            close_series=close,
-            price_val=price_val,
-            lookback=TREND_LOOKBACK_DAYS,
-            swing_left=TREND_SWING_LEFT,
-            swing_right=TREND_SWING_RIGHT,
-            min_peak_gap=TREND_MIN_PEAK_GAP,
-            min_drop_pct=TREND_MIN_DROP_PCT,
-            breakout_buffer_pct=TREND_BREAKOUT_BUFFER_PCT,
-        )
-
+        trend_result = detect_downtrend_breakout(df=df, price_val=price_val)
         if trend_result.get("signal") == "趨勢突破":
             trend_signal = "趨勢突破"
             p1_val = float(trend_result.get("p1_val", 0.0))
             p2_val = float(trend_result.get("p2_val", 0.0))
             slope_pct = float(trend_result.get("slope_pct", 0.0))
             tl_val = float(trend_result.get("trendline_now", 0.0))
+            p1_date = trend_result.get("p1_date", "-")
+            p2_date = trend_result.get("p2_date", "-")
+            trend_touch_count = trend_result.get("touch_count", "-")
+            trend_violations = trend_result.get("violations", "-")
 
     return {
         "price": round(price_val, 2),
@@ -1206,10 +1263,14 @@ def compute_indicators(df, price):
         "volume": int(latest_volume),
         "volume_lots": round(volume_lots, 1),
         "trend_signal": trend_signal,
+        "p1_date": p1_date,
         "p1_val": round(p1_val, 2) if p1_val else "-",
+        "p2_date": p2_date,
         "p2_val": round(p2_val, 2) if p2_val else "-",
         "slope_pct": round(slope_pct, 1) if slope_pct else "-",
-        "tl_val": round(tl_val, 2) if tl_val else "-"
+        "tl_val": round(tl_val, 2) if tl_val else "-",
+        "trend_touch_count": trend_touch_count,
+        "trend_violations": trend_violations
     }
 
 def format_color(val):
@@ -1534,7 +1595,10 @@ if should_run_scan:
                     "代碼": symbol, "代碼網址": yahoo_quote_url(symbol), "股票名稱": stock_name,
                     "價格": f"{data['price']:.2f}", "漲跌%": data["pct"],
                     "成交量(張)": data["volume_lots"],
-                    "區高P1": data["p1_val"], "近高P2": data["p2_val"], "坡度%": data["slope_pct"], "趨勢價": data["tl_val"], "趨勢突破": data["trend_signal"],
+                    "P1日期": data["p1_date"], "區高P1": data["p1_val"],
+                    "P2日期": data["p2_date"], "近高P2": data["p2_val"],
+                    "坡度%": data["slope_pct"], "趨勢價": data["tl_val"], "趨勢突破": data["trend_signal"],
+                    "貼線數": data["trend_touch_count"], "穿線數": data["trend_violations"],
                     "MA位置": data["ma_range"], "MA排列": data["ma_trend"],
                     "K值": data["k"], "D值": f"{data['d']:.1f}",
                     "KD訊號": data["kd_signal"], "MACD柱": data["macd_hist"],
@@ -1555,7 +1619,7 @@ if should_run_scan:
                     rows.append({
                         "代碼": symbol, "代碼網址": "", "股票名稱": get_stock_name(symbol, st.session_state.fubon_sdk),
                         "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-",
-                        "區高P1": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-",
+                        "P1日期": "-", "區高P1": "-", "P2日期": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-", "貼線數": "-", "穿線數": "-",
                         "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-",
                         "KD訊號": "-", "MACD柱": "-", "MACD訊號": "-",
                         "跳空訊號": str(e), "訊號類型": "錯誤", "來源": active_price_source,
@@ -1624,7 +1688,7 @@ unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=[
 st.metric("符合勾選訊號股票數", unique_signal_count)
 
 # 全域定義顯示的欄位，確保資料表一定找得到
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "區高P1", "近高P2", "坡度%", "趨勢價", "趨勢突破", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])
