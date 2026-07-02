@@ -480,6 +480,7 @@ def apply_excel_fonts(workbook):
                     cell.font = Font(name=english_font_name)
 
 def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
+    gain_rows = signal_buckets.get("漲幅達標", [])
     gap_rows = signal_buckets.get("跳空", [])
     golden_rows = signal_buckets.get("黃金交叉", [])
     near_golden_rows = signal_buckets.get("即將黃金交叉", [])
@@ -488,6 +489,7 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        normalize_rows_for_excel(gain_rows).to_excel(writer, sheet_name="漲幅達標", index=False)
         normalize_rows_for_excel(gap_rows).to_excel(writer, sheet_name="跳空", index=False)
         normalize_rows_for_excel(golden_rows).to_excel(writer, sheet_name="黃金交叉", index=False)
         normalize_rows_for_excel(near_golden_rows).to_excel(writer, sheet_name="即將黃金交叉", index=False)
@@ -1501,7 +1503,7 @@ rise_threshold = st.number_input(
 
 
 st.markdown("### 🎯 掃描條件")
-scan_btn_col1, scan_btn_col2, scan_col1, scan_col2, scan_col3, scan_macd_col, scan_trend_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.3, 0.7, 1.4, 1.0, 1.1, 1.2, 1.8])
+scan_btn_col1, scan_btn_col2, scan_col1, scan_gain_col, scan_col2, scan_col3, scan_macd_col, scan_trend_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.3, 1.0, 0.7, 1.4, 1.0, 1.1, 1.2, 1.8])
 with scan_btn_col1:
     if st.button("▶️ 開始掃描", use_container_width=True, disabled=st.session_state.scan_enabled):
         st.session_state.scan_enabled = True
@@ -1515,6 +1517,12 @@ with scan_btn_col2:
         st.rerun()
 with scan_col1:
     show_only_signal_rows = st.toggle("只顯示訊號股票", value=True)
+with scan_gain_col:
+    include_gain_threshold_filter = st.checkbox(
+        "漲幅達標",
+        value=True,
+        help="選出漲幅 >= 上方『儀表板漲幅達標門檻』的股票，並新增到漲幅達標分頁。"
+    )
 with scan_col2:
     include_gap_signal_filter = st.checkbox("跳空", value=True)
 with scan_col3:
@@ -1543,6 +1551,8 @@ else:
     st.caption("⚪ 掃描狀態：已停止，按「開始掃描」才會抓取資料。")
 
 selected_signal_names = []
+if include_gain_threshold_filter:
+    selected_signal_names.append("漲幅達標")
 if include_gap_signal_filter:
     selected_signal_names.append("跳空")
 if include_kd_signal_filter:
@@ -1605,7 +1615,7 @@ if should_run_scan:
     group_tables = {}
     group_up_summary = []
     all_signal_rows = []
-    signal_buckets = {"跳空": [], "黃金交叉": [], "即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
+    signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
     render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
     progress_bar = st.progress(0, text=f"掃描進度：0.0%（準備掃描 {scan_total_count} 檔股票）")
@@ -1638,6 +1648,7 @@ if should_run_scan:
                 data = compute_indicators(df, price)
 
                 signal_types = []
+                if data["pct"] >= rise_threshold: signal_types.append("漲幅達標")
                 if data["gap_signal"] == "跳空": signal_types.append("跳空")
                 if data["kd_signal"] in ["黃金交叉", "即將黃金交叉"]: signal_types.append(data["kd_signal"])
                 if data["macd_signal"] == "MACD翻正": signal_types.append("MACD翻正")
@@ -1756,7 +1767,7 @@ else:
     group_tables = last_scan_result.get("group_tables", {})
     group_up_summary = last_scan_result.get("group_up_summary", [])
     all_signal_rows = last_scan_result.get("all_signal_rows", [])
-    signal_buckets = last_scan_result.get("signal_buckets", {"跳空": [], "黃金交叉": [], "即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
+    signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
     render_scan_progress_card(scan_progress_card_placeholder, last_scan_result.get("progress_pct", 100), "掃描進度")
 
 excel_bytes = build_signal_excel_bytes(signal_buckets)
@@ -1777,7 +1788,7 @@ with scan_action_placeholder.container():
 
 st.markdown("### 🔎 訊號掃描結果")
 unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
-st.metric("符合勾選訊號股票數", unique_signal_count)
+st.metric("符合勾選掃描條件股票數", unique_signal_count)
 
 # 全域定義顯示的欄位，確保資料表一定找得到
 display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
@@ -1813,6 +1824,7 @@ if all_signal_rows:
     st.markdown("### 📑 依訊號分頁查看")
 
     signal_tab_specs = [
+        ("漲幅達標", "漲幅達標"),
         ("跳空", "跳空"),
         ("黃金交叉", "黃金交叉"),
         ("即將黃金交叉", "即將黃金交叉"),
