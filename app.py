@@ -1495,7 +1495,7 @@ rise_threshold = st.number_input(
     min_value=0.0,
     max_value=10.0,
     value=7.0,
-    step=1,
+    step=0.5,
     format="%.2f"
 )
 
