@@ -1489,7 +1489,16 @@ else:
 
 st.caption(f"更新時間：{tw_now.strftime('%Y-%m-%d %H:%M:%S')}｜價格來源：{active_price_source}")
 
-rise_threshold = st.slider("儀表板漲幅達標門檻 (%)", min_value=5, max_value=9, value=5, step=1)
+
+rise_threshold = st.number_input(
+    "儀表板漲幅達標門檻 (%)",
+    min_value=0.0,
+    max_value=20.0,
+    value=3.0,
+    step=0.1,
+    format="%.2f"
+)
+
 
 st.markdown("### 🎯 掃描條件")
 scan_btn_col1, scan_btn_col2, scan_col1, scan_col2, scan_col3, scan_macd_col, scan_trend_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.3, 0.7, 1.4, 1.0, 1.1, 1.2, 1.8])
