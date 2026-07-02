@@ -443,7 +443,7 @@ def get_last_price_by_source(symbol: str, df, _sdk, source: str):
     return get_last_price(symbol, df, _sdk)
 
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
     if not rows:
         return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
@@ -1138,6 +1138,74 @@ def detect_downtrend_breakout(
 
     return best if best else {"signal": "-"}
 
+def calc_custom_volatility(df, price_val, window=20):
+    """
+    依使用者指定公式計算波動率：
+
+    陽K（收盤價 >= 開盤價）單日股漲跌幅：
+        |昨日收盤價-開盤價| + |開盤價-最低價| + |最低價-最高價| + |最高價-收盤價|
+
+    陰K / 非陽K（收盤價 < 開盤價）單日股漲跌幅：
+        |昨日收盤價-開盤價| + |開盤價-最低價| + |最高價-最低價| + |最低價-收盤價|
+
+    波動率(%)：
+        單日股漲跌幅的20日平均 / 20MA * 100
+
+    注意：
+    - 最新一根 K 的收盤價會用即時/最後成交價 price_val 取代，讓盤中掃描時更貼近即時狀態。
+    - 最新一根 K 的 High/Low 仍使用資料源回傳的日 K high/low。
+    """
+    if df is None or df.empty:
+        return None
+    required_cols = ["Open", "High", "Low", "Close"]
+    if not set(required_cols).issubset(df.columns):
+        return None
+
+    work = df.copy().reset_index(drop=True)
+    for col in required_cols:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=required_cols).reset_index(drop=True)
+
+    # 20日平均的單日股漲跌幅需要至少 21 筆收盤資料，因為第一筆沒有昨日收盤價。
+    if len(work) < window + 1:
+        return None
+
+    close_for_calc = work["Close"].copy()
+    close_for_calc.iloc[-1] = float(price_val)
+
+    prev_close = close_for_calc.shift(1)
+    open_ = work["Open"]
+    high = work["High"]
+    low = work["Low"]
+    close_ = close_for_calc
+
+    is_bullish_k = close_ >= open_
+
+    bull_range = (
+        (prev_close - open_).abs()
+        + (open_ - low).abs()
+        + (low - high).abs()
+        + (high - close_).abs()
+    )
+    bear_range = (
+        (prev_close - open_).abs()
+        + (open_ - low).abs()
+        + (high - low).abs()
+        + (low - close_).abs()
+    )
+
+    daily_swing = bull_range.where(is_bullish_k, bear_range)
+    avg_20_swing = daily_swing.rolling(window=window, min_periods=window).mean()
+    ma20 = close_for_calc.rolling(window=window, min_periods=window).mean()
+
+    latest_avg_20_swing = avg_20_swing.iloc[-1]
+    latest_ma20 = ma20.iloc[-1]
+    if pd.isna(latest_avg_20_swing) or pd.isna(latest_ma20) or latest_ma20 == 0:
+        return None
+
+    return float(latest_avg_20_swing / latest_ma20 * 100)
+
+
 def compute_indicators(df, price):
     if df is None or df.empty:
         raise ValueError("下載資料為空")
@@ -1214,6 +1282,9 @@ def compute_indicators(df, price):
         latest_volume = float(volume.iloc[-1])
     volume_lots = latest_volume / 1000
 
+    # ===== 使用者自訂波動率計算 =====
+    custom_volatility_pct = calc_custom_volatility(df, price_val, window=20)
+
     gap_signal = "-"
     today_low = float(low.iloc[-1])
     yesterday_high = float(high.iloc[-2])
@@ -1262,6 +1333,7 @@ def compute_indicators(df, price):
         "macd_signal": macd_signal,
         "volume": int(latest_volume),
         "volume_lots": round(volume_lots, 1),
+        "volatility_pct": round(custom_volatility_pct, 2) if custom_volatility_pct is not None else "-",
         "trend_signal": trend_signal,
         "p1_date": p1_date,
         "p1_val": round(p1_val, 2) if p1_val else "-",
@@ -1298,6 +1370,13 @@ def format_trend(val):
 def format_volume(val):
     try:
         return f"{float(val):,.1f}"
+    except Exception:
+        return val
+
+
+def format_volatility(val):
+    try:
+        return f"{float(val):.2f}%"
     except Exception:
         return val
 
@@ -1572,6 +1651,7 @@ if should_run_scan:
                             f"📈 價格：{data['price']}\n"
                             f"🔥 漲幅：{data['pct']}%\n"
                             f"📦 成交量：{data['volume_lots']:,.1f} 張\n"
+                            f"🌊 波動率：{data['volatility_pct']}%\n"
                             f"📊 KD訊號：{data['kd_signal']}\n"
                             f"🧭 MACD訊號：{data['macd_signal']} / MACD柱：{data['macd_hist']}\n"
                             f"🚀 跳空訊號：{data['gap_signal']}\n"
@@ -1595,6 +1675,7 @@ if should_run_scan:
                     "代碼": symbol, "代碼網址": yahoo_quote_url(symbol), "股票名稱": stock_name,
                     "價格": f"{data['price']:.2f}", "漲跌%": data["pct"],
                     "成交量(張)": data["volume_lots"],
+                    "波動率%": data["volatility_pct"],
                     "P1日期": data["p1_date"], "區高P1": data["p1_val"],
                     "P2日期": data["p2_date"], "近高P2": data["p2_val"],
                     "坡度%": data["slope_pct"], "趨勢價": data["tl_val"], "趨勢突破": data["trend_signal"],
@@ -1618,7 +1699,7 @@ if should_run_scan:
                 if not show_only_signal_rows:
                     rows.append({
                         "代碼": symbol, "代碼網址": "", "股票名稱": get_stock_name(symbol, st.session_state.fubon_sdk),
-                        "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-",
+                        "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-",
                         "P1日期": "-", "區高P1": "-", "P2日期": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-", "貼線數": "-", "穿線數": "-",
                         "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-",
                         "KD訊號": "-", "MACD柱": "-", "MACD訊號": "-",
@@ -1633,6 +1714,8 @@ if should_run_scan:
             display_df["漲跌%"] = display_df["漲跌%"].apply(format_color)
             display_df["K值"] = display_df["K值"].apply(format_k)
             display_df["成交量(張)"] = display_df["成交量(張)"].apply(format_volume)
+            if "波動率%" in display_df.columns:
+                display_df["波動率%"] = display_df["波動率%"].apply(format_volatility)
             display_df["跳空訊號"] = display_df["跳空訊號"].apply(format_gap)
             if "趨勢突破" in display_df.columns:
                 display_df["趨勢突破"] = display_df["趨勢突破"].apply(format_trend)
@@ -1688,7 +1771,7 @@ unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=[
 st.metric("符合勾選訊號股票數", unique_signal_count)
 
 # 全域定義顯示的欄位，確保資料表一定找得到
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])
@@ -1696,6 +1779,8 @@ if all_signal_rows:
     signal_display_df["漲跌%"] = signal_display_df["漲跌%"].apply(format_color)
     signal_display_df["K值"] = signal_display_df["K值"].apply(format_k)
     signal_display_df["成交量(張)"] = signal_display_df["成交量(張)"].apply(format_volume)
+    if "波動率%" in signal_display_df.columns:
+        signal_display_df["波動率%"] = signal_display_df["波動率%"].apply(format_volatility)
     signal_display_df["跳空訊號"] = signal_display_df["跳空訊號"].apply(format_gap)
     
     # 🌟 防呆：確認有該欄位才套用格式，沒有則補上 "-"
@@ -1745,6 +1830,8 @@ if all_signal_rows:
                 bucket_display_df["漲跌%"] = bucket_display_df["漲跌%"].apply(format_color)
                 bucket_display_df["K值"] = bucket_display_df["K值"].apply(format_k)
                 bucket_display_df["成交量(張)"] = bucket_display_df["成交量(張)"].apply(format_volume)
+                if "波動率%" in bucket_display_df.columns:
+                    bucket_display_df["波動率%"] = bucket_display_df["波動率%"].apply(format_volatility)
                 bucket_display_df["跳空訊號"] = bucket_display_df["跳空訊號"].apply(format_gap)
                 
                 # 🌟 防呆：確認有該欄位才套用格式，沒有則補上 "-"
