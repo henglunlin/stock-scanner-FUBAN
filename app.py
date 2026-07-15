@@ -443,7 +443,7 @@ def get_last_price_by_source(symbol: str, df, _sdk, source: str):
     return get_last_price(symbol, df, _sdk)
 
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
     if not rows:
         return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
@@ -484,6 +484,8 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
     gap_rows = signal_buckets.get("跳空", [])
     golden_rows = signal_buckets.get("黃金交叉", [])
     near_golden_rows = signal_buckets.get("即將黃金交叉", [])
+    week_golden_rows = signal_buckets.get("週黃金交叉", [])
+    week_near_golden_rows = signal_buckets.get("週即將黃金交叉", [])
     macd_rows = signal_buckets.get("MACD翻正", [])
     trend_rows = signal_buckets.get("趨勢突破", [])
 
@@ -493,6 +495,8 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
         normalize_rows_for_excel(gap_rows).to_excel(writer, sheet_name="跳空", index=False)
         normalize_rows_for_excel(golden_rows).to_excel(writer, sheet_name="黃金交叉", index=False)
         normalize_rows_for_excel(near_golden_rows).to_excel(writer, sheet_name="即將黃金交叉", index=False)
+        normalize_rows_for_excel(week_golden_rows).to_excel(writer, sheet_name="週黃金交叉", index=False)
+        normalize_rows_for_excel(week_near_golden_rows).to_excel(writer, sheet_name="週即將黃金交叉", index=False)
         normalize_rows_for_excel(macd_rows).to_excel(writer, sheet_name="MACD訊號", index=False)
         normalize_rows_for_excel(trend_rows).to_excel(writer, sheet_name="趨勢突破", index=False)
         apply_excel_fonts(writer.book)
@@ -1220,6 +1224,41 @@ def calc_rs_raw_value(df, price_val):
     return rs_raw * 100
 
 
+def calc_kd_series(close, low, high, period: int = 9):
+    """通用 KD 計算（日線／週線皆可共用），回傳 K、D 序列"""
+    low_n = low.rolling(period).min()
+    high_n = high.rolling(period).max()
+    denominator = (high_n - low_n).replace(0, pd.NA)
+    rsv = ((close - low_n) / denominator) * 100
+    k = rsv.ewm(alpha=1/3, adjust=False).mean()
+    d = k.ewm(alpha=1/3, adjust=False).mean()
+    return k, d
+
+def judge_kd_signal(k_t: float, k_y: float, d_t: float, d_y: float) -> str:
+    """依據當期(t)與前一期(y)的 K/D 值判斷交叉訊號（日線／週線共用邏輯）"""
+    if k_y <= d_y and k_t > d_t: return "黃金交叉"
+    if k_y >= d_y and k_t < d_t: return "死亡交叉"
+    if k_t < d_t and (d_t - k_t) < 3: return "即將黃金交叉"
+    if k_t > d_t and (k_t - d_t) < 3: return "即將死亡交叉"
+    if k_t < 25: return "超賣"
+    return "-"
+
+def resample_weekly_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    將日線 OHLC 依日期重採樣成週線。
+    直接沿用同一批已下載的日線資料（df 需含 Date/High/Low/Close），
+    不會為了週KD額外呼叫任何行情 API，維持原本的資料抓取時間範圍。
+    """
+    if df is None or df.empty or "Date" not in df.columns:
+        return pd.DataFrame()
+    weekly_src = df[["Date", "High", "Low", "Close"]].copy()
+    weekly_src["Date"] = pd.to_datetime(weekly_src["Date"], errors="coerce")
+    weekly_src = weekly_src.dropna(subset=["Date"]).set_index("Date").sort_index()
+    if weekly_src.empty:
+        return pd.DataFrame()
+    weekly = weekly_src.resample("W").agg({"High": "max", "Low": "min", "Close": "last"}).dropna()
+    return weekly
+
 def compute_indicators(df, price):
     if df is None or df.empty:
         raise ValueError("下載資料為空")
@@ -1252,13 +1291,7 @@ def compute_indicators(df, price):
     elif ma5 < ma10 < ma20: ma_trend = "空頭"
     else: ma_trend = "糾結"
 
-    low_9 = low.rolling(9).min()
-    high_9 = high.rolling(9).max()
-    denominator = (high_9 - low_9).replace(0, pd.NA)
-
-    rsv = ((close - low_9) / denominator) * 100
-    k = rsv.ewm(alpha=1/3, adjust=False).mean()
-    d = k.ewm(alpha=1/3, adjust=False).mean()
+    k, d = calc_kd_series(close, low, high, period=9)
     if len(k.dropna()) < 2 or len(d.dropna()) < 2:
         raise ValueError("KD 計算資料不足")
 
@@ -1266,13 +1299,22 @@ def compute_indicators(df, price):
     d_t = float(d.iloc[-1])
     k_y = float(k.iloc[-2])
     d_y = float(d.iloc[-2])
+    kd_signal = judge_kd_signal(k_t, k_y, d_t, d_y)
 
-    if k_y <= d_y and k_t > d_t: kd_signal = "黃金交叉"
-    elif k_y >= d_y and k_t < d_t: kd_signal = "死亡交叉"
-    elif k_t < d_t and (d_t - k_t) < 3: kd_signal = "即將黃金交叉"
-    elif k_t > d_t and (k_t - d_t) < 3: kd_signal = "即將死亡交叉"
-    elif k_t < 25: kd_signal = "超賣"
-    else: kd_signal = "-"
+    # ===== 週KD計算 =====
+    # 沿用同一批日線資料重採樣成週線，不額外呼叫 API，資料抓取時間範圍維持不變。
+    # 3~4個月資料約僅有 13~18 週，週KD需至少 9 週(rolling)+1週比較，資料不足時訊號留空("-")。
+    week_k_t = week_d_t = None
+    week_kd_signal = "-"
+    weekly_df = resample_weekly_ohlc(df)
+    if len(weekly_df) >= 10:
+        wk, wd = calc_kd_series(weekly_df["Close"], weekly_df["Low"], weekly_df["High"], period=9)
+        if len(wk.dropna()) >= 2 and len(wd.dropna()) >= 2:
+            week_k_t = float(wk.iloc[-1])
+            week_d_t = float(wd.iloc[-1])
+            week_k_y = float(wk.iloc[-2])
+            week_d_y = float(wd.iloc[-2])
+            week_kd_signal = judge_kd_signal(week_k_t, week_k_y, week_d_t, week_d_y)
 
     # ===== MACD 計算 =====
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -1341,6 +1383,9 @@ def compute_indicators(df, price):
         "k": round(k_t, 1),
         "d": round(d_t, 1),
         "kd_signal": kd_signal,
+        "week_k": round(week_k_t, 1) if week_k_t is not None else "-",
+        "week_d": round(week_d_t, 1) if week_d_t is not None else "-",
+        "week_kd_signal": week_kd_signal,
         "gap_signal": gap_signal,
         "macd_hist": round(macd_hist_t, 4),
         "macd_signal": macd_signal,
@@ -1515,7 +1560,7 @@ rise_threshold = st.number_input(
 
 
 st.markdown("### 🎯 掃描條件")
-scan_btn_col1, scan_btn_col2, scan_col1, scan_gain_col, scan_col2, scan_col3, scan_macd_col, scan_trend_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.3, 1.0, 0.7, 1.4, 1.0, 1.1, 1.2, 1.8])
+scan_btn_col1, scan_btn_col2, scan_col1, scan_gain_col, scan_col2, scan_col3, scan_week_kd_col, scan_macd_col, scan_trend_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.2, 0.9, 0.7, 1.3, 1.3, 0.9, 1.0, 1.1, 1.7])
 with scan_btn_col1:
     if st.button("▶️ 開始掃描", use_container_width=True, disabled=st.session_state.scan_enabled):
         st.session_state.scan_enabled = True
@@ -1539,6 +1584,12 @@ with scan_col2:
     include_gap_signal_filter = st.checkbox("跳空", value=True)
 with scan_col3:
     include_kd_signal_filter = st.checkbox("黃金交叉 / 即將黃金交叉", value=True)
+with scan_week_kd_col:
+    include_week_kd_signal_filter = st.checkbox(
+        "週KD 黃金交叉 / 即將黃金交叉",
+        value=True,
+        help="以同一批已下載的日線資料重採樣成週線後計算KD，資料抓取區間與日KD相同，不會多打API。"
+    )
 with scan_macd_col:
     include_macd_signal_filter = st.checkbox("MACD翻正", value=True)
 with scan_trend_col:
@@ -1569,6 +1620,8 @@ if include_gap_signal_filter:
     selected_signal_names.append("跳空")
 if include_kd_signal_filter:
     selected_signal_names.extend(["黃金交叉", "即將黃金交叉"])
+if include_week_kd_signal_filter:
+    selected_signal_names.extend(["週黃金交叉", "週即將黃金交叉"])
 if include_macd_signal_filter:
     selected_signal_names.append("MACD翻正")
 if include_trend_signal_filter:
@@ -1627,7 +1680,7 @@ if should_run_scan:
     group_tables = {}
     group_up_summary = []
     all_signal_rows = []
-    signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
+    signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
     render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
     progress_bar = st.progress(0, text=f"掃描進度：0.0%（準備掃描 {scan_total_count} 檔股票）")
@@ -1663,6 +1716,7 @@ if should_run_scan:
                 if data["pct"] >= rise_threshold: signal_types.append("漲幅達標")
                 if data["gap_signal"] == "跳空": signal_types.append("跳空")
                 if data["kd_signal"] in ["黃金交叉", "即將黃金交叉"]: signal_types.append(data["kd_signal"])
+                if data["week_kd_signal"] in ["黃金交叉", "即將黃金交叉"]: signal_types.append(f"週{data['week_kd_signal']}")
                 if data["macd_signal"] == "MACD翻正": signal_types.append("MACD翻正")
                 if data["trend_signal"] == "趨勢突破": signal_types.append("趨勢突破")
                     
@@ -1685,6 +1739,7 @@ if should_run_scan:
                             f"📦 成交量：{data['volume_lots']:,.1f} 張\n"
                             f"🌊 波動率：{data['volatility_pct']}%\n"
                             f"📊 KD訊號：{data['kd_signal']}\n"
+                            f"📊 週KD訊號：{data['week_kd_signal']}\n"
                             f"🧭 MACD訊號：{data['macd_signal']} / MACD柱：{data['macd_hist']}\n"
                             f"🚀 跳空訊號：{data['gap_signal']}\n"
                             f"🔥 趨勢突破：{data['trend_signal']}\n"
@@ -1715,7 +1770,11 @@ if should_run_scan:
                     "貼線數": data["trend_touch_count"], "穿線數": data["trend_violations"],
                     "MA位置": data["ma_range"], "MA排列": data["ma_trend"],
                     "K值": data["k"], "D值": f"{data['d']:.1f}",
-                    "KD訊號": data["kd_signal"], "MACD柱": data["macd_hist"],
+                    "KD訊號": data["kd_signal"],
+                    "週K值": data["week_k"],
+                    "週D值": data["week_d"] if data["week_d"] == "-" else f"{data['week_d']:.1f}",
+                    "週KD訊號": data["week_kd_signal"],
+                    "MACD柱": data["macd_hist"],
                     "MACD訊號": data["macd_signal"], "跳空訊號": data["gap_signal"],
                     "訊號類型": "、".join(signal_types) if signal_types else "-",
                     "來源": active_price_source,
@@ -1735,7 +1794,8 @@ if should_run_scan:
                         "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-",
                         "P1日期": "-", "區高P1": "-", "P2日期": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-", "貼線數": "-", "穿線數": "-",
                         "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-",
-                        "KD訊號": "-", "MACD柱": "-", "MACD訊號": "-",
+                        "KD訊號": "-", "週K值": "-", "週D值": "-", "週KD訊號": "-",
+                        "MACD柱": "-", "MACD訊號": "-",
                         "跳空訊號": str(e), "訊號類型": "錯誤", "來源": active_price_source,
                     })
 
@@ -1746,6 +1806,8 @@ if should_run_scan:
         if not display_df.empty:
             display_df["漲跌%"] = display_df["漲跌%"].apply(format_color)
             display_df["K值"] = display_df["K值"].apply(format_k)
+            if "週K值" in display_df.columns:
+                display_df["週K值"] = display_df["週K值"].apply(format_k)
             display_df["成交量(張)"] = display_df["成交量(張)"].apply(format_volume)
             if "波動率%" in display_df.columns:
                 display_df["波動率%"] = display_df["波動率%"].apply(format_volatility)
@@ -1780,7 +1842,7 @@ else:
     group_tables = last_scan_result.get("group_tables", {})
     group_up_summary = last_scan_result.get("group_up_summary", [])
     all_signal_rows = last_scan_result.get("all_signal_rows", [])
-    signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
+    signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
     render_scan_progress_card(scan_progress_card_placeholder, last_scan_result.get("progress_pct", 100), "掃描進度")
 
 excel_bytes = build_signal_excel_bytes(signal_buckets)
@@ -1804,13 +1866,15 @@ unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=[
 st.metric("符合勾選掃描條件股票數", unique_signal_count)
 
 # 全域定義顯示的欄位，確保資料表一定找得到
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])
     signal_display_df = signal_df.copy()
     signal_display_df["漲跌%"] = signal_display_df["漲跌%"].apply(format_color)
     signal_display_df["K值"] = signal_display_df["K值"].apply(format_k)
+    if "週K值" in signal_display_df.columns:
+        signal_display_df["週K值"] = signal_display_df["週K值"].apply(format_k)
     signal_display_df["成交量(張)"] = signal_display_df["成交量(張)"].apply(format_volume)
     if "波動率%" in signal_display_df.columns:
         signal_display_df["波動率%"] = signal_display_df["波動率%"].apply(format_volatility)
@@ -1841,6 +1905,8 @@ if all_signal_rows:
         ("跳空", "跳空"),
         ("黃金交叉", "黃金交叉"),
         ("即將黃金交叉", "即將黃金交叉"),
+        ("週黃金交叉", "週黃金交叉"),
+        ("週即將黃金交叉", "週即將黃金交叉"),
         ("MACD 訊號", "MACD翻正"),
         ("趨勢突破", "趨勢突破"), 
     ]
@@ -1863,6 +1929,8 @@ if all_signal_rows:
                 bucket_display_df = bucket_df.copy()
                 bucket_display_df["漲跌%"] = bucket_display_df["漲跌%"].apply(format_color)
                 bucket_display_df["K值"] = bucket_display_df["K值"].apply(format_k)
+                if "週K值" in bucket_display_df.columns:
+                    bucket_display_df["週K值"] = bucket_display_df["週K值"].apply(format_k)
                 bucket_display_df["成交量(張)"] = bucket_display_df["成交量(張)"].apply(format_volume)
                 if "波動率%" in bucket_display_df.columns:
                     bucket_display_df["波動率%"] = bucket_display_df["波動率%"].apply(format_volatility)
