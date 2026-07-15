@@ -208,15 +208,15 @@ def check_telegram_push_command():
     return False
 
 # ===== Fubon API 行情工具 =====
-@st.cache_data(ttl=REFRESH_SEC)
-def download_stock_data(symbol: str, _sdk):
+def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFrame:
+    """
+    向富邦 API 抓取指定日期區間的日K線，統一整理成與 yfinance 對齊的欄位格式
+    （Date/Open/High/Low/Close/Volume），方便後續與 Yfinance 資料合併串接。
+    """
     if _sdk is None:
         raise ValueError("富邦 API 尚未連線")
-        
+
     fubon_symbol = str(symbol).split(".")[0]
-    end_date = date.today()
-    start_date = end_date - timedelta(days=90)
-    
     try:
         res = _sdk.marketdata.rest_client.stock.historical.candles(**{
             "symbol": fubon_symbol,
@@ -225,29 +225,46 @@ def download_stock_data(symbol: str, _sdk):
             "timeframe": "D",
             "fields": "open,high,low,close,volume"
         })
-        
-        if res and "data" in res and isinstance(res["data"], list):
+
+        if res and "data" in res and isinstance(res["data"], list) and res["data"]:
             df = pd.DataFrame(res["data"])
-            if not df.empty:
-                df.rename(columns={
-                    "open": "Open",
-                    "high": "High",
-                    "low": "Low",
-                    "close": "Close",
-                    "volume": "Volume"
-                }, inplace=True)
-                
-                if "date" in df.columns:
-                    df = df.sort_values("date").reset_index(drop=True)
-                    
-                for col in ["Open", "High", "Low", "Close", "Volume"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                    
-                return df
+            df.rename(columns={
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume", "date": "Date",
+            }, inplace=True)
+
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+                df = df.sort_values("Date").reset_index(drop=True)
+
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            keep_cols = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            return df[keep_cols].dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
     except Exception as e:
-        print(f"富邦 API 抓取 {fubon_symbol} 歷史 K 線失敗: {e}")
-        
+        print(f"富邦 API 抓取 {fubon_symbol} K 線失敗: {e}")
+
     return pd.DataFrame()
+
+@st.cache_data(ttl=REFRESH_SEC)
+def download_stock_data(symbol: str, _sdk):
+    """富邦完整90天歷史資料（僅在混合資料源都抓不到時作為備援使用，平常掃描不會走這條慢路徑）"""
+    end_date = date.today()
+    start_date = end_date - timedelta(days=90)
+    return _fetch_fubon_candles(symbol, _sdk, start_date, end_date)
+
+@st.cache_data(ttl=REFRESH_SEC)
+def download_stock_data_fubon_today(symbol: str, _sdk, today_str: str):
+    """
+    🚀 加速重點：盤中(9:00-13:30)只跟富邦要『今日』單日K線，不再像過去一樣每次都要
+    90天完整歷史。今日以前的資料改由 Yfinance 批次快取提供（見下方 bulk_download_yfinance_history），
+    單檔富邦請求的資料量大幅縮小，掃描速度明顯提升。
+    """
+    if _sdk is None:
+        return pd.DataFrame()
+    today = date.today()
+    return _fetch_fubon_candles(symbol, _sdk, today, today)
 
 def normalize_ohlc(df):
     if df is None or df.empty:
@@ -385,6 +402,71 @@ def download_stock_data_yfinance(symbol: str):
         df = df.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
     return df.reset_index(drop=True)
 
+def _split_yfinance_bulk_result(raw: pd.DataFrame, symbols: tuple) -> dict:
+    """把 yf.download 多檔批次結果拆成 {symbol: 單檔DataFrame} 字典"""
+    result = {}
+    if raw is None or raw.empty:
+        return {s: pd.DataFrame() for s in symbols}
+    is_multi = isinstance(raw.columns, pd.MultiIndex)
+    for symbol in symbols:
+        try:
+            if is_multi:
+                if symbol not in raw.columns.get_level_values(0):
+                    result[symbol] = pd.DataFrame()
+                    continue
+                sub = raw[symbol].copy()
+            else:
+                sub = raw.copy()
+            result[symbol] = _normalize_yfinance_ohlcv(sub)
+        except Exception:
+            result[symbol] = pd.DataFrame()
+    return result
+
+@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
+def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
+    """
+    🚀 加速重點：一次批次下載整批股票『今日以前』的歷史資料（yfinance 內部會自動平行抓取多檔），
+    取代過去逐檔各打一次 API 的作法。全市場掃描時（可能上百檔股票），這能把歷史資料的
+    網路請求次數從「N次」降為「1次」，是掃描速度提升最主要的來源。
+    快取1小時，同一小時內重複掃描不會再次觸發下載。
+    """
+    if yf is None or not symbols:
+        return {}
+    try:
+        raw = yf.download(
+            tickers=list(symbols), period="4mo", interval="1d",
+            auto_adjust=False, group_by="ticker", threads=True, progress=False,
+        )
+    except Exception:
+        return {s: pd.DataFrame() for s in symbols}
+
+    today = pd.to_datetime(today_str).date()
+    per_symbol = _split_yfinance_bulk_result(raw, symbols)
+    return {
+        s: (df[df["Date"] < today].reset_index(drop=True) if not df.empty else df)
+        for s, df in per_symbol.items()
+    }
+
+@st.cache_data(ttl=REFRESH_SEC)
+def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
+    """批次下載整批股票『今日』資料，供盤後(13:30後)全面改用Yfinance時使用"""
+    if yf is None or not symbols:
+        return {}
+    try:
+        raw = yf.download(
+            tickers=list(symbols), period="5d", interval="1d",
+            auto_adjust=False, group_by="ticker", threads=True, progress=False,
+        )
+    except Exception:
+        return {s: pd.DataFrame() for s in symbols}
+
+    today = pd.to_datetime(today_str).date()
+    per_symbol = _split_yfinance_bulk_result(raw, symbols)
+    return {
+        s: (df[df["Date"] >= today].reset_index(drop=True) if not df.empty else df)
+        for s, df in per_symbol.items()
+    }
+
 def resolve_price_source(now_dt=None) -> str:
     mode = st.session_state.get("price_source_mode", "自動")
     if mode in ["WebSocket", "Yfinance"]:
@@ -397,38 +479,83 @@ def resolve_price_source(now_dt=None) -> str:
 def render_price_source_selector(now_dt):
     active_source = resolve_price_source(now_dt)
     source_mode = st.session_state.get("price_source_mode", "自動")
-    with st.sidebar.expander("🧭 價格來源模式", expanded=True):
+    with st.sidebar.expander("🧭 資料來源開關", expanded=True):
         st.markdown(
             f"""
             <div style="background:#2f4563; color:#35a8ff; border-radius:8px; padding:14px 16px; line-height:1.8; font-weight:600;">
-            目前價格模式：{source_mode}；<br>
+            目前資料來源模式：{source_mode}；<br>
             實際使用：{active_source}
             </div>
             """,
             unsafe_allow_html=True,
         )
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("WebSocket", use_container_width=True, key="price_source_ws_btn"):
-                st.session_state.price_source_mode = "WebSocket"
-                st.cache_data.clear(); st.rerun()
-        with c2:
-            if st.button("Yfinance", use_container_width=True, key="price_source_yf_btn"):
-                st.session_state.price_source_mode = "Yfinance"
-                st.cache_data.clear(); st.rerun()
-        if st.button("恢復自動模式", use_container_width=True, key="price_source_auto_btn"):
-            st.session_state.price_source_mode = "自動"
-            st.cache_data.clear(); st.rerun()
+        st.caption(
+            f"自動模式邏輯：{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 前 → "
+            f"富邦WebSocket(今日) + Yfinance(今日以前) 混合資料；"
+            f"{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 後 → 全部改用 Yfinance。"
+        )
+        mode_options = ["自動", "WebSocket", "Yfinance"]
+        selected_mode = st.radio(
+            "資料來源開關",
+            options=mode_options,
+            index=mode_options.index(source_mode) if source_mode in mode_options else 0,
+            horizontal=True,
+            key="price_source_mode_radio",
+            label_visibility="collapsed",
+        )
+        if selected_mode != source_mode:
+            st.session_state.price_source_mode = selected_mode
+            st.cache_data.clear()
+            st.rerun()
     return active_source
 
-def download_stock_data_by_source(symbol: str, _sdk, source: str):
+def download_stock_data_by_source(
+    symbol: str, _sdk, source: str, today_str: str,
+    history_map: dict = None, yf_today_map: dict = None,
+):
+    """
+    依資料來源模式取得K線資料（邏輯維持不變，僅優化抓取方式加速）：
+    - Yfinance：優先查表使用外部預先批次下載好的 history_map / yf_today_map（一次API呼叫換來的整批結果），
+      查不到才退回單檔即時查詢（例如臨時加入、不在原批次清單中的股票）。
+    - WebSocket（盤中9:00-13:30混合模式）：『今日以前』歷史資料一樣查表使用 Yfinance 批次快取，
+      『今日』資料改成只跟富邦要當天單日K線（不再要90天），大幅減少富邦API的資料量與延遲。
+    - 兩種模式都抓不到資料時，才退回最慢但最保險的富邦90天完整歷史。
+    """
+    history_map = history_map or {}
+    yf_today_map = yf_today_map or {}
+
+    def _combine(history_df, today_df):
+        frames = [d for d in [history_df, today_df] if d is not None and not d.empty]
+        if not frames:
+            return pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True)
+        if "Date" in combined.columns:
+            combined = combined.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
+        return combined
+
     if source == "Yfinance":
-        df = download_stock_data_yfinance(symbol)
+        history_df = history_map.get(symbol)
+        if history_df is None:
+            history_df = download_stock_data_yfinance_history(symbol, today_str)
+        today_df = yf_today_map.get(symbol)
+        if today_df is None:
+            today_df = download_stock_data_yfinance_today(symbol, today_str)
+        df = _combine(history_df, today_df)
         if not df.empty:
             return df
         if _sdk is not None:
             return download_stock_data(symbol, _sdk)
         return pd.DataFrame()
+
+    # ===== WebSocket：盤中混合模式 =====
+    history_df = history_map.get(symbol)
+    if history_df is None:
+        history_df = download_stock_data_yfinance_history(symbol, today_str)
+    today_df = download_stock_data_fubon_today(symbol, _sdk, today_str) if _sdk is not None else pd.DataFrame()
+    df = _combine(history_df, today_df)
+    if not df.empty:
+        return df
+    # 混合來源都抓不到資料時，退回原本較慢的富邦90天完整歷史作為最終備援
     return download_stock_data(symbol, _sdk)
 
 def get_last_price_by_source(symbol: str, df, _sdk, source: str):
@@ -1682,6 +1809,17 @@ if should_run_scan:
     all_signal_rows = []
     signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
+
+    # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
+    # 這是加速全市場掃描最主要的一步，尤其股票數量多時效果最明顯。
+    scan_today_str = tw_now.strftime("%Y-%m-%d")
+    all_unique_symbols = tuple(sorted({s for stocks in st.session_state.stock_groups.values() for s in stocks}))
+    yf_history_map = bulk_download_yfinance_history(all_unique_symbols, scan_today_str) if yf is not None else {}
+    yf_today_map = (
+        bulk_download_yfinance_today(all_unique_symbols, scan_today_str)
+        if (yf is not None and active_price_source == "Yfinance") else {}
+    )
+
     render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
     progress_bar = st.progress(0, text=f"掃描進度：0.0%（準備掃描 {scan_total_count} 檔股票）")
     processed_count = 0
@@ -1704,7 +1842,10 @@ if should_run_scan:
                 render_scan_progress_card(scan_progress_card_placeholder, progress_pct, "掃描進度")
                 progress_bar.progress(progress_value, text=f"掃描進度：{progress_pct:.1f}%（{processed_count}/{scan_total_count}：{symbol}）")
             try:
-                df = download_stock_data_by_source(symbol, st.session_state.fubon_sdk, active_price_source)
+                df = download_stock_data_by_source(
+                    symbol, st.session_state.fubon_sdk, active_price_source, scan_today_str,
+                    history_map=yf_history_map, yf_today_map=yf_today_map,
+                )
                 df = normalize_ohlc(df)
                 if df.empty: raise ValueError("無效的 K 線資料")
 
