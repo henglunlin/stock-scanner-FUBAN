@@ -120,7 +120,7 @@ if "qmd_last_scan_result" not in st.session_state:
 if "qmd_manual_symbols_text" not in st.session_state:
     st.session_state.qmd_manual_symbols_text = ""
 
-st.title("🎯 巧妙點掃描 (十字線家族 + 量縮)")
+st.title("🎯 巧妙點掃描")
 st.caption("條件１：實體佔全距(高-低)比例極小，且具有長影線特徵。條件２：今日成交量 < N日均量 × 門檻%。兩條件同時成立才算命中。")
 
 # ===== 側邊欄：富邦連線 / 資料來源 =====
