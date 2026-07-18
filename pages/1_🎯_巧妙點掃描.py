@@ -306,7 +306,7 @@ if should_run_scan:
         "shadow_threshold": shadow_threshold,
         "vol_ratio_threshold": vol_ratio_threshold,
         "vol_ma_days": int(vol_ma_days),
-        "excel_filename": f"QiaoMiaoDian_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
+        "excel_filename": f"巧妙點_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
     }
 
 last_result = st.session_state.qmd_last_scan_result or {}
