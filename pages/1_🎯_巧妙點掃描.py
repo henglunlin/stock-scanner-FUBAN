@@ -3,7 +3,7 @@
 pages/1_🎯_巧妙點掃描.py
 ========================
 獨立頁面：巧妙點 掃描條件
-- 條件1：|收盤價(現價) - 開盤價| / 開盤價 的絕對值百分比 < 門檻（預設 3.6%，可調整）
+- 條件1：K線型態符合十字線家族 (實體極小，依據上下影線比例區分 十字/T字/倒T字)
 - 條件2：今日成交量 < N日均量 × 門檻%（預設 10日、100%，可調整）
 - 使用「獨立」的股票掃描清單檔案（不吃主頁面的 TWstocklistname2.txt / 分組清單）
 
@@ -37,8 +37,8 @@ if "qmd_last_scan_result" not in st.session_state:
 if "qmd_manual_symbols_text" not in st.session_state:
     st.session_state.qmd_manual_symbols_text = ""
 
-st.title("🎯 巧妙點掃描")
-st.caption("條件１：|收盤價（現價）－開盤價| ÷ 開盤價 的漲跌幅絕對值 < 門檻。條件２：今日成交量 < N日均量 × 門檻%。兩條件同時成立才算命中。")
+st.title("🎯 巧妙點掃描 (十字線家族 + 量縮)")
+st.caption("條件１：實體佔全距(高-低)比例極小，且具有長影線特徵。條件２：今日成交量 < N日均量 × 門檻%。兩條件同時成立才算命中。")
 
 # ===== 側邊欄：富邦連線 / 資料來源 =====
 cf.render_fubon_login_sidebar()
@@ -47,10 +47,15 @@ active_price_source = cf.render_price_source_selector_sidebar(tw_now)
 
 # ===== 側邊欄：巧妙點掃描條件（可調整）=====
 with st.sidebar.expander("⚙️ 巧妙點掃描條件", expanded=True):
-    pct_threshold = st.number_input(
-        "條件１：漲跌幅絕對值上限 (%)",
-        min_value=0.0, max_value=50.0, value=3.6, step=0.1, format="%.2f",
-        help="以「(現價－開盤價) / 開盤價 × 100%」計算，取絕對值後需小於此門檻。",
+    body_threshold = st.number_input(
+        "條件１：實體佔全距上限 (%)",
+        min_value=0.0, max_value=50.0, value=10.0, step=1.0, format="%.1f",
+        help="實體(|收-開|) 佔 全日振幅(高-低) 的百分比上限。預設 < 10% 視為十字線家族。",
+    )
+    shadow_threshold = st.number_input(
+        "條件１：長影線最低門檻 (%)",
+        min_value=0.0, max_value=100.0, value=60.0, step=5.0, format="%.1f",
+        help="單邊影線長度需佔全日振幅大於此門檻，才符合 T字線 或 倒T字線 特徵。",
     )
     vol_ma_days = st.number_input(
         "均量天數 N（日）",
@@ -197,14 +202,19 @@ if should_run_scan:
             if df.empty or len(df) < need_days + 1:
                 raise ValueError("歷史資料不足，無法計算均量")
 
+            # --- 1. 取得 OHLC 資料 ---
             open_price = df["Open"].iloc[-1]
             if pd.isna(open_price) or open_price == 0:
                 raise ValueError("今日尚無有效開盤資料")
             open_price = float(open_price)
 
-            price = cf.get_last_price_by_source(symbol, df, st.session_state.fubon_sdk, active_price_source)
+            price = cf.get_last_price_by_source(symbol, df, st.session_state.fubon_sdk, active_price_source) # 即現價/收盤價
+            high_price = float(df["High"].iloc[-1])
+            low_price = float(df["Low"].iloc[-1])
+            
             stock_name = cf.get_stock_name(symbol, st.session_state.fubon_sdk)
 
+            # --- 取得量能資料 ---
             volume_series = pd.to_numeric(df["Volume"], errors="coerce")
             today_volume = float(volume_series.iloc[-1]) if pd.notna(volume_series.iloc[-1]) else 0.0
 
@@ -218,16 +228,41 @@ if should_run_scan:
             vol_ma = float(vol_ma_window.mean())
             if vol_ma <= 0:
                 raise ValueError("均量資料異常")
-
-            pct_change_abs = abs(price - open_price) / open_price * 100
+                
             vol_ratio_pct = today_volume / vol_ma * 100
             today_volume_lots = today_volume / 1000
             vol_ma_lots = vol_ma / 1000
 
-            passes_condition1 = pct_change_abs < pct_threshold
-            passes_condition2 = vol_ratio_pct < vol_ratio_threshold
-            passes_min_volume = today_volume_lots >= float(min_volume_lots)
-            is_hit = passes_condition1 and passes_condition2 and passes_min_volume
+            # --- 2. 計算全距與各部位絕對長度 ---
+            k_range = high_price - low_price
+            body_size = abs(price - open_price)
+            upper_shadow = high_price - max(open_price, price)
+            lower_shadow = min(open_price, price) - low_price
+
+            # --- 3. 計算佔比 (%) ---
+            if k_range > 0:
+                body_ratio_pct = (body_size / k_range) * 100
+                upper_shadow_pct = (upper_shadow / k_range) * 100
+                lower_shadow_pct = (lower_shadow / k_range) * 100
+            else:
+                body_ratio_pct = upper_shadow_pct = lower_shadow_pct = 0.0
+
+            # --- 4. 判斷 K 線型態 ---
+            k_pattern = "-"
+            if body_ratio_pct <= body_threshold:
+                if lower_shadow_pct >= shadow_threshold and upper_shadow_pct <= body_threshold:
+                    k_pattern = "T字線"
+                elif upper_shadow_pct >= shadow_threshold and lower_shadow_pct <= body_threshold:
+                    k_pattern = "倒T字線"
+                else:
+                    k_pattern = "十字線"
+
+            # --- 5. 綜合量能條件判定 ---
+            passes_k_pattern = (k_pattern != "-")
+            passes_vol = (vol_ratio_pct < vol_ratio_threshold)
+            passes_min_volume = (today_volume_lots >= float(min_volume_lots))
+            
+            is_hit = passes_k_pattern and passes_vol and passes_min_volume
 
             row = {
                 "代碼": symbol,
@@ -235,13 +270,17 @@ if should_run_scan:
                 "股票名稱": stock_name,
                 "開盤": round(open_price, 2),
                 "現價": round(price, 2),
-                "漲跌幅絕對值%": round(pct_change_abs, 2),
+                "型態": k_pattern,
+                "實體佔比%": round(body_ratio_pct, 1),
+                "上影佔比%": round(upper_shadow_pct, 1),
+                "下影佔比%": round(lower_shadow_pct, 1),
                 "成交量(張)": round(today_volume_lots, 1),
                 f"{int(vol_ma_days)}日均量(張)": round(vol_ma_lots, 1),
                 "量比%": round(vol_ratio_pct, 1),
                 "是否命中巧妙點": "✅ 是" if is_hit else "否",
                 "來源": active_price_source,
             }
+            
             if (not show_only_hits) or is_hit:
                 rows.append(row)
             if is_hit:
@@ -251,8 +290,8 @@ if should_run_scan:
             if not show_only_hits:
                 rows.append({
                     "代碼": symbol, "代碼網址": "", "股票名稱": cf.get_stock_name(symbol, st.session_state.fubon_sdk),
-                    "開盤": "-", "現價": "錯誤", "漲跌幅絕對值%": "-", "成交量(張)": "-",
-                    f"{int(vol_ma_days)}日均量(張)": "-", "量比%": "-",
+                    "開盤": "-", "現價": "錯誤", "型態": "-", "實體佔比%": "-", "上影佔比%": "-", "下影佔比%": "-", 
+                    "成交量(張)": "-", f"{int(vol_ma_days)}日均量(張)": "-", "量比%": "-",
                     "是否命中巧妙點": str(e), "來源": active_price_source,
                 })
 
@@ -263,7 +302,8 @@ if should_run_scan:
         "hit_rows": hit_rows,
         "error_count": error_count,
         "scan_completed_at": tw_now.strftime("%Y-%m-%d %H:%M:%S"),
-        "pct_threshold": pct_threshold,
+        "body_threshold": body_threshold,
+        "shadow_threshold": shadow_threshold,
         "vol_ratio_threshold": vol_ratio_threshold,
         "vol_ma_days": int(vol_ma_days),
         "excel_filename": f"QiaoMiaoDian_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
@@ -277,7 +317,7 @@ error_count = last_result.get("error_count", 0)
 # ===== 結果輸出（Excel / Telegram）=====
 def build_qiaomiao_excel_bytes(hit_rows_local):
     from io import BytesIO
-    columns = ["代碼", "股票名稱", "開盤", "現價", "漲跌幅絕對值%", "成交量(張)", "量比%", "是否命中巧妙點", "來源"]
+    columns = ["代碼", "股票名稱", "開盤", "現價", "型態", "實體佔比%", "上影佔比%", "下影佔比%", "成交量(張)", "量比%", "是否命中巧妙點", "來源"]
     df = pd.DataFrame(hit_rows_local)
     if df.empty:
         df = pd.DataFrame(columns=columns)
@@ -305,7 +345,7 @@ with action_col2:
     if st.button("推送命中清單到 Telegram", use_container_width=True, key="qmd_push_tg_btn"):
         ok = cf.send_telegram_document(
             excel_bytes, excel_filename,
-            caption=f"巧妙點掃描結果｜漲跌幅絕對值<{last_result.get('pct_threshold', pct_threshold)}%｜"
+            caption=f"巧妙點掃描結果｜實體佔比<{last_result.get('body_threshold', body_threshold)}%｜"
                     f"量比<{last_result.get('vol_ratio_threshold', vol_ratio_threshold)}%｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}",
         )
         if ok:
@@ -317,7 +357,7 @@ m1.metric("命中巧妙點檔數", len(hit_rows))
 m2.metric("清單股票總數", len(scan_symbols))
 m3.metric("抓取失敗檔數", error_count)
 
-display_columns = ["代碼", "股票名稱", "開盤", "現價", "漲跌幅絕對值%", "成交量(張)",
+display_columns = ["代碼", "股票名稱", "開盤", "現價", "型態", "實體佔比%", "上影佔比%", "下影佔比%", "成交量(張)",
                     f"{last_result.get('vol_ma_days', int(vol_ma_days))}日均量(張)", "量比%", "是否命中巧妙點", "來源"]
 
 if rows:
@@ -347,9 +387,12 @@ else:
 with st.expander("ℹ️ 巧妙點條件說明"):
     st.markdown(
         f"""
-- **條件１（價格）**：`|現價 － 今日開盤價| ÷ 今日開盤價 × 100%` 需 **小於 {last_result.get('pct_threshold', pct_threshold)}%**
-- **條件２（量能）**：`今日成交量 ÷ {last_result.get('vol_ma_days', int(vol_ma_days))}日均量 × 100%` 需 **小於 {last_result.get('vol_ratio_threshold', vol_ratio_threshold)}%**
-- 兩條件需同時成立才算「命中巧妙點」
-- 股票清單為**獨立清單**（`{QIAOMIAO_STOCK_FILE}` 或使用者自行上傳/輸入），不會套用主頁面的分組或全市場清單
+- **條件１（價格與型態）**：
+    - 計算全日振幅 `(最高價 - 最低價)`。
+    - 實體佔比：`|收盤價 - 開盤價| ÷ 振幅 × 100%` 需小於 **{last_result.get('body_threshold', body_threshold)}%**。
+    - 上/下影線佔比依據長短判斷為 **十字線**、**T字線**（下影線大於 {last_result.get('shadow_threshold', shadow_threshold)}%）、**倒T字線**（上影線大於 {last_result.get('shadow_threshold', shadow_threshold)}%）。
+- **條件２（量能）**：今日成交量 `÷ {last_result.get('vol_ma_days', int(vol_ma_days))}日均量 × 100%` 需小於 **{last_result.get('vol_ratio_threshold', vol_ratio_threshold)}%**。
+- 兩條件需同時成立才算「命中巧妙點」。
+- 股票清單為**獨立清單**（`{QIAOMIAO_STOCK_FILE}` 或使用者自行上傳/輸入），不會套用主頁面的分組或全市場清單。
         """
     )
