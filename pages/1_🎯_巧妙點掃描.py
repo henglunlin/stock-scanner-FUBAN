@@ -132,7 +132,7 @@ active_price_source = cf.render_price_source_selector_sidebar(tw_now)
 with st.sidebar.expander("⚙️ 巧妙點掃描條件", expanded=True):
     body_threshold = st.number_input(
         "條件１：實體佔全距上限 (%)",
-        min_value=0.0, max_value=50.0, value=10.0, step=1.0, format="%.1f",
+        min_value=0.0, max_value=90.0, value=60.0, step=5.0, format="%.1f",
         help="實體(|收-開|) 佔 全日振幅(高-低) 的百分比上限。預設 < 10% 視為十字線家族。",
     )
     shadow_threshold = st.number_input(
