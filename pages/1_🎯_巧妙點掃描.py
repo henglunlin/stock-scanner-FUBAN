@@ -6,9 +6,6 @@ pages/1_🎯_巧妙點掃描.py
 - 條件1：K線型態符合十字線家族 (實體極小，依據上下影線比例區分 十字/T字/倒T字)
 - 條件2：今日成交量 < N日均量 × 門檻%（預設 10日、100%，可調整）
 - 使用「獨立」的股票掃描清單檔案（不吃主頁面的 TWstocklistname2.txt / 分組清單）
-
-把這個檔案放在主程式同一層目錄下的 pages/ 資料夾裡，Streamlit 就會自動把它
-辨識成側邊導覽列中的一個獨立頁面。
 """
 
 import os
@@ -20,13 +17,99 @@ import streamlit as st
 
 import common_fubon as cf
 
+# ===== 輔助函式：自動判別 .TW 或 .TWO =====
+@st.cache_data(ttl=86400)
+def load_code_to_ticker_map(filepath="TWstocklistname2.txt"):
+    """
+    從 TWstocklistname2.txt 載入純號碼對應到 .TW 或 .TWO 的查表字典
+    """
+    mapping = {}
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                parts = line.split()
+                if parts:
+                    ticker = parts[0].strip().upper()
+                    if "." in ticker:
+                        code = ticker.split(".")[0]
+                        mapping[code] = ticker
+    return mapping
+
+def symbol_to_code(symbol: str) -> str:
+    return str(symbol).split(".")[0]
+
+def normalize_symbol_quick(input_text: str):
+    s = str(input_text).strip().upper()
+    if not s:
+        return None
+    if "." in s:
+        return s
+    if s.isdigit():
+        if s.startswith(("3", "6", "8")):
+            return f"{s}.TWO"
+        return f"{s}.TW"
+    return s
+
+def build_yfinance_candidates(symbol: str, code_map: dict = None):
+    code_map = code_map or {}
+    raw = str(symbol).strip().upper()
+    code = symbol_to_code(raw)
+    
+    # 【新增】查表邏輯：如果輸入是純號碼或沒有後綴，且在對應表中找得到，直接回傳表裡的確切代碼
+    if ("." not in raw) and code in code_map:
+        return [code_map[code]]
+        
+    candidates = []
+    if raw and "." in raw:
+        candidates.append(raw)
+    elif raw:
+        normalized = normalize_symbol_quick(raw)
+        if normalized:
+            candidates.append(normalized)
+    if code:
+        candidates.extend([f"{code}.TW", f"{code}.TWO"])
+    
+    result, seen = [], set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+def parse_raw_symbols(text: str) -> list:
+    """
+    寬鬆解析股票代碼：
+    - 允許純數字
+    - 以換行符號或逗號分割
+    - 遇到空格或 Tab 自動截斷（支援 "2330 台積電" 格式）
+    """
+    symbols = []
+    if not text:
+        return symbols
+    
+    # 將全形空白、逗號統一替換為換行符號
+    text = text.replace("\ufeff", "").replace("\u3000", " ").replace(",", "\n")
+    
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 切割並取第一個元素作為代碼
+        raw_code = line.split()[0].upper()
+        if raw_code and raw_code not in symbols:
+            symbols.append(raw_code)
+    return symbols
+# ==========================================
+
 # ===== 頁面基本設定 =====
 st.set_page_config(page_title="巧妙點掃描", layout="wide")
 
 # ===== 這個頁面專屬的常數 =====
-QIAOMIAO_STOCK_FILE = "TWstocklistname_QiaoMiaoDian.txt"   # 巧妙點專用、獨立的股票掃描清單檔案
+QIAOMIAO_STOCK_FILE = "TWstocklistname_QiaoMiaoDian.txt"
 
-# ===== session_state 初始化（讓使用者可以直接從這一頁進站也不出錯）=====
+# ===== session_state 初始化 =====
 cf.ensure_fubon_session_state()
 if "qmd_scan_enabled" not in st.session_state:
     st.session_state.qmd_scan_enabled = False
@@ -45,7 +128,7 @@ cf.render_fubon_login_sidebar()
 tw_now = datetime.now(ZoneInfo("Asia/Taipei"))
 active_price_source = cf.render_price_source_selector_sidebar(tw_now)
 
-# ===== 側邊欄：巧妙點掃描條件（可調整）=====
+# ===== 側邊欄：巧妙點掃描條件 =====
 with st.sidebar.expander("⚙️ 巧妙點掃描條件", expanded=True):
     body_threshold = st.number_input(
         "條件１：實體佔全距上限 (%)",
@@ -90,30 +173,34 @@ with st.sidebar.expander("📋 巧妙點股票清單", expanded=True):
 
     uploaded_symbols = None
     if list_source_mode == "預設清單檔案":
-        st.caption(f"讀取檔案：`{QIAOMIAO_STOCK_FILE}`（格式同主程式：每行「代碼 名稱」或純代碼，例如 `2330.TW 台積電`）")
+        st.caption(f"讀取檔案：`{QIAOMIAO_STOCK_FILE}`")
         if not os.path.exists(QIAOMIAO_STOCK_FILE):
-            st.warning(f"尚未找到 {QIAOMIAO_STOCK_FILE}，請改用「上傳清單檔案」或「手動輸入代碼」，或把檔案放到程式同一層目錄。")
+            st.warning(f"尚未找到 {QIAOMIAO_STOCK_FILE}，請改用「上傳清單檔案」或「手動輸入代碼」。")
     elif list_source_mode == "上傳清單檔案":
         upload_file = st.file_uploader("上傳巧妙點股票清單 (.txt)", type=["txt"], key="qmd_upload_file")
         if upload_file is not None:
             content = upload_file.read().decode("utf-8-sig", errors="ignore")
-            uploaded_symbols = cf.parse_stock_symbols_from_text(content)
+            uploaded_symbols = parse_raw_symbols(content)
             st.success(f"已解析 {len(uploaded_symbols)} 檔股票代碼")
     else:
         st.session_state.qmd_manual_symbols_text = st.text_area(
-            "手動輸入代碼（每行一檔，或用逗號分隔；純數字會自動補上 .TW / .TWO）",
+            "手動輸入代碼（每行一檔，或用逗號分隔）",
             value=st.session_state.qmd_manual_symbols_text,
             height=140,
-            placeholder="2330\n2317.TW\n6488.TWO",
+            placeholder="2330\n2317\n6488",
         )
 
 # ===== 解析出這次掃描要用的股票清單 =====
 if list_source_mode == "預設清單檔案":
-    scan_symbols = cf.load_stock_symbols_from_file(QIAOMIAO_STOCK_FILE)
+    if os.path.exists(QIAOMIAO_STOCK_FILE):
+        with open(QIAOMIAO_STOCK_FILE, "r", encoding="utf-8-sig", errors="ignore") as f:
+            scan_symbols = parse_raw_symbols(f.read())
+    else:
+        scan_symbols = []
 elif list_source_mode == "上傳清單檔案":
     scan_symbols = uploaded_symbols or []
 else:
-    scan_symbols = cf.parse_manual_symbols(st.session_state.qmd_manual_symbols_text)
+    scan_symbols = parse_raw_symbols(st.session_state.qmd_manual_symbols_text)
 
 st.caption(
     f"更新時間：{tw_now.strftime('%Y-%m-%d %H:%M:%S')}｜價格來源：{active_price_source}｜"
@@ -167,16 +254,26 @@ if not should_run_scan and not has_last_result:
 # ===== 掃描主邏輯 =====
 if should_run_scan:
     scan_today_str = tw_now.strftime("%Y-%m-%d")
-    all_unique_symbols = tuple(sorted(set(scan_symbols)))
+    
+    unique_raw_symbols = tuple(sorted(set(scan_symbols)))
+    
+    # 載入股票代號與後綴的對應表
+    code_map = load_code_to_ticker_map("TWstocklistname2.txt")
 
-    # 批次預先抓取歷史資料，減少逐檔 API 呼叫次數
-    yf_history_map = cf.bulk_download_yfinance_history(all_unique_symbols, scan_today_str) if cf.yf is not None else {}
+    # 將清單展開成所有可能的 yfinance 候選代碼
+    expanded_symbols_set = set()
+    for sym in unique_raw_symbols:
+        expanded_symbols_set.update(build_yfinance_candidates(sym, code_map))
+    all_unique_expanded_symbols = tuple(sorted(expanded_symbols_set))
+
+    # 批次預先抓取歷史資料
+    yf_history_map = cf.bulk_download_yfinance_history(all_unique_expanded_symbols, scan_today_str) if cf.yf is not None else {}
     yf_today_map = (
-        cf.bulk_download_yfinance_today(all_unique_symbols, scan_today_str)
+        cf.bulk_download_yfinance_today(all_unique_expanded_symbols, scan_today_str)
         if (cf.yf is not None and active_price_source == "Yfinance") else {}
     )
 
-    total_count = len(all_unique_symbols)
+    total_count = len(unique_raw_symbols)
     progress_bar = progress_placeholder.progress(0, text=f"掃描進度：0.0%（準備掃描 {total_count} 檔股票）")
 
     rows = []
@@ -184,21 +281,34 @@ if should_run_scan:
     error_count = 0
     need_days = int(vol_ma_days) + (0 if vol_ma_include_today else 1)
 
-    for idx, symbol in enumerate(all_unique_symbols, start=1):
+    for idx, original_symbol in enumerate(unique_raw_symbols, start=1):
         if not st.session_state.qmd_scan_enabled:
             progress_placeholder.empty()
             st.warning("掃描已停止。")
             st.stop()
 
         progress_value = min(idx / total_count, 1.0) if total_count else 1.0
-        progress_bar.progress(progress_value, text=f"掃描進度：{progress_value*100:.1f}%（{idx}/{total_count}：{symbol}）")
+        progress_bar.progress(progress_value, text=f"掃描進度：{progress_value*100:.1f}%（{idx}/{total_count}：{original_symbol}）")
 
         try:
-            df = cf.download_stock_data_by_source(
-                symbol, st.session_state.fubon_sdk, active_price_source, scan_today_str,
-                history_map=yf_history_map, yf_today_map=yf_today_map,
-            )
-            df = cf.normalize_ohlc(df)
+            candidates = build_yfinance_candidates(original_symbol, code_map)
+            df = pd.DataFrame()
+            valid_symbol = original_symbol
+            
+            for candidate in candidates:
+                try:
+                    temp_df = cf.download_stock_data_by_source(
+                        candidate, st.session_state.fubon_sdk, active_price_source, scan_today_str,
+                        history_map=yf_history_map, yf_today_map=yf_today_map,
+                    )
+                    temp_df = cf.normalize_ohlc(temp_df)
+                    if not temp_df.empty and len(temp_df) >= need_days + 1:
+                        df = temp_df
+                        valid_symbol = candidate
+                        break  
+                except Exception:
+                    continue
+
             if df.empty or len(df) < need_days + 1:
                 raise ValueError("歷史資料不足，無法計算均量")
 
@@ -208,11 +318,11 @@ if should_run_scan:
                 raise ValueError("今日尚無有效開盤資料")
             open_price = float(open_price)
 
-            price = cf.get_last_price_by_source(symbol, df, st.session_state.fubon_sdk, active_price_source) # 即現價/收盤價
+            price = cf.get_last_price_by_source(valid_symbol, df, st.session_state.fubon_sdk, active_price_source)
             high_price = float(df["High"].iloc[-1])
             low_price = float(df["Low"].iloc[-1])
             
-            stock_name = cf.get_stock_name(symbol, st.session_state.fubon_sdk)
+            stock_name = cf.get_stock_name(valid_symbol, st.session_state.fubon_sdk)
 
             # --- 取得量能資料 ---
             volume_series = pd.to_numeric(df["Volume"], errors="coerce")
@@ -265,8 +375,8 @@ if should_run_scan:
             is_hit = passes_k_pattern and passes_vol and passes_min_volume
 
             row = {
-                "代碼": symbol,
-                "代碼網址": cf.yahoo_quote_url(symbol),
+                "代碼": valid_symbol,
+                "代碼網址": cf.yahoo_quote_url(valid_symbol),
                 "股票名稱": stock_name,
                 "開盤": round(open_price, 2),
                 "現價": round(price, 2),
@@ -289,7 +399,7 @@ if should_run_scan:
             error_count += 1
             if not show_only_hits:
                 rows.append({
-                    "代碼": symbol, "代碼網址": "", "股票名稱": cf.get_stock_name(symbol, st.session_state.fubon_sdk),
+                    "代碼": original_symbol, "代碼網址": "", "股票名稱": cf.get_stock_name(original_symbol, st.session_state.fubon_sdk),
                     "開盤": "-", "現價": "錯誤", "型態": "-", "實體佔比%": "-", "上影佔比%": "-", "下影佔比%": "-", 
                     "成交量(張)": "-", f"{int(vol_ma_days)}日均量(張)": "-", "量比%": "-",
                     "是否命中巧妙點": str(e), "來源": active_price_source,
