@@ -209,10 +209,6 @@ def check_telegram_push_command():
 
 # ===== Fubon API 行情工具 =====
 def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFrame:
-    """
-    向富邦 API 抓取指定日期區間的日K線，統一整理成與 yfinance 對齊的欄位格式
-    （Date/Open/High/Low/Close/Volume），方便後續與 Yfinance 資料合併串接。
-    """
     if _sdk is None:
         raise ValueError("富邦 API 尚未連線")
 
@@ -249,18 +245,12 @@ def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFram
 
 @st.cache_data(ttl=REFRESH_SEC)
 def download_stock_data(symbol: str, _sdk):
-    """富邦完整90天歷史資料（僅在混合資料源都抓不到時作為備援使用，平常掃描不會走這條慢路徑）"""
     end_date = date.today()
     start_date = end_date - timedelta(days=90)
     return _fetch_fubon_candles(symbol, _sdk, start_date, end_date)
 
 @st.cache_data(ttl=REFRESH_SEC)
 def download_stock_data_fubon_today(symbol: str, _sdk, today_str: str):
-    """
-    🚀 加速重點：盤中(9:00-13:30)只跟富邦要『今日』單日K線，不再像過去一樣每次都要
-    90天完整歷史。今日以前的資料改由 Yfinance 批次快取提供（見下方 bulk_download_yfinance_history），
-    單檔富邦請求的資料量大幅縮小，掃描速度明顯提升。
-    """
     if _sdk is None:
         return pd.DataFrame()
     today = date.today()
@@ -271,7 +261,6 @@ def normalize_ohlc(df):
         return pd.DataFrame()
 
     df = df.copy()
-    # 保留日期欄位，讓趨勢線可以回報 P1/P2 是哪一天。
     if "date" in df.columns and "Date" not in df.columns:
         df.rename(columns={"date": "Date"}, inplace=True)
 
@@ -403,7 +392,6 @@ def download_stock_data_yfinance(symbol: str):
     return df.reset_index(drop=True)
 
 def _split_yfinance_bulk_result(raw: pd.DataFrame, symbols: tuple) -> dict:
-    """把 yf.download 多檔批次結果拆成 {symbol: 單檔DataFrame} 字典"""
     result = {}
     if raw is None or raw.empty:
         return {s: pd.DataFrame() for s in symbols}
@@ -424,12 +412,6 @@ def _split_yfinance_bulk_result(raw: pd.DataFrame, symbols: tuple) -> dict:
 
 @st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
 def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
-    """
-    🚀 加速重點：一次批次下載整批股票『今日以前』的歷史資料（yfinance 內部會自動平行抓取多檔），
-    取代過去逐檔各打一次 API 的作法。全市場掃描時（可能上百檔股票），這能把歷史資料的
-    網路請求次數從「N次」降為「1次」，是掃描速度提升最主要的來源。
-    快取1小時，同一小時內重複掃描不會再次觸發下載。
-    """
     if yf is None or not symbols:
         return {}
     try:
@@ -449,7 +431,6 @@ def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
 
 @st.cache_data(ttl=REFRESH_SEC)
 def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
-    """批次下載整批股票『今日』資料，供盤後(13:30後)全面改用Yfinance時使用"""
     if yf is None or not symbols:
         return {}
     try:
@@ -513,14 +494,6 @@ def download_stock_data_by_source(
     symbol: str, _sdk, source: str, today_str: str,
     history_map: dict = None, yf_today_map: dict = None,
 ):
-    """
-    依資料來源模式取得K線資料（邏輯維持不變，僅優化抓取方式加速）：
-    - Yfinance：優先查表使用外部預先批次下載好的 history_map / yf_today_map（一次API呼叫換來的整批結果），
-      查不到才退回單檔即時查詢（例如臨時加入、不在原批次清單中的股票）。
-    - WebSocket（盤中9:00-13:30混合模式）：『今日以前』歷史資料一樣查表使用 Yfinance 批次快取，
-      『今日』資料改成只跟富邦要當天單日K線（不再要90天），大幅減少富邦API的資料量與延遲。
-    - 兩種模式都抓不到資料時，才退回最慢但最保險的富邦90天完整歷史。
-    """
     history_map = history_map or {}
     yf_today_map = yf_today_map or {}
 
@@ -547,7 +520,6 @@ def download_stock_data_by_source(
             return download_stock_data(symbol, _sdk)
         return pd.DataFrame()
 
-    # ===== WebSocket：盤中混合模式 =====
     history_df = history_map.get(symbol)
     if history_df is None:
         history_df = download_stock_data_yfinance_history(symbol, today_str)
@@ -555,7 +527,6 @@ def download_stock_data_by_source(
     df = _combine(history_df, today_df)
     if not df.empty:
         return df
-    # 混合來源都抓不到資料時，退回原本較慢的富邦90天完整歷史作為最終備援
     return download_stock_data(symbol, _sdk)
 
 def get_last_price_by_source(symbol: str, df, _sdk, source: str):
@@ -570,7 +541,7 @@ def get_last_price_by_source(symbol: str, df, _sdk, source: str):
     return get_last_price(symbol, df, _sdk)
 
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "巧妙點訊號", "訊號類型", "來源"]
     if not rows:
         return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
@@ -578,7 +549,7 @@ def normalize_rows_for_excel(rows):
         df.drop(columns=["代碼網址"], inplace=True)
     for col in columns:
         if col not in df.columns:
-            df[col] = ""
+            df[col] = "-"
     return df[columns]
 
 def contains_cjk(text) -> bool:
@@ -615,6 +586,7 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
     week_near_golden_rows = signal_buckets.get("週即將黃金交叉", [])
     macd_rows = signal_buckets.get("MACD翻正", [])
     trend_rows = signal_buckets.get("趨勢突破", [])
+    clever_rows = signal_buckets.get("巧妙點", []) # 新增巧妙點列表[cite: 1]
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -626,6 +598,7 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
         normalize_rows_for_excel(week_near_golden_rows).to_excel(writer, sheet_name="週即將黃金交叉", index=False)
         normalize_rows_for_excel(macd_rows).to_excel(writer, sheet_name="MACD訊號", index=False)
         normalize_rows_for_excel(trend_rows).to_excel(writer, sheet_name="趨勢突破", index=False)
+        normalize_rows_for_excel(clever_rows).to_excel(writer, sheet_name="巧妙點", index=False) # 新增巧妙點工作表匯出[cite: 1]
         apply_excel_fonts(writer.book)
     output.seek(0)
     return output.getvalue()
@@ -1305,16 +1278,10 @@ def calc_custom_volatility(df, price_val, window=20):
     return float(latest_avg_20_swing / latest_ma20 * 100)
 
 def calc_rs_raw_value(df, price_val):
-    """
-    計算單月 RS 原始值 (週加權報酬率)
-    權重：最近1週40%，前1週20%，再前1週20%，最初1週20%
-    一週大約 5 個交易日
-    """
     if df is None or len(df) < 21:
         return None
     
     close = df["Close"].copy().reset_index(drop=True)
-    # 用最新價格替換最後一筆收盤價，以貼近盤中即時狀態
     close.iloc[-1] = float(price_val)
     
     n = len(close)
@@ -1330,29 +1297,23 @@ def calc_rs_raw_value(df, price_val):
         return (end_price - start_price) / start_price
 
     end_idx = n - 1
-    # W4 (最近1週/約 5 個交易日)
     w4_start = max(0, end_idx - 5)
     ret_w4 = get_return(w4_start, end_idx)
     
-    # W3 (前1週)
     w3_start = max(0, w4_start - 5)
     ret_w3 = get_return(w3_start, w4_start)
     
-    # W2 (再前1週)
     w2_start = max(0, w3_start - 5)
     ret_w2 = get_return(w2_start, w3_start)
     
-    # W1 (最初1週)
     w1_start = max(0, w2_start - 5)
     ret_w1 = get_return(w1_start, w2_start)
     
-    # 根據公式加權
     rs_raw = (ret_w4 * 0.4) + (ret_w3 * 0.2) + (ret_w2 * 0.2) + (ret_w1 * 0.2)
     return rs_raw * 100
 
 
 def calc_kd_series(close, low, high, period: int = 9):
-    """通用 KD 計算（日線／週線皆可共用），回傳 K、D 序列"""
     low_n = low.rolling(period).min()
     high_n = high.rolling(period).max()
     denominator = (high_n - low_n).replace(0, pd.NA)
@@ -1362,7 +1323,6 @@ def calc_kd_series(close, low, high, period: int = 9):
     return k, d
 
 def judge_kd_signal(k_t: float, k_y: float, d_t: float, d_y: float) -> str:
-    """依據當期(t)與前一期(y)的 K/D 值判斷交叉訊號（日線／週線共用邏輯）"""
     if k_y <= d_y and k_t > d_t: return "黃金交叉"
     if k_y >= d_y and k_t < d_t: return "死亡交叉"
     if k_t < d_t and (d_t - k_t) < 3: return "即將黃金交叉"
@@ -1371,11 +1331,6 @@ def judge_kd_signal(k_t: float, k_y: float, d_t: float, d_y: float) -> str:
     return "-"
 
 def resample_weekly_ohlc(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    將日線 OHLC 依日期重採樣成週線。
-    直接沿用同一批已下載的日線資料（df 需含 Date/High/Low/Close），
-    不會為了週KD額外呼叫任何行情 API，維持原本的資料抓取時間範圍。
-    """
     if df is None or df.empty or "Date" not in df.columns:
         return pd.DataFrame()
     weekly_src = df[["Date", "High", "Low", "Close"]].copy()
@@ -1395,7 +1350,11 @@ def compute_indicators(df, price):
     close = pd.to_numeric(df["Close"].squeeze(), errors="coerce")
     low = pd.to_numeric(df["Low"].squeeze(), errors="coerce")
     high = pd.to_numeric(df["High"].squeeze(), errors="coerce")
+    
+    # 提取 Open 用以計算巧妙點[cite: 1]
+    open_series = pd.to_numeric(df["Open"].squeeze(), errors="coerce") if "Open" in df.columns else pd.Series(dtype="float64")
     volume = pd.to_numeric(df["Volume"].squeeze(), errors="coerce") if "Volume" in df.columns else pd.Series(dtype="float64")
+    
     if close.isna().all() or low.isna().all() or high.isna().all():
         raise ValueError("OHLC 資料格式異常")
 
@@ -1429,8 +1388,6 @@ def compute_indicators(df, price):
     kd_signal = judge_kd_signal(k_t, k_y, d_t, d_y)
 
     # ===== 週KD計算 =====
-    # 沿用同一批日線資料重採樣成週線，不額外呼叫 API，資料抓取時間範圍維持不變。
-    # 3~4個月資料約僅有 13~18 週，週KD需至少 9 週(rolling)+1週比較，資料不足時訊號留空("-")。
     week_k_t = week_d_t = None
     week_kd_signal = "-"
     weekly_df = resample_weekly_ohlc(df)
@@ -1466,8 +1423,6 @@ def compute_indicators(df, price):
     volume_lots = latest_volume / 1000
 
     custom_volatility_pct = calc_custom_volatility(df, price_val, window=20)
-    
-    # ===== 加入 RS 計算 =====
     rs_raw = calc_rs_raw_value(df, price_val)
 
     gap_signal = "-"
@@ -1502,6 +1457,16 @@ def compute_indicators(df, price):
             trend_touch_count = trend_result.get("touch_count", "-")
             trend_violations = trend_result.get("violations", "-")
 
+    # ===== 巧妙點計算 =====[cite: 1]
+    clever_signal = "-"
+    ma10_vol = float(volume.tail(10).mean()) if not volume.empty and len(volume) >= 10 else 0.0
+    today_open = float(open_series.iloc[-1]) if not open_series.empty and pd.notna(open_series.iloc[-1]) else float(yesterday_close)
+    
+    if yesterday_close > 0 and ma10_vol > 0:
+        body_pct = abs(price_val - today_open) / yesterday_close * 100
+        if body_pct < 3.6 and latest_volume < ma10_vol:
+            clever_signal = "巧妙點"
+
     return {
         "price": round(price_val, 2),
         "pct": round(change_pct, 2),
@@ -1528,7 +1493,8 @@ def compute_indicators(df, price):
         "slope_pct": round(slope_pct, 1) if slope_pct else "-",
         "tl_val": round(tl_val, 2) if tl_val else "-",
         "trend_touch_count": trend_touch_count,
-        "trend_violations": trend_violations
+        "trend_violations": trend_violations,
+        "clever_signal": clever_signal  # 回傳巧妙點訊號[cite: 1]
     }
 
 def format_color(val):
@@ -1551,6 +1517,10 @@ def format_gap(val):
 
 def format_trend(val):
     if val == "趨勢突破": return "🔥 突破"
+    return "-"
+
+def format_clever(val):  # 巧妙點格式化[cite: 1]
+    if val == "巧妙點": return "✨ 巧妙點"
     return "-"
 
 def format_volume(val):
@@ -1685,9 +1655,9 @@ rise_threshold = st.number_input(
     format="%.2f"
 )
 
-
+# ===== 更新掃描條件的 UI 排版 =====[cite: 1]
 st.markdown("### 🎯 掃描條件")
-scan_btn_col1, scan_btn_col2, scan_col1, scan_gain_col, scan_col2, scan_col3, scan_week_kd_col, scan_macd_col, scan_trend_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.2, 0.9, 0.7, 1.3, 1.3, 0.9, 1.0, 1.1, 1.7])
+scan_btn_col1, scan_btn_col2, scan_col1, scan_gain_col, scan_col2, scan_col3, scan_week_kd_col, scan_macd_col, scan_trend_col, scan_clever_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.2, 0.9, 0.7, 1.3, 1.3, 0.9, 1.0, 0.9, 1.1, 1.7])
 with scan_btn_col1:
     if st.button("▶️ 開始掃描", use_container_width=True, disabled=st.session_state.scan_enabled):
         st.session_state.scan_enabled = True
@@ -1702,25 +1672,20 @@ with scan_btn_col2:
 with scan_col1:
     show_only_signal_rows = st.toggle("只顯示訊號股票", value=True)
 with scan_gain_col:
-    include_gain_threshold_filter = st.checkbox(
-        "漲幅達標",
-        value=True,
-        help="選出漲幅 >= 上方『儀表板漲幅達標門檻』的股票，並新增到漲幅達標分頁。"
-    )
+    include_gain_threshold_filter = st.checkbox("漲幅達標", value=True)
 with scan_col2:
     include_gap_signal_filter = st.checkbox("跳空", value=True)
 with scan_col3:
     include_kd_signal_filter = st.checkbox("黃金交叉 / 即將黃金交叉", value=True)
 with scan_week_kd_col:
-    include_week_kd_signal_filter = st.checkbox(
-        "週KD 黃金交叉 / 即將黃金交叉",
-        value=True,
-        help="以同一批已下載的日線資料重採樣成週線後計算KD，資料抓取區間與日KD相同，不會多打API。"
-    )
+    include_week_kd_signal_filter = st.checkbox("週KD 黃金交叉 / 即將黃金交叉", value=True)
 with scan_macd_col:
     include_macd_signal_filter = st.checkbox("MACD翻正", value=True)
 with scan_trend_col:
-    include_trend_signal_filter = st.checkbox("趨勢突破", value=True, help="40日動態雙高點下降趨勢 + 8%坡度 + 60MA上揚")
+    include_trend_signal_filter = st.checkbox("趨勢突破", value=True)
+with scan_clever_col:
+    # 增加巧妙點篩選核取方塊[cite: 1]
+    include_clever_point_filter = st.checkbox("巧妙點", value=True, help="收盤價-開盤價絕對漲跌幅 < 3.6% 且 成交量 < 10日均量") 
 with scan_vol_col:
     min_volume_lots = st.number_input(
         "成交量(張)下限",
@@ -1741,18 +1706,13 @@ else:
     st.caption("⚪ 掃描狀態：已停止，按「開始掃描」才會抓取資料。")
 
 selected_signal_names = []
-if include_gain_threshold_filter:
-    selected_signal_names.append("漲幅達標")
-if include_gap_signal_filter:
-    selected_signal_names.append("跳空")
-if include_kd_signal_filter:
-    selected_signal_names.extend(["黃金交叉", "即將黃金交叉"])
-if include_week_kd_signal_filter:
-    selected_signal_names.extend(["週黃金交叉", "週即將黃金交叉"])
-if include_macd_signal_filter:
-    selected_signal_names.append("MACD翻正")
-if include_trend_signal_filter:
-    selected_signal_names.append("趨勢突破")
+if include_gain_threshold_filter: selected_signal_names.append("漲幅達標")
+if include_gap_signal_filter: selected_signal_names.append("跳空")
+if include_kd_signal_filter: selected_signal_names.extend(["黃金交叉", "即將黃金交叉"])
+if include_week_kd_signal_filter: selected_signal_names.extend(["週黃金交叉", "週即將黃金交叉"])
+if include_macd_signal_filter: selected_signal_names.append("MACD翻正")
+if include_trend_signal_filter: selected_signal_names.append("趨勢突破")
+if include_clever_point_filter: selected_signal_names.append("巧妙點") # 將巧妙點註冊至欲顯示之訊號清單中[cite: 1]
     
 if not selected_signal_names:
     st.warning("請至少勾選一種掃描訊號，否則不會列出訊號股票。")
@@ -1807,11 +1767,10 @@ if should_run_scan:
     group_tables = {}
     group_up_summary = []
     all_signal_rows = []
-    signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
+    # 增加巧妙點資料籃子[cite: 1]
+    signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": [], "巧妙點": []}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
 
-    # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
-    # 這是加速全市場掃描最主要的一步，尤其股票數量多時效果最明顯。
     scan_today_str = tw_now.strftime("%Y-%m-%d")
     all_unique_symbols = tuple(sorted({s for stocks in st.session_state.stock_groups.values() for s in stocks}))
     yf_history_map = bulk_download_yfinance_history(all_unique_symbols, scan_today_str) if yf is not None else {}
@@ -1860,6 +1819,7 @@ if should_run_scan:
                 if data["week_kd_signal"] in ["黃金交叉", "即將黃金交叉"]: signal_types.append(f"週{data['week_kd_signal']}")
                 if data["macd_signal"] == "MACD翻正": signal_types.append("MACD翻正")
                 if data["trend_signal"] == "趨勢突破": signal_types.append("趨勢突破")
+                if data["clever_signal"] == "巧妙點": signal_types.append("巧妙點") # 將巧妙點歸入訊號類型[cite: 1]
                     
                 passes_volume_filter = float(data.get("volume_lots", 0)) >= float(min_volume_lots)
                 is_selected_signal = any(sig in selected_signal_names for sig in signal_types) and passes_volume_filter
@@ -1884,6 +1844,7 @@ if should_run_scan:
                             f"🧭 MACD訊號：{data['macd_signal']} / MACD柱：{data['macd_hist']}\n"
                             f"🚀 跳空訊號：{data['gap_signal']}\n"
                             f"🔥 趨勢突破：{data['trend_signal']}\n"
+                            f"✨ 巧妙點訊號：{data['clever_signal']}\n"
                             f"🔌 來源：{active_price_source}"
                         )
                         send_telegram_message(msg)
@@ -1917,6 +1878,7 @@ if should_run_scan:
                     "週KD訊號": data["week_kd_signal"],
                     "MACD柱": data["macd_hist"],
                     "MACD訊號": data["macd_signal"], "跳空訊號": data["gap_signal"],
+                    "巧妙點訊號": data.get("clever_signal", "-"),  # 加入巧妙點訊號欄位[cite: 1]
                     "訊號類型": "、".join(signal_types) if signal_types else "-",
                     "來源": active_price_source,
                 }
@@ -1937,7 +1899,7 @@ if should_run_scan:
                         "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-",
                         "KD訊號": "-", "週K值": "-", "週D值": "-", "週KD訊號": "-",
                         "MACD柱": "-", "MACD訊號": "-",
-                        "跳空訊號": str(e), "訊號類型": "錯誤", "來源": active_price_source,
+                        "跳空訊號": str(e), "巧妙點訊號": "-", "訊號類型": "錯誤", "來源": active_price_source,
                     })
 
         hit_names_text = compact_name_list(hit_names, max_show=4)
@@ -1955,6 +1917,9 @@ if should_run_scan:
             display_df["跳空訊號"] = display_df["跳空訊號"].apply(format_gap)
             if "趨勢突破" in display_df.columns:
                 display_df["趨勢突破"] = display_df["趨勢突破"].apply(format_trend)
+            if "巧妙點訊號" in display_df.columns: # 增加巧妙點欄位的顏色套用[cite: 1]
+                display_df["巧妙點訊號"] = display_df["巧妙點訊號"].apply(format_clever)
+                
         group_tables[group_name] = {"count": len(stocks), "table": display_df}
         group_up_summary.append({
             "分類": group_name, "達標數": hit_count, "達標股票名稱": hit_names_text,
@@ -1983,7 +1948,8 @@ else:
     group_tables = last_scan_result.get("group_tables", {})
     group_up_summary = last_scan_result.get("group_up_summary", [])
     all_signal_rows = last_scan_result.get("all_signal_rows", [])
-    signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
+    # 同步修改歷史載入時的巧妙點陣列設定[cite: 1]
+    signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": [], "巧妙點": []})
     render_scan_progress_card(scan_progress_card_placeholder, last_scan_result.get("progress_pct", 100), "掃描進度")
 
 excel_bytes = build_signal_excel_bytes(signal_buckets)
@@ -2006,8 +1972,8 @@ st.markdown("### 🔎 訊號掃描結果")
 unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
 st.metric("符合勾選掃描條件股票數", unique_signal_count)
 
-# 全域定義顯示的欄位，確保資料表一定找得到
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+# 全域定義顯示的欄位，確保資料表一定找得到 (加入巧妙點訊號)[cite: 1]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "巧妙點訊號", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])
@@ -2021,15 +1987,18 @@ if all_signal_rows:
         signal_display_df["波動率%"] = signal_display_df["波動率%"].apply(format_volatility)
     signal_display_df["跳空訊號"] = signal_display_df["跳空訊號"].apply(format_gap)
     
-    # 🌟 防呆：確認有該欄位才套用格式，沒有則補上 "-"
     if "趨勢突破" in signal_display_df.columns:
         signal_display_df["趨勢突破"] = signal_display_df["趨勢突破"].apply(format_trend)
     else:
         signal_display_df["趨勢突破"] = "-"
         
+    if "巧妙點訊號" in signal_display_df.columns: # 對巧妙點訊號作渲染[cite: 1]
+        signal_display_df["巧妙點訊號"] = signal_display_df["巧妙點訊號"].apply(format_clever)
+    else:
+        signal_display_df["巧妙點訊號"] = "-"
+        
     signal_display_df["代碼"] = signal_display_df["代碼網址"]
     
-    # 🌟 防呆：補齊遺失的顯示欄位
     for col in display_columns:
         if col not in signal_display_df.columns:
             signal_display_df[col] = "-"
@@ -2050,6 +2019,7 @@ if all_signal_rows:
         ("週即將黃金交叉", "週即將黃金交叉"),
         ("MACD 訊號", "MACD翻正"),
         ("趨勢突破", "趨勢突破"), 
+        ("巧妙點", "巧妙點"), # 新增巧妙點頁籤清單[cite: 1]
     ]
 
     tab_labels = []
@@ -2077,15 +2047,18 @@ if all_signal_rows:
                     bucket_display_df["波動率%"] = bucket_display_df["波動率%"].apply(format_volatility)
                 bucket_display_df["跳空訊號"] = bucket_display_df["跳空訊號"].apply(format_gap)
                 
-                # 🌟 防呆：確認有該欄位才套用格式，沒有則補上 "-"
                 if "趨勢突破" in bucket_display_df.columns:
                     bucket_display_df["趨勢突破"] = bucket_display_df["趨勢突破"].apply(format_trend)
                 else:
                     bucket_display_df["趨勢突破"] = "-"
                     
+                if "巧妙點訊號" in bucket_display_df.columns: # 對巧妙點訊號作渲染[cite: 1]
+                    bucket_display_df["巧妙點訊號"] = bucket_display_df["巧妙點訊號"].apply(format_clever)
+                else:
+                    bucket_display_df["巧妙點訊號"] = "-"
+                    
                 bucket_display_df["代碼"] = bucket_display_df["代碼網址"]
                 
-                # 🌟 防呆：補齊遺失的顯示欄位
                 for col in display_columns:
                     if col not in bucket_display_df.columns:
                         bucket_display_df[col] = "-"
