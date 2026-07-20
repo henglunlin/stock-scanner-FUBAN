@@ -274,11 +274,15 @@ if should_run_scan:
 
     # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
     if cf.yf is not None:
-        yf_history_map = cf.bulk_download_yfinance_history(all_unique_candidates, scan_today_str)
-        yf_today_map = (
-            cf.bulk_download_yfinance_today(all_unique_candidates, scan_today_str)
-            if active_price_source == "Yfinance" else {}
-        )
+        raw_history_map = cf.bulk_download_yfinance_history(all_unique_candidates, scan_today_str)
+        # 【關鍵修正】：過濾掉失敗的空 DataFrame，強迫系統針對這些股票觸發單檔備援機制
+        yf_history_map = {k: v for k, v in raw_history_map.items() if v is not None and not v.empty}
+        
+        if active_price_source == "Yfinance":
+            raw_today_map = cf.bulk_download_yfinance_today(all_unique_candidates, scan_today_str)
+            yf_today_map = {k: v for k, v in raw_today_map.items() if v is not None and not v.empty}
+        else:
+            yf_today_map = {}
     else:
         yf_history_map = {}
         yf_today_map = {}
