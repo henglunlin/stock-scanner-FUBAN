@@ -66,6 +66,25 @@ def load_code_to_ticker_map(file_path: str = CODE_MAP_FILE) -> dict:
                 mapping[ticker.split(".")[0]] = ticker
     return mapping
 
+@st.cache_data(ttl=86400)
+def load_ticker_to_name_map(file_path: str = CODE_MAP_FILE) -> dict:
+    """從清單檔載入『代碼 -> 股票名稱』對照表，用於畫面顯示補齊名稱。"""
+    mapping = {}
+    if not os.path.exists(file_path):
+        return mapping
+    with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+        for raw_line in f:
+            line = raw_line.strip().replace("\u3000", " ")
+            if not line:
+                continue
+            parts = re.split(r"[\t ]+", line, maxsplit=1)
+            if len(parts) >= 2:
+                ticker = parts[0].strip().upper()
+                name = parts[1].strip()
+                mapping[ticker] = name
+                if "." in ticker:
+                    mapping[ticker.split(".")[0]] = name
+    return mapping
 
 def normalize_symbol_quick(input_text: str):
     s = str(input_text).strip().upper()
@@ -78,7 +97,6 @@ def normalize_symbol_quick(input_text: str):
             return f"{s}.TWO"
         return f"{s}.TW"
     return s
-
 
 def resolve_ticker_suffix(raw_code, code_map: dict = None) -> str:
     """已經帶明確後綴就直接使用；純數字則優先查對照表，查不到才退回猜測 .TW/.TWO。"""
@@ -94,7 +112,7 @@ def resolve_ticker_suffix(raw_code, code_map: dict = None) -> str:
 
 
 # ===== 檔案解析工具 =====
-def parse_excel_file(file_obj, code_map: dict) -> pd.DataFrame:
+def parse_excel_file(file_obj, code_map: dict, name_map: dict) -> pd.DataFrame:
     """解析 Excel 清單，嘗試辨識常見欄位名稱（代碼／商品／名稱...）"""
     df = pd.read_excel(file_obj)
     df.columns = [str(c).strip() for c in df.columns]
@@ -112,7 +130,12 @@ def parse_excel_file(file_obj, code_map: dict) -> pd.DataFrame:
         if not raw_code or raw_code.lower() == "nan":
             continue
         full_ticker = resolve_ticker_suffix(raw_code, code_map)
+        
+        # 查表補齊股票名稱
         name = str(r[name_col]).strip() if name_col else ""
+        if not name:
+            name = name_map.get(full_ticker, name_map.get(str(raw_code).split(".")[0], ""))
+            
         extra = {}
         for c in ["成交", "漲幅%", "總量", "昨收"]:
             if c in df.columns and pd.notna(r.get(c)):
@@ -121,7 +144,7 @@ def parse_excel_file(file_obj, code_map: dict) -> pd.DataFrame:
     return pd.DataFrame(out_rows)
 
 
-def parse_txt_file(file_obj, code_map: dict) -> pd.DataFrame:
+def parse_txt_file(file_obj, code_map: dict, name_map: dict) -> pd.DataFrame:
     content = file_obj.read().decode("utf-8-sig", errors="ignore")
     out_rows = []
     for raw_line in content.splitlines():
@@ -130,8 +153,13 @@ def parse_txt_file(file_obj, code_map: dict) -> pd.DataFrame:
             continue
         parts = line.split("\t") if "\t" in line else line.split(None, 1)
         raw_code = parts[0].strip()
-        name = parts[1].strip() if len(parts) > 1 else ""
         full_ticker = resolve_ticker_suffix(raw_code, code_map)
+        
+        # 查表補齊股票名稱
+        name = parts[1].strip() if len(parts) > 1 else ""
+        if not name:
+            name = name_map.get(full_ticker, name_map.get(str(raw_code).split(".")[0], ""))
+            
         out_rows.append({"代碼": full_ticker, "股票名稱": name})
     return pd.DataFrame(out_rows)
 
@@ -151,14 +179,15 @@ with col_dedupe:
 
 if load_btn and uploaded_files:
     code_map = load_code_to_ticker_map(CODE_MAP_FILE)
+    name_map = load_ticker_to_name_map(CODE_MAP_FILE)
     frames = []
     parse_errors = []
     for f in uploaded_files:
         try:
             if f.name.lower().endswith((".xlsx", ".xls")):
-                part = parse_excel_file(f, code_map)
+                part = parse_excel_file(f, code_map, name_map)
             else:
-                part = parse_txt_file(f, code_map)
+                part = parse_txt_file(f, code_map, name_map)
             part["來源檔案"] = f.name
             frames.append(part)
         except Exception as e:
