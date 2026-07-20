@@ -396,7 +396,7 @@ all_rows = last_result.get("all_rows", [])
 hit_rows = last_result.get("hit_rows", [])
 error_count = last_result.get("error_count", 0)
 
-# ===== 結果輸出（Excel / Telegram）=====
+# ===== 結果輸出（Excel / Telegram / TXT）=====
 def build_qiaomiao_excel_bytes(hit_rows_local):
     from io import BytesIO
     columns = ["代碼", "股票名稱", "開盤", "現價", "型態", "實體佔比%", "上影佔比%", "下影佔比%", "成交量(張)", "量比%", "是否命中巧妙點", "來源"]
@@ -412,13 +412,24 @@ def build_qiaomiao_excel_bytes(hit_rows_local):
     output.seek(0)
     return output.getvalue()
 
-excel_bytes = build_qiaomiao_excel_bytes(hit_rows)
-excel_filename = last_result.get("excel_filename", f"QiaoMiaoDian_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx")
+def build_export_txt(df_rows) -> bytes:
+    df = pd.DataFrame(df_rows)
+    if df.empty or "代碼" not in df.columns: return b""
+    # 修改為只匯出股票代碼，不匯出股票名稱
+    lines = df["代碼"].astype(str).str.strip().tolist()
+    return "\n".join(lines).encode("utf-8-sig")
 
-action_col1, action_col2 = st.columns(2)
+excel_bytes = build_qiaomiao_excel_bytes(hit_rows)
+txt_bytes = build_export_txt(hit_rows)
+excel_filename = last_result.get("excel_filename", f"QiaoMiaoDian_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx")
+txt_filename = excel_filename.replace(".xlsx", ".txt")
+
+action_col1, action_col2, action_col3 = st.columns(3)
 with action_col1:
     st.download_button("下載命中清單 Excel", data=excel_bytes, file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="qmd_download_excel_btn")
 with action_col2:
+    st.download_button("下載命中清單 txt", data=txt_bytes, file_name=txt_filename, mime="text/plain", use_container_width=True, key="qmd_download_txt_btn")
+with action_col3:
     if st.button("推送命中清單到 Telegram", use_container_width=True, key="qmd_push_tg_btn"):
         ok = cf.send_telegram_document(excel_bytes, excel_filename, caption=f"巧妙點掃描結果｜實體佔比<{last_result.get('body_threshold', body_threshold)}%｜量比<{last_result.get('vol_ratio_threshold', vol_ratio_threshold)}%｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
         if ok: st.success("已將 Excel 推送到 Telegram。")
@@ -442,8 +453,7 @@ if error_count > 0:
 
 # 🔥 核心防呆：如果 0 命中，且有錯誤，強制顯示所有清單以供排查！
 if show_only_hits and len(hit_rows) == 0 and error_count > 0:
-if show_only_hits and len(hit_rows) == 0 and error_count > 0:
-    st.warning(f"⚠️ 掃描完畢，但沒有任何股票命中巧妙點，且有 **{error_count}** 檔抓取失敗。已為您自動展開所有清單，請查看最右側『是否命中巧妙點』欄位了解錯誤原因：")
+    st.warning(f"⚠️ 掃描完畢，但沒有任何股票命中巧妙點，且有 **{error_count}** 檔抓取失敗。已為您自動展開所有清單，請查看上方下拉視窗或表格中的『是否命中巧妙點』欄位了解錯誤原因：")
     display_rows = all_rows
 else:
     display_rows = hit_rows if show_only_hits else all_rows
