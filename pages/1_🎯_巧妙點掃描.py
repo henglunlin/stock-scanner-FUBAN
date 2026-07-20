@@ -429,7 +429,19 @@ m1.metric("命中巧妙點檔數", len(hit_rows))
 m2.metric("清單股票總數", len(scan_symbols))
 m3.metric("抓取失敗檔數", error_count)
 
+# 🔥 新增：抓取失敗股票清單下拉視窗
+if error_count > 0:
+    with st.expander(f"⚠️ 檢視 {error_count} 檔抓取失敗清單", expanded=False):
+        # 篩選出 all_rows 中，"現價" 為 "錯誤" 的資料，並擷取代碼與錯誤訊息
+        error_records = [
+            {"代碼": r.get("代碼", ""), "錯誤訊息": r.get("是否命中巧妙點", "")} 
+            for r in all_rows if r.get("現價") == "錯誤"
+        ]
+        if error_records:
+            st.dataframe(pd.DataFrame(error_records), use_container_width=True)
+
 # 🔥 核心防呆：如果 0 命中，且有錯誤，強制顯示所有清單以供排查！
+if show_only_hits and len(hit_rows) == 0 and error_count > 0:
 if show_only_hits and len(hit_rows) == 0 and error_count > 0:
     st.warning(f"⚠️ 掃描完畢，但沒有任何股票命中巧妙點，且有 **{error_count}** 檔抓取失敗。已為您自動展開所有清單，請查看最右側『是否命中巧妙點』欄位了解錯誤原因：")
     display_rows = all_rows
