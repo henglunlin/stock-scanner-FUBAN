@@ -56,21 +56,27 @@ def build_yfinance_candidates(symbol: str, code_map: dict = None):
     code_map = code_map or {}
     raw = str(symbol).strip().upper()
     code = symbol_to_code(raw)
-    
-    # 【新增】查表邏輯：如果輸入是純號碼或沒有後綴，且在對應表中找得到，直接回傳表裡的確切代碼
-    if ("." not in raw) and code in code_map:
+
+    # 【修正】已經帶明確後綴（.TW / .TWO）就直接用，不要再猜其他後綴，
+    # 避免整批清單被平白多灌近一倍不存在的假代碼，拖垮單次 yf.download() 批次請求。
+    if "." in raw:
+        return [raw]
+
+    # 純數字、沒有後綴：優先查對照表
+    if code in code_map:
         return [code_map[code]]
-        
+
+    # 對照表查不到，才需要用猜的，依序嘗試 .TW / .TWO
     candidates = []
-    if raw and "." in raw:
-        candidates.append(raw)
-    elif raw:
-        normalized = normalize_symbol_quick(raw)
-        if normalized:
-            candidates.append(normalized)
+    normalized = normalize_symbol_quick(raw)
+    if normalized:
+        candidates.append(normalized)
     if code:
-        candidates.extend([f"{code}.TW", f"{code}.TWO"])
-    
+        for suffix in (".TW", ".TWO"):
+            cand = f"{code}{suffix}"
+            if cand not in candidates:
+                candidates.append(cand)
+
     result, seen = [], set()
     for item in candidates:
         if item and item not in seen:
