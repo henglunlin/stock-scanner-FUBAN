@@ -140,6 +140,41 @@ def safe_batch_yfinance_download(candidates: tuple, today_str: str, period="4mo"
     return result_map
 # ==========================================
 
+# ===== 巧妙點專用資料獲取包裝器 =====
+def get_qmd_stock_data_safe(symbol, _sdk, source, today_str, history_map, yf_today_map, min_rows):
+    """
+    巧妙點專屬資料獲取邏輯：
+    1. 完全阻斷單檔 Yfinance 請求：歷史資料僅從批次下載的 map 讀取，避免觸發限流。
+    2. 強化備援邏輯：當「資料筆數不足(min_rows)」時，強制觸發富邦 90 天完整歷史備援。
+    """
+    history_df = history_map.get(symbol, pd.DataFrame())
+    
+    if source == "Yfinance":
+        today_df = yf_today_map.get(symbol, pd.DataFrame())
+    else:
+        # WebSocket 盤中模式：只跟富邦要當天單日 K 線
+        today_df = cf.download_stock_data_fubon_today(symbol, _sdk, today_str) if _sdk is not None else pd.DataFrame()
+        
+    frames = [d for d in [history_df, today_df] if d is not None and not d.empty]
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        if "Date" in df.columns:
+            df = df.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
+    else:
+        df = pd.DataFrame()
+        
+    df = cf.normalize_ohlc(df)
+    
+    # 🔥 關鍵備援：如果筆數不夠（包含空資料或中途停牌導致天數不足），直接退回富邦 90 天歷史
+    if len(df) < min_rows and _sdk is not None:
+        fubon_df = cf.download_stock_data(symbol, _sdk)
+        fubon_df = cf.normalize_ohlc(fubon_df)
+        if len(fubon_df) > len(df):
+            df = fubon_df
+            
+    return df
+# ==========================================
+
 # ===== 頁面基本設定 =====
 st.set_page_config(page_title="巧妙點掃描", layout="wide")
 
@@ -297,11 +332,11 @@ if should_run_scan:
             
             for candidate in candidates:
                 try:
-                    temp_df = cf.download_stock_data_by_source(
+                    # 改用自訂的安全獲取包裝器，並傳入 min_rows 參數觸發歷史備援
+                    temp_df = get_qmd_stock_data_safe(
                         candidate, st.session_state.fubon_sdk, active_price_source, scan_today_str,
-                        history_map=yf_history_map, yf_today_map=yf_today_map,
+                        history_map=yf_history_map, yf_today_map=yf_today_map, min_rows=need_days + 1
                     )
-                    temp_df = cf.normalize_ohlc(temp_df)
                     if not temp_df.empty and len(temp_df) >= need_days + 1:
                         df = temp_df
                         valid_symbol = candidate
