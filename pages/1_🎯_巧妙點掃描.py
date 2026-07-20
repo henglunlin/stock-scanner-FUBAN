@@ -57,7 +57,7 @@ def build_yfinance_candidates(symbol: str, code_map: dict = None):
     raw = str(symbol).strip().upper()
     code = symbol_to_code(raw)
 
-    # 【修正】已經帶明確後綴（.TW / .TWO）就直接用，不要再猜其他後綴，
+    # 已經帶明確後綴（.TW / .TWO）就直接用，不要再猜其他後綴，
     # 避免整批清單被平白多灌近一倍不存在的假代碼，拖垮單次 yf.download() 批次請求。
     if "." in raw:
         return [raw]
@@ -263,17 +263,25 @@ if should_run_scan:
     
     unique_raw_symbols = tuple(sorted(set(scan_symbols)))
 
-    # 載入股票代號與後綴的對應表（逐檔抓取迴圈裡的 build_yfinance_candidates 還是會用到）
+    # 載入股票代號與後綴的對應表
     code_map = load_code_to_ticker_map("TWstocklistname2.txt")
 
-    # 【修正】不再用「一次性整批多檔」的 yf.download() 預先抓取。
-    # 這種整批請求在雲端環境很容易被 Yahoo Finance 判定成異常流量而整批擋掉/回傳空值，
-    # 而且 bulk_download_yfinance_* 對每個代碼一定會建立一個 key（就算抓失敗也是空 DataFrame，
-    # 不是 None），導致後面「history_map.get(symbol) is None 才 fallback 單檔抓取」的保護機制
-    # 永遠不會被觸發，最後全部卡在「資料不足」。
-    # 改成直接讓每一檔都走 common_fubon 內建、已驗證可靠的單檔逐一抓取＋快取（threads=False）。
-    yf_history_map = {}
-    yf_today_map = {}
+    # 收集所有可能的 yfinance 代碼，確保批次下載時格式正確 (.TW / .TWO)
+    all_candidates = []
+    for original_symbol in unique_raw_symbols:
+        all_candidates.extend(build_yfinance_candidates(original_symbol, code_map))
+    all_unique_candidates = tuple(sorted(set(all_candidates)))
+
+    # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
+    if cf.yf is not None:
+        yf_history_map = cf.bulk_download_yfinance_history(all_unique_candidates, scan_today_str)
+        yf_today_map = (
+            cf.bulk_download_yfinance_today(all_unique_candidates, scan_today_str)
+            if active_price_source == "Yfinance" else {}
+        )
+    else:
+        yf_history_map = {}
+        yf_today_map = {}
 
     total_count = len(unique_raw_symbols)
     progress_bar = progress_placeholder.progress(0, text=f"掃描進度：0.0%（準備掃描 {total_count} 檔股票）")
