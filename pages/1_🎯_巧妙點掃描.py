@@ -56,27 +56,21 @@ def build_yfinance_candidates(symbol: str, code_map: dict = None):
     code_map = code_map or {}
     raw = str(symbol).strip().upper()
     code = symbol_to_code(raw)
-
-    # 已經帶明確後綴（.TW / .TWO）就直接用，不要再猜其他後綴，
-    # 避免整批清單被平白多灌近一倍不存在的假代碼，拖垮單次 yf.download() 批次請求。
-    if "." in raw:
-        return [raw]
-
-    # 純數字、沒有後綴：優先查對照表
-    if code in code_map:
+    
+    # 【新增】查表邏輯：如果輸入是純號碼或沒有後綴，且在對應表中找得到，直接回傳表裡的確切代碼
+    if ("." not in raw) and code in code_map:
         return [code_map[code]]
-
-    # 對照表查不到，才需要用猜的，依序嘗試 .TW / .TWO
+        
     candidates = []
-    normalized = normalize_symbol_quick(raw)
-    if normalized:
-        candidates.append(normalized)
+    if raw and "." in raw:
+        candidates.append(raw)
+    elif raw:
+        normalized = normalize_symbol_quick(raw)
+        if normalized:
+            candidates.append(normalized)
     if code:
-        for suffix in (".TW", ".TWO"):
-            cand = f"{code}{suffix}"
-            if cand not in candidates:
-                candidates.append(cand)
-
+        candidates.extend([f"{code}.TW", f"{code}.TWO"])
+    
     result, seen = [], set()
     for item in candidates:
         if item and item not in seen:
@@ -262,30 +256,22 @@ if should_run_scan:
     scan_today_str = tw_now.strftime("%Y-%m-%d")
     
     unique_raw_symbols = tuple(sorted(set(scan_symbols)))
-
+    
     # 載入股票代號與後綴的對應表
     code_map = load_code_to_ticker_map("TWstocklistname2.txt")
 
-    # 收集所有可能的 yfinance 代碼，確保批次下載時格式正確 (.TW / .TWO)
-    all_candidates = []
-    for original_symbol in unique_raw_symbols:
-        all_candidates.extend(build_yfinance_candidates(original_symbol, code_map))
-    all_unique_candidates = tuple(sorted(set(all_candidates)))
+    # 將清單展開成所有可能的 yfinance 候選代碼
+    expanded_symbols_set = set()
+    for sym in unique_raw_symbols:
+        expanded_symbols_set.update(build_yfinance_candidates(sym, code_map))
+    all_unique_expanded_symbols = tuple(sorted(expanded_symbols_set))
 
-    # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
-    if cf.yf is not None:
-        raw_history_map = cf.bulk_download_yfinance_history(all_unique_candidates, scan_today_str)
-        # 【關鍵修正】：過濾掉失敗的空 DataFrame，強迫系統針對這些股票觸發單檔備援機制
-        yf_history_map = {k: v for k, v in raw_history_map.items() if v is not None and not v.empty}
-        
-        if active_price_source == "Yfinance":
-            raw_today_map = cf.bulk_download_yfinance_today(all_unique_candidates, scan_today_str)
-            yf_today_map = {k: v for k, v in raw_today_map.items() if v is not None and not v.empty}
-        else:
-            yf_today_map = {}
-    else:
-        yf_history_map = {}
-        yf_today_map = {}
+    # 批次預先抓取歷史資料
+    yf_history_map = cf.bulk_download_yfinance_history(all_unique_expanded_symbols, scan_today_str) if cf.yf is not None else {}
+    yf_today_map = (
+        cf.bulk_download_yfinance_today(all_unique_expanded_symbols, scan_today_str)
+        if (cf.yf is not None and active_price_source == "Yfinance") else {}
+    )
 
     total_count = len(unique_raw_symbols)
     progress_bar = progress_placeholder.progress(0, text=f"掃描進度：0.0%（準備掃描 {total_count} 檔股票）")
