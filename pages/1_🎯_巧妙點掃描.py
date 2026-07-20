@@ -182,7 +182,7 @@ with st.sidebar.expander("⚙️ 巧妙點掃描條件", expanded=True):
         f"{int(vol_ma_days)}日均量計算是否包含當日", value=False,
     )
     min_volume_lots = st.number_input(
-        "最低成交量下限 (張)，過濾冷門股", min_value=0, value=0, step=50,
+        "最低成交量下限 (張)，過濾冷門股", min_value=0, value=900, step=50,
     )
 
 # ===== 側邊欄：獨立股票清單來源 =====
