@@ -354,12 +354,33 @@ def apply_excel_fonts(workbook):
 
 # ===== 匯出（txt / xlsx）=====
 def build_export_txt(df: pd.DataFrame) -> bytes:
+    code_map = load_code_to_ticker_map(CODE_MAP_FILE)
     lines = []
     for _, r in df.iterrows():
-        code = str(r["代碼"]).strip()
-        # 移除抓取與判斷股票名稱的邏輯，單純加入代碼" name = str(r.get("股票名稱", "")).strip()"
-        lines.append(code)
-    return "\n".join(lines).encode("utf-8-sig")
+        raw_code = str(r["代碼"]).strip()
+        if not raw_code:
+            continue
+            
+        # 1. 提取純數字部分
+        numeric_match = re.search(r'\d+', raw_code)
+        if not numeric_match:
+            continue # 如果沒有數字就跳過
+        num_code = numeric_match.group(0)
+        
+        # 2. 透過 mapping 加上 .TW 或 .TWO
+        full_ticker = resolve_ticker_suffix(num_code, code_map)
+        
+        lines.append(full_ticker)
+        
+    # 去重
+    unique_lines = []
+    seen = set()
+    for line in lines:
+        if line not in seen:
+            unique_lines.append(line)
+            seen.add(line)
+            
+    return "\n".join(unique_lines).encode("utf-8-sig")
 
 
 def build_export_xlsx(df: pd.DataFrame) -> bytes:
