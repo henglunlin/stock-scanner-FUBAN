@@ -248,7 +248,44 @@ def parse_manual_symbols(text: str) -> list:
     return symbols
 
 
-def _normalize_yfinance_ohlcv(df):
+@st.cache_data(ttl=86400)
+def load_code_to_ticker_map(file_path: str = STOCK_NAME_FILE) -> dict:
+    """從『代碼<TAB/空白>名稱』格式的清單檔載入『純數字代碼 -> 完整代碼(含.TW/.TWO)』對照表。
+    用來把使用者輸入或 Excel 匯入的純數字代碼，準確轉換成正確的 .TW / .TWO 後綴，
+    避免對每個代碼同時亂猜兩種後綴（那樣會讓批次 yfinance 請求膨脹、拖累抓取成功率）。
+    """
+    mapping = {}
+    if not os.path.exists(file_path):
+        return mapping
+    with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+        for raw_line in f:
+            line = raw_line.strip().replace("\u3000", "")
+            if not line:
+                continue
+            parts = re.split(r"[\t]+", line) if "\t" in line else line.split(None, 1)
+            if not parts:
+                continue
+            ticker = parts[0].strip().upper()
+            if "." in ticker:
+                mapping[ticker.split(".")[0]] = ticker
+    return mapping
+
+
+def resolve_ticker_suffix(raw_code, code_map: dict = None) -> str:
+    """把單一輸入（可能是純數字、可能已含 .TW/.TWO）解析成正確的完整代碼。
+    已經帶明確後綴就直接使用；純數字則優先查對照表，查不到才退回猜測 .TW。"""
+    code_map = code_map or {}
+    raw = str(raw_code).strip().upper()
+    if not raw:
+        return ""
+    if "." in raw:
+        return raw
+    if raw in code_map:
+        return code_map[raw]
+    return normalize_symbol_quick(raw) or raw
+
+
+
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
