@@ -357,7 +357,7 @@ def build_export_txt(df: pd.DataFrame) -> bytes:
     lines = []
     for _, r in df.iterrows():
         code = str(r["代碼"]).strip()
-        name = str(r.get("股票名稱", "")).strip()
+        #name = str(r.get("股票名稱", "")).strip()
         lines.append(f"{code}\t{name}" if name else code)
     return "\n".join(lines).encode("utf-8-sig")
 
