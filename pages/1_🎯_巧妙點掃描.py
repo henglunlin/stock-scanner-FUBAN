@@ -195,7 +195,7 @@ tw_now = datetime.now(ZoneInfo("Asia/Taipei"))
 active_price_source = cf.render_price_source_selector_sidebar(tw_now)
 
 # ===== 側邊欄：巧妙點掃描條件 =====
-with st.sidebar.expander("⚙️ 巧妙點掃描條件", expanded=True):
+with st.sidebar.expander("⚙️ 巧妙點掃描條件", expanded=False):
     body_threshold = st.number_input(
         "條件１：實體佔全距上限 (%)",
         min_value=0.0, max_value=90.0, value=60.0, step=5.0, format="%.1f",
