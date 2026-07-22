@@ -166,18 +166,13 @@ def parse_txt_file(file_obj, code_map: dict, name_map: dict) -> pd.DataFrame:
 
 
 # ===== zip 資料夾展開工具 =====
-class ZipMemberFile:
+class ZipMemberFile(BytesIO):
     """把從 zip 內解出來的檔案內容，包成跟 st.file_uploader 回傳的 UploadedFile 一樣
-    有 .name / .read() 介面，這樣後面 parse_excel_file / parse_txt_file 可以直接沿用，不用改。"""
+    有 .name 屬性的檔案物件。直接繼承 BytesIO，所以 read/seek/tell 等 pandas、openpyxl
+    需要的檔案介面全部原生具備，不用另外補方法。"""
     def __init__(self, name: str, data: bytes):
+        super().__init__(data)
         self.name = name
-        self._buf = BytesIO(data)
-
-    def read(self, *args, **kwargs):
-        return self._buf.read(*args, **kwargs)
-
-    def seek(self, *args, **kwargs):
-        return self._buf.seek(*args, **kwargs)
 
 
 def expand_uploaded_files(files):
