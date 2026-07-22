@@ -16,6 +16,7 @@ pages/2_📝_股票列表編輯器.py
 
 import os
 import re
+import zipfile
 from datetime import datetime
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -164,16 +165,58 @@ def parse_txt_file(file_obj, code_map: dict, name_map: dict) -> pd.DataFrame:
     return pd.DataFrame(out_rows)
 
 
+# ===== zip 資料夾展開工具 =====
+class ZipMemberFile:
+    """把從 zip 內解出來的檔案內容，包成跟 st.file_uploader 回傳的 UploadedFile 一樣
+    有 .name / .read() 介面，這樣後面 parse_excel_file / parse_txt_file 可以直接沿用，不用改。"""
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._buf = BytesIO(data)
+
+    def read(self, *args, **kwargs):
+        return self._buf.read(*args, **kwargs)
+
+    def seek(self, *args, **kwargs):
+        return self._buf.seek(*args, **kwargs)
+
+
+def expand_uploaded_files(files):
+    """如果上傳的是 .zip（例如整個資料夾壓縮打包），自動解壓縮並取出裡面所有
+    .xlsx / .xls / .txt（不管在幾層子資料夾內都會抓到）；非 zip 的檔案原樣保留。"""
+    expanded = []
+    zip_errors = []
+    for f in files:
+        if f.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(f) as zf:
+                    for member in zf.namelist():
+                        if member.endswith("/"):
+                            continue  # 資料夾本身，跳過
+                        base_name = member.rsplit("/", 1)[-1]
+                        if not base_name or base_name.startswith("__MACOSX") or base_name.startswith("."):
+                            continue
+                        if base_name.lower().endswith((".xlsx", ".xls", ".txt")):
+                            expanded.append(ZipMemberFile(base_name, zf.read(member)))
+            except Exception as e:
+                zip_errors.append(f"{f.name}: {e}")
+        else:
+            expanded.append(f)
+    for err in zip_errors:
+        st.error(f"解壓縮失敗：{err}")
+    return expanded
+
+
 # ===== 上傳區 =====
-uploaded_files = st.file_uploader(
-    "上傳股票清單檔案（可一次選多個，支援 .xlsx / .txt）",
-    type=["xlsx", "xls", "txt"],
+uploaded_files_raw = st.file_uploader(
+    "上傳股票清單檔案（可一次選多個 .xlsx / .txt，或把整個資料夾壓縮成 .zip 一次上傳）",
+    type=["xlsx", "xls", "txt", "zip"],
     accept_multiple_files=True,
 )
+uploaded_files = expand_uploaded_files(uploaded_files_raw) if uploaded_files_raw else []
 
 col_load, col_dedupe = st.columns([1, 1])
 with col_load:
-    load_btn = st.button("📥 讀取並合併清單", use_container_width=True, disabled=not uploaded_files)
+    load_btn = st.button("📥 讀取並合併清單", use_container_width=True, disabled=not uploaded_files_raw)
 with col_dedupe:
     auto_dedupe = st.checkbox("自動去重化（依代碼，保留第一次出現的資料）", value=True)
 
@@ -209,7 +252,7 @@ if load_btn and uploaded_files:
         merged.insert(0, "保留", True)
         st.session_state.sle_merged_df = merged
         st.session_state.sle_ma60_applied = False
-        st.success(f"已合併 {len(uploaded_files)} 個檔案，共 {total_before} 筆，去重後剩 {len(merged)} 筆（移除 {dup_removed} 筆重複）。")
+        st.success(f"已合併 {len(frames)} 個檔案（含 zip 內解出的檔案），共 {total_before} 筆，去重後剩 {len(merged)} 筆（移除 {dup_removed} 筆重複）。")
 
 if st.session_state.sle_merged_df is None:
     st.info("請先上傳清單檔案並按「讀取並合併清單」。")
