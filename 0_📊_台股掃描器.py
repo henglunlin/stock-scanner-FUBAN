@@ -20,6 +20,14 @@ try:
 except ImportError:
     yf = None
 
+# ===== plotly（用於繪製 K 線 + 趨勢線圖表）=====
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except ImportError:
+    go = None
+    make_subplots = None
+
 # ===== 富邦 API 引入 =====
 try:
     from fubon_neo.sdk import FubonSDK, Mode
@@ -570,7 +578,7 @@ def get_last_price_by_source(symbol: str, df, _sdk, source: str):
     return get_last_price(symbol, df, _sdk)
 
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
     if not rows:
         return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
@@ -1087,6 +1095,10 @@ TREND_TOUCH_TOL_PCT = 2.0
 TREND_MAX_VIOLATIONS = 1              
 TREND_REQUIRE_MA60_UP = False         
 
+# ===== 量能確認參數（突破日成交量須放大到 N 日均量的幾倍）=====
+TREND_VOL_MA_PERIOD = 5
+TREND_VOL_RATIO_MIN = 1.3
+
 
 def _format_date_for_table(value):
     if value is None or value == "-" or pd.isna(value):
@@ -1118,6 +1130,35 @@ def find_swing_highs(values, left=2, right=2):
     return peaks
 
 
+def _hull_cross(o, a, b):
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def upper_hull_edges(peak_positions, high_series):
+    """
+    對 swing high 點集合取「上凸包 (upper convex hull)」，只回傳其中呈下降的邊。
+    上凸包保證：這條線段之間沒有任何一個高點超出線的上方（零違反），
+    比任意兩點窮舉連線更貼近圖表上真正有效的壓力線／下降趨勢線。
+    回傳依 x1 (較早的高點) 排序的 (x1, x2, y1, y2) list。
+    """
+    pts = sorted({(int(p), float(high_series.iloc[p])) for p in peak_positions})
+    if len(pts) < 2:
+        return []
+
+    hull = []
+    for p in pts:
+        while len(hull) >= 2 and _hull_cross(hull[-2], hull[-1], p) >= 0:
+            hull.pop()
+        hull.append(p)
+
+    edges = []
+    for i in range(len(hull) - 1):
+        (x1, y1), (x2, y2) = hull[i], hull[i + 1]
+        if y2 < y1:  # 只保留下降邊，才是下降趨勢線的候選
+            edges.append((x1, x2, y1, y2))
+    return edges
+
+
 def detect_downtrend_breakout(
     df,
     price_val,
@@ -1130,6 +1171,9 @@ def detect_downtrend_breakout(
     resist_tol_pct=TREND_RESIST_TOL_PCT,
     touch_tol_pct=TREND_TOUCH_TOL_PCT,
     max_violations=TREND_MAX_VIOLATIONS,
+    vol_ma_period=TREND_VOL_MA_PERIOD,
+    vol_ratio_min=TREND_VOL_RATIO_MIN,
+    require_volume_confirm=False,
 ):
     if df is None or df.empty or not {"High", "Close"}.issubset(df.columns):
         return {"signal": "-"}
@@ -1137,6 +1181,8 @@ def detect_downtrend_breakout(
     work = df.copy().reset_index(drop=True)
     work["High"] = pd.to_numeric(work["High"], errors="coerce")
     work["Close"] = pd.to_numeric(work["Close"], errors="coerce")
+    if "Volume" in work.columns:
+        work["Volume"] = pd.to_numeric(work["Volume"], errors="coerce")
     if "Date" not in work.columns:
         work["Date"] = work.index.astype(str)
 
@@ -1152,6 +1198,17 @@ def detect_downtrend_breakout(
     x_today = n - 1
     x_yesterday = n - 2
 
+    # ===== 量能確認：突破日成交量 / N日均量 =====
+    vol_ratio = None
+    if "Volume" in work.columns:
+        vol = work["Volume"].reset_index(drop=True)
+        vol_ma = vol.rolling(window=vol_ma_period, min_periods=1).mean()
+        # 用「昨日」均量當基準，避免今日爆量把自己均量拉高、稀釋比率
+        base_vol_ma = float(vol_ma.iloc[x_yesterday]) if x_yesterday >= 0 else None
+        today_vol = float(vol.iloc[x_today]) if pd.notna(vol.iloc[x_today]) else None
+        if base_vol_ma and base_vol_ma > 0 and today_vol is not None:
+            vol_ratio = today_vol / base_vol_ma
+
     peaks = find_swing_highs(high.values, left=swing_left, right=swing_right)
     if len(peaks) < 2 and swing_right > 1:
         peaks = find_swing_highs(high.values, left=swing_left, right=1)
@@ -1160,99 +1217,180 @@ def detect_downtrend_breakout(
     if len(peaks) < 2:
         return {"signal": "-"}
 
+    # ===== 用上凸包取代 O(n^2) 窮舉，候選邊數大幅減少且每條邊天生零違反(對峰值點而言) =====
+    hull_edges = upper_hull_edges(peaks, high)
+
     best = None
-    for p1_pos in peaks:
-        p1_v = float(high.iloc[p1_pos])
+    for p1_pos, p2_pos, p1_v, p2_v in hull_edges:
         if p1_pos > x_today - min_peak_gap:
             continue
+        if p2_pos <= p1_pos + min_peak_gap:
+            continue
+        if p2_pos >= x_today:
+            continue
 
-        for p2_pos in peaks:
-            if p2_pos <= p1_pos + min_peak_gap:
+        drop_pct = (p1_v - p2_v) / p1_v * 100
+        if drop_pct < min_drop_pct:
+            continue
+
+        slope = (p2_v - p1_v) / (p2_pos - p1_pos)
+        if slope >= 0:
+            continue
+
+        xs = pd.Series(range(n), dtype="float64")
+        line = p1_v + slope * (xs - p1_pos)
+
+        # 仍對「每日高點」(而非僅峰值點)做違反檢查，避免兩峰值之間的盤中假突破被漏掉
+        check_start = p1_pos + 1
+        check_end = x_yesterday
+        if check_start <= check_end:
+            segment_high = high.iloc[check_start:check_end+1].reset_index(drop=True)
+            segment_line = line.iloc[check_start:check_end+1].reset_index(drop=True)
+            above = segment_high > segment_line * (1 + resist_tol_pct / 100)
+            p2_segment_idx = p2_pos - check_start
+            if 0 <= p2_segment_idx < len(above):
+                above.iloc[p2_segment_idx] = False
+            violations = int(above.sum())
+        else:
+            violations = 0
+
+        if violations > max_violations:
+            continue
+
+        touch_count = 0
+        for p in peaks:
+            if p < p1_pos or p > x_yesterday:
                 continue
-            if p2_pos >= x_today:
+            line_p = float(line.iloc[p])
+            if line_p <= 0:
                 continue
+            dist_pct = abs(float(high.iloc[p]) - line_p) / line_p * 100
+            if dist_pct <= touch_tol_pct:
+                touch_count += 1
 
-            p2_v = float(high.iloc[p2_pos])
-            if p2_v >= p1_v:
-                continue
+        trendline_today = float(line.iloc[x_today])
+        trendline_yesterday = float(line.iloc[x_yesterday])
+        today_close = float(price_val)
+        yesterday_close = float(close.iloc[-2])
+        buffer = 1 + breakout_buffer_pct / 100
 
-            drop_pct = (p1_v - p2_v) / p1_v * 100
-            if drop_pct < min_drop_pct:
-                continue
+        is_breakout = (
+            today_close > trendline_today * buffer
+            and yesterday_close <= trendline_yesterday * buffer
+        )
+        if not is_breakout:
+            continue
 
-            slope = (p2_v - p1_v) / (p2_pos - p1_pos)
-            if slope >= 0:
-                continue
+        if require_volume_confirm and (vol_ratio is None or vol_ratio < vol_ratio_min):
+            continue
 
-            xs = pd.Series(range(n), dtype="float64")
-            line = p1_v + slope * (xs - p1_pos)
+        score = (
+            (max_violations - violations) * 100000
+            + touch_count * 10000
+            + p2_pos * 100
+            + drop_pct
+        )
 
-            check_start = p1_pos + 1
-            check_end = x_yesterday
-            if check_start <= check_end:
-                segment_high = high.iloc[check_start:check_end+1].reset_index(drop=True)
-                segment_line = line.iloc[check_start:check_end+1].reset_index(drop=True)
-                above = segment_high > segment_line * (1 + resist_tol_pct / 100)
-                p2_segment_idx = p2_pos - check_start
-                if 0 <= p2_segment_idx < len(above):
-                    above.iloc[p2_segment_idx] = False
-                violations = int(above.sum())
-            else:
-                violations = 0
-
-            if violations > max_violations:
-                continue
-
-            touch_count = 0
-            for p in peaks:
-                if p < p1_pos or p > x_yesterday:
-                    continue
-                line_p = float(line.iloc[p])
-                if line_p <= 0:
-                    continue
-                dist_pct = abs(float(high.iloc[p]) - line_p) / line_p * 100
-                if dist_pct <= touch_tol_pct:
-                    touch_count += 1
-
-            trendline_today = float(line.iloc[x_today])
-            trendline_yesterday = float(line.iloc[x_yesterday])
-            today_close = float(price_val)
-            yesterday_close = float(close.iloc[-2])
-            buffer = 1 + breakout_buffer_pct / 100
-
-            is_breakout = (
-                today_close > trendline_today * buffer
-                and yesterday_close <= trendline_yesterday * buffer
-            )
-            if not is_breakout:
-                continue
-
-            score = (
-                (max_violations - violations) * 100000
-                + touch_count * 10000
-                + p2_pos * 100
-                + drop_pct
-            )
-
-            candidate = {
-                "signal": "趨勢突破",
-                "p1_pos": int(p1_pos),
-                "p2_pos": int(p2_pos),
-                "p1_date": _format_date_for_table(work.loc[p1_pos, "Date"]),
-                "p2_date": _format_date_for_table(work.loc[p2_pos, "Date"]),
-                "p1_val": p1_v,
-                "p2_val": p2_v,
-                "slope": slope,
-                "slope_pct": drop_pct,
-                "trendline_now": trendline_today,
-                "touch_count": touch_count,
-                "violations": violations,
-                "score": score,
-            }
-            if best is None or candidate["score"] > best["score"]:
-                best = candidate
+        candidate = {
+            "signal": "趨勢突破",
+            "p1_pos": int(p1_pos),
+            "p2_pos": int(p2_pos),
+            "p1_date": _format_date_for_table(work.loc[p1_pos, "Date"]),
+            "p2_date": _format_date_for_table(work.loc[p2_pos, "Date"]),
+            "p1_val": p1_v,
+            "p2_val": p2_v,
+            "slope": slope,
+            "slope_pct": drop_pct,
+            "trendline_now": trendline_today,
+            "touch_count": touch_count,
+            "violations": violations,
+            "vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
+            "score": score,
+            # 保留繪圖用資料（K線+趨勢線所需的完整片段）
+            "chart_df": work,
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
 
     return best if best else {"signal": "-"}
+
+def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
+    """
+    繪製 K線 + 下降趨勢線(藍色) + 成交量 圖表，用來視覺化「趨勢突破」訊號。
+    chart_info 需包含：df（含 Date/Open/High/Low/Close/Volume 的片段）、p1_pos、p2_pos、p1_val、slope
+    """
+    if go is None or make_subplots is None:
+        st.caption("尚未安裝 plotly，無法繪製圖表（請在 requirements.txt 加入 plotly）。")
+        return
+
+    work = chart_info.get("df")
+    p1_pos = chart_info.get("p1_pos")
+    p2_pos = chart_info.get("p2_pos")
+    p1_val = chart_info.get("p1_val")
+    slope = chart_info.get("slope")
+    if work is None or work.empty or p1_pos is None or slope is None or p1_val is None:
+        st.caption("此檔股票暫無圖表資料。")
+        return
+
+    work = work.reset_index(drop=True)
+    n = len(work)
+    has_volume = "Volume" in work.columns
+
+    fig = make_subplots(
+        rows=2 if has_volume else 1, cols=1, shared_xaxes=True,
+        row_heights=[0.75, 0.25] if has_volume else [1.0],
+        vertical_spacing=0.03,
+    )
+
+    fig.add_trace(go.Candlestick(
+        x=work["Date"], open=work["Open"], high=work["High"],
+        low=work["Low"], close=work["Close"],
+        increasing_line_color="red", decreasing_line_color="green",
+        name="K線",
+    ), row=1, col=1)
+
+    # 下降趨勢線：從 p1 延伸畫到最後一天（今天）
+    trend_x = [work.loc[p1_pos, "Date"], work.loc[n - 1, "Date"]]
+    trend_y = [p1_val, p1_val + slope * (n - 1 - p1_pos)]
+    fig.add_trace(go.Scatter(
+        x=trend_x, y=trend_y, mode="lines",
+        line=dict(color="blue", width=2.5), name="下降趨勢線",
+    ), row=1, col=1)
+
+    # 標記 P1 / P2 兩個高點
+    for pos, label in ((p1_pos, "P1"), (p2_pos, "P2")):
+        if pos is not None and 0 <= pos < n:
+            fig.add_annotation(
+                x=work.loc[pos, "Date"], y=work.loc[pos, "High"],
+                text=label, showarrow=True, arrowhead=2, arrowcolor="blue",
+                ax=0, ay=-30, row=1, col=1,
+            )
+
+    # 標記今天的突破點
+    fig.add_annotation(
+        x=work.loc[n - 1, "Date"], y=work.loc[n - 1, "High"],
+        text="突破", showarrow=True, arrowhead=2, arrowcolor="red",
+        ax=0, ay=-40, row=1, col=1,
+    )
+
+    if has_volume:
+        vol_colors = [
+            "red" if c >= o else "green"
+            for o, c in zip(work["Open"], work["Close"])
+        ]
+        fig.add_trace(go.Bar(
+            x=work["Date"], y=work["Volume"], marker_color=vol_colors, name="成交量",
+        ), row=2, col=1)
+
+    fig.update_layout(
+        title=f"{symbol} {name}｜下降趨勢突破",
+        xaxis_rangeslider_visible=False,
+        height=520 if has_volume else 420,
+        margin=dict(l=10, r=10, t=40, b=10),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"trend_chart_{symbol}")
+
 
 def calc_custom_volatility(df, price_val, window=20):
     if df is None or df.empty:
@@ -1386,7 +1524,7 @@ def resample_weekly_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     weekly = weekly_src.resample("W").agg({"High": "max", "Low": "min", "Close": "last"}).dropna()
     return weekly
 
-def compute_indicators(df, price):
+def compute_indicators(df, price, require_trend_volume_confirm=False):
     if df is None or df.empty:
         raise ValueError("下載資料為空")
     if len(df) < 20:
@@ -1480,6 +1618,10 @@ def compute_indicators(df, price):
     p1_val = p2_val = slope_pct = tl_val = 0.0
     p1_date = p2_date = "-"
     trend_touch_count = trend_violations = "-"
+    trend_vol_ratio = "-"
+    trend_chart_df = None
+    trend_p1_pos = trend_p2_pos = None
+    trend_slope = None
 
     enough_for_trend = len(df) >= max(61, TREND_MIN_PEAK_GAP + TREND_SWING_LEFT + TREND_SWING_RIGHT + 5)
     ma60_ok = True
@@ -1490,7 +1632,9 @@ def compute_indicators(df, price):
         ma60_ok = pd.notna(ma60_today) and pd.notna(ma60_yesterday) and ma60_today > ma60_yesterday
 
     if enough_for_trend and ma60_ok:
-        trend_result = detect_downtrend_breakout(df=df, price_val=price_val)
+        trend_result = detect_downtrend_breakout(
+            df=df, price_val=price_val, require_volume_confirm=require_trend_volume_confirm
+        )
         if trend_result.get("signal") == "趨勢突破":
             trend_signal = "趨勢突破"
             p1_val = float(trend_result.get("p1_val", 0.0))
@@ -1501,6 +1645,12 @@ def compute_indicators(df, price):
             p2_date = trend_result.get("p2_date", "-")
             trend_touch_count = trend_result.get("touch_count", "-")
             trend_violations = trend_result.get("violations", "-")
+            vr = trend_result.get("vol_ratio")
+            trend_vol_ratio = round(vr, 2) if vr is not None else "-"
+            trend_chart_df = trend_result.get("chart_df")
+            trend_p1_pos = trend_result.get("p1_pos")
+            trend_p2_pos = trend_result.get("p2_pos")
+            trend_slope = trend_result.get("slope")
 
     return {
         "price": round(price_val, 2),
@@ -1528,7 +1678,12 @@ def compute_indicators(df, price):
         "slope_pct": round(slope_pct, 1) if slope_pct else "-",
         "tl_val": round(tl_val, 2) if tl_val else "-",
         "trend_touch_count": trend_touch_count,
-        "trend_violations": trend_violations
+        "trend_violations": trend_violations,
+        "trend_vol_ratio": trend_vol_ratio,
+        "trend_chart_df": trend_chart_df,
+        "trend_p1_pos": trend_p1_pos,
+        "trend_p2_pos": trend_p2_pos,
+        "trend_slope": trend_slope,
     }
 
 def format_color(val):
@@ -1552,6 +1707,15 @@ def format_gap(val):
 def format_trend(val):
     if val == "趨勢突破": return "🔥 突破"
     return "-"
+
+def format_vol_ratio(val):
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "-"
+    if v >= TREND_VOL_RATIO_MIN:
+        return f"🔥 {v:.2f}x"
+    return f"{v:.2f}x"
 
 def format_volume(val):
     try:
@@ -1808,6 +1972,7 @@ if should_run_scan:
     group_up_summary = []
     all_signal_rows = []
     signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
+    trend_chart_store = {}  # symbol -> {df, p1_pos, p2_pos, p1_val, slope, name} 供「趨勢突破」分頁畫K線+趨勢線圖
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
 
     # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
@@ -1909,6 +2074,7 @@ if should_run_scan:
                     "P2日期": data["p2_date"], "近高P2": data["p2_val"],
                     "坡度%": data["slope_pct"], "趨勢價": data["tl_val"], "趨勢突破": data["trend_signal"],
                     "貼線數": data["trend_touch_count"], "穿線數": data["trend_violations"],
+                    "量能倍數": data["trend_vol_ratio"],
                     "MA位置": data["ma_range"], "MA排列": data["ma_trend"],
                     "K值": data["k"], "D值": f"{data['d']:.1f}",
                     "KD訊號": data["kd_signal"],
@@ -1927,13 +2093,29 @@ if should_run_scan:
                     for sig in signal_types:
                         if sig in signal_buckets and sig in selected_signal_names:
                             signal_buckets[sig].append(row.copy())
+
+                    if (
+                        data["trend_signal"] == "趨勢突破"
+                        and data.get("trend_chart_df") is not None
+                        and data.get("trend_p1_pos") is not None
+                        and data.get("trend_p2_pos") is not None
+                    ):
+                        trend_chart_store[symbol] = {
+                            "name": stock_name,
+                            "df": data["trend_chart_df"],
+                            "p1_pos": data["trend_p1_pos"],
+                            "p2_pos": data["trend_p2_pos"],
+                            "p1_val": float(data["p1_val"]) if data["p1_val"] != "-" else None,
+                            "slope": data["trend_slope"],
+                            "vol_ratio": data["trend_vol_ratio"],
+                        }
             except Exception as e:
                 error_count += 1
                 if not show_only_signal_rows:
                     rows.append({
                         "代碼": symbol, "代碼網址": "", "股票名稱": get_stock_name(symbol, st.session_state.fubon_sdk),
                         "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-",
-                        "P1日期": "-", "區高P1": "-", "P2日期": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-", "貼線數": "-", "穿線數": "-",
+                        "P1日期": "-", "區高P1": "-", "P2日期": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-", "貼線數": "-", "穿線數": "-", "量能倍數": "-",
                         "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-",
                         "KD訊號": "-", "週K值": "-", "週D值": "-", "週KD訊號": "-",
                         "MACD柱": "-", "MACD訊號": "-",
@@ -1955,6 +2137,8 @@ if should_run_scan:
             display_df["跳空訊號"] = display_df["跳空訊號"].apply(format_gap)
             if "趨勢突破" in display_df.columns:
                 display_df["趨勢突破"] = display_df["趨勢突破"].apply(format_trend)
+            if "量能倍數" in display_df.columns:
+                display_df["量能倍數"] = display_df["量能倍數"].apply(format_vol_ratio)
         group_tables[group_name] = {"count": len(stocks), "table": display_df}
         group_up_summary.append({
             "分類": group_name, "達標數": hit_count, "達標股票名稱": hit_names_text,
@@ -1972,6 +2156,7 @@ if should_run_scan:
         "group_up_summary": group_up_summary,
         "all_signal_rows": all_signal_rows,
         "signal_buckets": signal_buckets,
+        "trend_chart_store": trend_chart_store,
         "excel_filename": f"TWstock_signal_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
         "scan_completed_at": tw_now.strftime('%Y-%m-%d %H:%M:%S'),
         "progress_pct": 100,
@@ -1984,6 +2169,7 @@ else:
     group_up_summary = last_scan_result.get("group_up_summary", [])
     all_signal_rows = last_scan_result.get("all_signal_rows", [])
     signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
+    trend_chart_store = last_scan_result.get("trend_chart_store", {})
     render_scan_progress_card(scan_progress_card_placeholder, last_scan_result.get("progress_pct", 100), "掃描進度")
 
 excel_bytes = build_signal_excel_bytes(signal_buckets)
@@ -2007,7 +2193,7 @@ unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=[
 st.metric("符合勾選掃描條件股票數", unique_signal_count)
 
 # 全域定義顯示的欄位，確保資料表一定找得到
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])
@@ -2026,6 +2212,11 @@ if all_signal_rows:
         signal_display_df["趨勢突破"] = signal_display_df["趨勢突破"].apply(format_trend)
     else:
         signal_display_df["趨勢突破"] = "-"
+
+    if "量能倍數" in signal_display_df.columns:
+        signal_display_df["量能倍數"] = signal_display_df["量能倍數"].apply(format_vol_ratio)
+    else:
+        signal_display_df["量能倍數"] = "-"
         
     signal_display_df["代碼"] = signal_display_df["代碼網址"]
     
@@ -2082,6 +2273,11 @@ if all_signal_rows:
                     bucket_display_df["趨勢突破"] = bucket_display_df["趨勢突破"].apply(format_trend)
                 else:
                     bucket_display_df["趨勢突破"] = "-"
+
+                if "量能倍數" in bucket_display_df.columns:
+                    bucket_display_df["量能倍數"] = bucket_display_df["量能倍數"].apply(format_vol_ratio)
+                else:
+                    bucket_display_df["量能倍數"] = "-"
                     
                 bucket_display_df["代碼"] = bucket_display_df["代碼網址"]
                 
@@ -2094,6 +2290,17 @@ if all_signal_rows:
                     "代碼": st.column_config.LinkColumn("代碼", help="點擊前往台股 Yahoo", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
                     "股票名稱": st.column_config.TextColumn("股票名稱")
                 })
+
+                # 🌟 趨勢突破分頁：額外提供 K線 + 下降趨勢線圖表，方便肉眼確認訊號品質
+                if bucket_key == "趨勢突破" and trend_chart_store:
+                    st.markdown("##### 📈 個股圖表（K線 + 下降趨勢線）")
+                    for _, r in bucket_df.iterrows():
+                        sym = r["代碼"]
+                        chart_info = trend_chart_store.get(sym)
+                        if not chart_info:
+                            continue
+                        with st.expander(f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}"):
+                            plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info)
             else:
                 st.caption(f"目前沒有符合「{display_name}」的股票。")
 else:
