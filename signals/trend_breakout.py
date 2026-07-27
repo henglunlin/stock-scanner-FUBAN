@@ -252,14 +252,14 @@ def detect_downtrend_breakout(
     return best if best else {"signal": "-"}
 
 
-def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
+def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict, render: bool = True):
     """
     繪製 K線 + 下降趨勢線(藍色) + 成交量 圖表，用來視覺化「趨勢突破」訊號。
     chart_info 需包含：df（含 Date/Open/High/Low/Close/Volume 的片段）、p1_pos、p2_pos、p1_val、slope
     """
     if go is None or make_subplots is None:
         st.caption("尚未安裝 plotly，無法繪製圖表（請在 requirements.txt 加入 plotly）。")
-        return
+        return None
 
     work = chart_info.get("df")
     p1_pos = chart_info.get("p1_pos")
@@ -268,7 +268,7 @@ def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
     slope = chart_info.get("slope")
     if work is None or work.empty or p1_pos is None or slope is None or p1_val is None:
         st.caption("此檔股票暫無圖表資料。")
-        return
+        return None
 
     work = work.reset_index(drop=True)
     n = len(work)
@@ -327,8 +327,11 @@ def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
         margin=dict(l=10, r=10, t=40, b=10),
         showlegend=False,
     )
-    st.plotly_chart(fig, use_container_width=True, key=f"trend_chart_{symbol}")
-
+    
+    if render:
+        st.plotly_chart(fig, use_container_width=True, key=f"trend_chart_{symbol}")
+        
+    return fig
 
 
 def check_trend_breakout_signal(ctx: SignalContext, params: dict) -> dict:
