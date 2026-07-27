@@ -1315,13 +1315,59 @@ if all_signal_rows:
                 # 🌟 趨勢突破分頁：額外提供 K線 + 下降趨勢線圖表，方便肉眼確認訊號品質
                 if bucket_key == "趨勢突破" and trend_chart_store:
                     st.markdown("##### 📈 個股圖表（K線 + 下降趨勢線）")
+                    
+                    # 1. 狀態管理：一鍵收折 / 展開
+                    if "trend_charts_expanded" not in st.session_state:
+                        st.session_state.trend_charts_expanded = False
+                        
+                    btn_col1, btn_col2, _ = st.columns([2, 2, 6])
+                    
+                    with btn_col1:
+                        # 切換展開/收折狀態並重新渲染
+                        if st.button("一鍵收折 / 展開 (全部結果圖)", use_container_width=True):
+                            st.session_state.trend_charts_expanded = not st.session_state.trend_charts_expanded
+                            st.rerun()
+                            
+                    # 2. 預先產生所有圖表物件
+                    all_figs = []
                     for _, r in bucket_df.iterrows():
                         sym = r["代碼"]
                         chart_info = trend_chart_store.get(sym)
                         if not chart_info:
                             continue
-                        with st.expander(f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}"):
-                            plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info)
+                        
+                        # 設定 render=False 只取圖表物件，不在這階段印出
+                        fig = plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info, render=False)
+                        if fig:
+                            all_figs.append((sym, r.get("股票名稱", ""), fig, chart_info))
+                            
+                    # 3. 組合 HTML 以供「一鍵下載」
+                    if all_figs:
+                        # 建立基本的 HTML 結構，並載入 plotly.js
+                        html_content = "<html><head><meta charset='utf-8'><title>趨勢突破全部結果圖</title></head><body style='font-family: sans-serif; padding: 20px;'>\n"
+                        html_content += "<script src='https://cdn.plot.ly/plotly-latest.min.js'></script>\n"
+                        html_content += "<h2>趨勢突破掃描結果圖表</h2>\n"
+                        
+                        for sym, name, f, info in all_figs:
+                            html_content += f"<h3>{sym} {name} (量能倍數: {info.get('vol_ratio', '-')})</h3>\n"
+                            # 將圖表轉換為 HTML div (不含完整的 js，共用上方的 cdn)
+                            html_content += f.to_html(full_html=False, include_plotlyjs=False)
+                            html_content += "<hr style='margin: 40px 0;'>\n"
+                        html_content += "</body></html>"
+                        
+                        with btn_col2:
+                            st.download_button(
+                                label="一鍵下載 (全部結果圖)",
+                                data=html_content,
+                                file_name=f"Trend_Breakout_Charts_{tw_now.strftime('%Y%m%d_%H%M')}.html",
+                                mime="text/html",
+                                use_container_width=True
+                            )
+                            
+                    # 4. 依照狀態渲染至畫面
+                    for sym, name, f, info in all_figs:
+                        with st.expander(f"{sym} {name} 量能倍數 {info.get('vol_ratio', '-')}", expanded=st.session_state.trend_charts_expanded):
+                            st.plotly_chart(f, use_container_width=True, key=f"trend_chart_{sym}")
             else:
                 st.caption(f"目前沒有符合「{display_name}」的股票。")
 else:
