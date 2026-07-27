@@ -1341,28 +1341,36 @@ if all_signal_rows:
                         if fig:
                             all_figs.append((sym, r.get("股票名稱", ""), fig, chart_info))
                             
-                    # 3. 組合 HTML 以供「一鍵下載」
+                    # 3. 組合圖檔並打包成 ZIP 以供「一鍵下載」
                     if all_figs:
-                        # 建立基本的 HTML 結構，並載入 plotly.js
-                        html_content = "<html><head><meta charset='utf-8'><title>趨勢突破全部結果圖</title></head><body style='font-family: sans-serif; padding: 20px;'>\n"
-                        html_content += "<script src='https://cdn.plot.ly/plotly-latest.min.js'></script>\n"
-                        html_content += "<h2>趨勢突破掃描結果圖表</h2>\n"
+                        import zipfile
                         
-                        for sym, name, f, info in all_figs:
-                            html_content += f"<h3>{sym} {name} (量能倍數: {info.get('vol_ratio', '-')})</h3>\n"
-                            # 將圖表轉換為 HTML div (不含完整的 js，共用上方的 cdn)
-                            html_content += f.to_html(full_html=False, include_plotlyjs=False)
-                            html_content += "<hr style='margin: 40px 0;'>\n"
-                        html_content += "</body></html>"
-                        
-                        with btn_col2:
-                            st.download_button(
-                                label="一鍵下載 (全部結果圖)",
-                                data=html_content,
-                                file_name=f"Trend_Breakout_Charts_{tw_now.strftime('%Y%m%d_%H%M')}.html",
-                                mime="text/html",
-                                use_container_width=True
-                            )
+                        zip_buffer = BytesIO()
+                        try:
+                            # 建立 ZIP 壓縮檔
+                            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                                for sym, name, f, info in all_figs:
+                                    # 將 plotly 圖表轉換為 PNG 圖片的 bytes (需依賴 kaleido 套件)
+                                    img_bytes = f.to_image(format="png", width=1200, height=800, scale=1.5)
+                                    # 命名圖檔並寫入 ZIP 中
+                                    file_name = f"{sym}_{name}_下降趨勢突破.png"
+                                    zip_file.writestr(file_name, img_bytes)
+                                    
+                            with btn_col2:
+                                st.download_button(
+                                    label="一鍵下載 (ZIP 圖檔包)",
+                                    data=zip_buffer.getvalue(),
+                                    file_name=f"Trend_Breakout_Charts_{tw_now.strftime('%Y%m%d_%H%M')}.zip",
+                                    mime="application/zip",
+                                    use_container_width=True
+                                )
+                        except ValueError as ve:
+                            with btn_col2:
+                                st.error("⚠️ 需安裝 kaleido 才能匯出靜態圖片")
+                                st.caption("請在終端機輸入: `pip install kaleido`")
+                        except Exception as e:
+                            with btn_col2:
+                                st.error(f"圖片打包失敗: {e}")
                             
                     # 4. 依照狀態渲染至畫面
                     for sym, name, f, info in all_figs:
