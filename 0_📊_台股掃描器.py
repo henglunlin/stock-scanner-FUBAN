@@ -1315,67 +1315,13 @@ if all_signal_rows:
                 # 🌟 趨勢突破分頁：額外提供 K線 + 下降趨勢線圖表，方便肉眼確認訊號品質
                 if bucket_key == "趨勢突破" and trend_chart_store:
                     st.markdown("##### 📈 個股圖表（K線 + 下降趨勢線）")
-                    
-                    # 1. 狀態管理：一鍵收折 / 展開
-                    if "trend_charts_expanded" not in st.session_state:
-                        st.session_state.trend_charts_expanded = False
-                        
-                    btn_col1, btn_col2, _ = st.columns([2, 2, 6])
-                    
-                    with btn_col1:
-                        # 切換展開/收折狀態並重新渲染
-                        if st.button("一鍵收折 / 展開 (全部結果圖)", use_container_width=True):
-                            st.session_state.trend_charts_expanded = not st.session_state.trend_charts_expanded
-                            st.rerun()
-                            
-                    # 2. 預先產生所有圖表物件
-                    all_figs = []
                     for _, r in bucket_df.iterrows():
                         sym = r["代碼"]
                         chart_info = trend_chart_store.get(sym)
                         if not chart_info:
                             continue
-                        
-                        # 設定 render=False 只取圖表物件，不在這階段印出
-                        fig = plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info, render=False)
-                        if fig:
-                            all_figs.append((sym, r.get("股票名稱", ""), fig, chart_info))
-                            
-                    # 3. 組合圖檔並打包成 ZIP 以供「一鍵下載」
-                    if all_figs:
-                        import zipfile
-                        
-                        zip_buffer = BytesIO()
-                        try:
-                            # 建立 ZIP 壓縮檔
-                            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                                for sym, name, f, info in all_figs:
-                                    # 將 plotly 圖表轉換為 PNG 圖片的 bytes (需依賴 kaleido 套件)
-                                    img_bytes = f.to_image(format="png", width=1200, height=800, scale=1.5)
-                                    # 命名圖檔並寫入 ZIP 中
-                                    file_name = f"{sym}_{name}_下降趨勢突破.png"
-                                    zip_file.writestr(file_name, img_bytes)
-                                    
-                            with btn_col2:
-                                st.download_button(
-                                    label="一鍵下載 (ZIP 圖檔包)",
-                                    data=zip_buffer.getvalue(),
-                                    file_name=f"Trend_Breakout_Charts_{tw_now.strftime('%Y%m%d_%H%M')}.zip",
-                                    mime="application/zip",
-                                    use_container_width=True
-                                )
-                        except ValueError as ve:
-                            with btn_col2:
-                                st.error("⚠️ 需安裝 kaleido 才能匯出靜態圖片")
-                                st.caption("請在終端機輸入: `pip install kaleido`")
-                        except Exception as e:
-                            with btn_col2:
-                                st.error(f"圖片打包失敗: {e}")
-                            
-                    # 4. 依照狀態渲染至畫面
-                    for sym, name, f, info in all_figs:
-                        with st.expander(f"{sym} {name} 量能倍數 {info.get('vol_ratio', '-')}", expanded=st.session_state.trend_charts_expanded):
-                            st.plotly_chart(f, use_container_width=True, key=f"trend_chart_{sym}")
+                        with st.expander(f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}"):
+                            plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info)
             else:
                 st.caption(f"目前沒有符合「{display_name}」的股票。")
 else:
