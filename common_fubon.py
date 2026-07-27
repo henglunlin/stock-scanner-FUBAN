@@ -1,87 +1,51 @@
-# -*- coding: utf-8 -*-
 """
 common_fubon.py
 ================
-共用工具模組：把主掃描程式（Sacnner_Web_fubon_...py）裡「跟資料抓取 / 資料源切換 /
-股票清單載入 / Excel & Telegram 輸出」有關、不含頁面畫面邏輯的函式抽出來，
-讓「巧妙點」等新頁面可以直接 import 使用，不用整份複製主程式。
-
-⚠️ 這個檔案必須跟主程式放在同一個資料夾（例如 app 根目錄），
-   新頁面則放在 pages/ 資料夾底下，Streamlit 才能自動辨識成多頁應用程式。
+台股資料源模組：富邦(Fubon Neo) WebSocket/REST 行情 + Yfinance 備援/批次抓取。
+所有跟「怎麼拿到 K 線與即時價」有關的邏輯都集中在這裡，
+掃描邏輯(signals/)與 UI(app.py) 都只呼叫這裡提供的函式，不用關心資料怎麼來的。
 """
 
-import re
 import os
-from html import escape
-from io import BytesIO
-from datetime import date, timedelta
+import re
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
 import streamlit as st
 
+# ===== yfinance 選用資料源 =====
 try:
     import yfinance as yf
 except ImportError:
     yf = None
 
-# ===== 共用常數 =====
+# ===== 富邦 API 引入 =====
+try:
+    from fubon_neo.sdk import FubonSDK, Mode
+except ImportError:
+    st.error("請先安裝富邦 API 套件：執行 `pip install fubon-neo`")
+    st.stop()
+
+# ===== 資料源相關常數 =====
 REFRESH_SEC = 3
-YFINANCE_HISTORY_CACHE_TTL_SEC = 60 * 60
-STOCK_NAME_FILE = "TWstocklistname2.txt"          # 股票代碼->名稱 對照表（沿用主程式既有檔案）
+YFINANCE_HISTORY_CACHE_TTL_SEC = 60 * 60  # yfinance 今日以前歷史資料每小時更新一次
+STOCK_NAME_FILE = "TWstocklistname2.txt"
+STOCK_SCAN_FILE = "TWstocklistname2.txt"
+FORCE_SCAN_ALL_STOCKS_FROM_FILE = True
+ALL_STOCK_GROUP_NAME = "TWstocklistname2 全股票掃描"
 AUTO_YFINANCE_AFTER_HOUR = 13
 AUTO_YFINANCE_AFTER_MINUTE = 30
 
-TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
-
-
-# ===== Telegram 工具 =====
-def send_telegram_message(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code != 200:
-            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
-    except Exception as e:
-        st.error(f"Telegram 連線失敗: {e}")
-
-
-def send_telegram_document(file_bytes: bytes, filename: str, caption: str = "") -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        st.error("Telegram Bot Token 或 Chat ID 尚未設定，無法推送檔案。")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
-    files = {
-        "document": (
-            filename,
-            file_bytes,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    }
-    try:
-        res = requests.post(url, data=data, files=files, timeout=20)
-        if res.status_code == 200:
-            return True
-        st.error(f"Telegram 檔案傳送失敗，API 回傳：{res.text}")
-    except Exception as e:
-        st.error(f"Telegram 檔案傳送連線失敗: {e}")
-    return False
-
-
-# ===== 富邦 API 行情工具 =====
+# ===== Fubon API 行情工具 =====
 def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFrame:
+    """
+    向富邦 API 抓取指定日期區間的日K線，統一整理成與 yfinance 對齊的欄位格式
+    （Date/Open/High/Low/Close/Volume），方便後續與 Yfinance 資料合併串接。
+    """
     if _sdk is None:
         raise ValueError("富邦 API 尚未連線")
+
     fubon_symbol = str(symbol).split(".")[0]
     try:
         res = _sdk.marketdata.rest_client.stock.historical.candles(**{
@@ -91,45 +55,56 @@ def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFram
             "timeframe": "D",
             "fields": "open,high,low,close,volume"
         })
+
         if res and "data" in res and isinstance(res["data"], list) and res["data"]:
             df = pd.DataFrame(res["data"])
             df.rename(columns={
                 "open": "Open", "high": "High", "low": "Low",
                 "close": "Close", "volume": "Volume", "date": "Date",
             }, inplace=True)
+
             if "Date" in df.columns:
                 df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
                 df = df.sort_values("Date").reset_index(drop=True)
+
             for col in ["Open", "High", "Low", "Close", "Volume"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
+
             keep_cols = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
             return df[keep_cols].dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
     except Exception as e:
         print(f"富邦 API 抓取 {fubon_symbol} K 線失敗: {e}")
-    return pd.DataFrame()
 
+    return pd.DataFrame()
 
 @st.cache_data(ttl=REFRESH_SEC)
 def download_stock_data(symbol: str, _sdk):
+    """富邦完整90天歷史資料（僅在混合資料源都抓不到時作為備援使用，平常掃描不會走這條慢路徑）"""
     end_date = date.today()
     start_date = end_date - timedelta(days=90)
     return _fetch_fubon_candles(symbol, _sdk, start_date, end_date)
 
-
 @st.cache_data(ttl=REFRESH_SEC)
 def download_stock_data_fubon_today(symbol: str, _sdk, today_str: str):
+    """
+    🚀 加速重點：盤中(9:00-13:30)只跟富邦要『今日』單日K線，不再像過去一樣每次都要
+    90天完整歷史。今日以前的資料改由 Yfinance 批次快取提供（見下方 bulk_download_yfinance_history），
+    單檔富邦請求的資料量大幅縮小，掃描速度明顯提升。
+    """
     if _sdk is None:
         return pd.DataFrame()
     today = date.today()
     return _fetch_fubon_candles(symbol, _sdk, today, today)
 
-
 def normalize_ohlc(df):
     if df is None or df.empty:
         return pd.DataFrame()
+
     df = df.copy()
+    # 保留日期欄位，讓趨勢線可以回報 P1/P2 是哪一天。
     if "date" in df.columns and "Date" not in df.columns:
         df.rename(columns={"date": "Date"}, inplace=True)
+
     required_cols = ["Open", "High", "Low", "Close", "Volume"]
     if set(required_cols).issubset(df.columns):
         cols = (["Date"] if "Date" in df.columns else []) + required_cols
@@ -140,7 +115,6 @@ def normalize_ohlc(df):
             out[col] = pd.to_numeric(out[col], errors="coerce")
         return out.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
     return pd.DataFrame()
-
 
 def get_last_price(symbol, df, _sdk):
     fubon_symbol = str(symbol).split(".")[0]
@@ -154,10 +128,11 @@ def get_last_price(symbol, df, _sdk):
                     return float(price)
         except Exception:
             pass
+
     if not df.empty and "Close" in df.columns:
         return float(df["Close"].iloc[-1])
+        
     raise ValueError("無法取得即時價格")
-
 
 @st.cache_data(ttl=86400)
 def load_stock_name_map(file_path: str = STOCK_NAME_FILE) -> dict:
@@ -167,8 +142,7 @@ def load_stock_name_map(file_path: str = STOCK_NAME_FILE) -> dict:
     with open(file_path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip().replace("\ufeff", "").replace("\u3000", "")
-            if not line:
-                continue
+            if not line: continue
             if "\t" in line:
                 parts = [p.strip() for p in line.split("\t") if p.strip()]
                 if len(parts) >= 2:
@@ -179,113 +153,30 @@ def load_stock_name_map(file_path: str = STOCK_NAME_FILE) -> dict:
                 name_map[m.group(1).strip().upper()] = m.group(2).strip()
     return name_map
 
-
-def _parse_symbol_lines(lines):
-    """把一行一行的文字（'代碼 名稱' 或純代碼）解析成去重後的代碼 list。"""
+@st.cache_data(ttl=86400)
+def load_stock_symbols_from_file(file_path: str = STOCK_SCAN_FILE) -> list:
     symbols = []
     seen = set()
-    for raw_line in lines:
-        line = str(raw_line).strip().replace("\ufeff", "").replace("\u3000", "")
-        if not line:
-            continue
-        symbol = re.split(r"[\s,，]+", line, maxsplit=1)[0].strip().upper()
-        if not re.match(r"^[0-9A-Z]+\.(TW|TWO)$", symbol):
-            continue
-        if symbol not in seen:
-            seen.add(symbol)
-            symbols.append(symbol)
-    return symbols
-
-
-@st.cache_data(ttl=86400)
-def load_stock_symbols_from_file(file_path: str) -> list:
-    """從指定的股票清單檔案載入代碼清單（各頁面可傳入各自獨立的檔案路徑）。"""
     if not os.path.exists(file_path):
-        return []
+        return symbols
     with open(file_path, "r", encoding="utf-8") as f:
-        return _parse_symbol_lines(f.readlines())
-
-
-def parse_stock_symbols_from_text(text: str) -> list:
-    """從使用者上傳/貼上的文字內容解析代碼清單（不快取，即時解析）。"""
-    if not text:
-        return []
-    return _parse_symbol_lines(text.splitlines())
-
-
-def normalize_symbol_quick(input_text: str):
-    """把使用者手動輸入的單一代碼補齊成 xxxx.TW / xxxx.TWO 格式。"""
-    s = str(input_text).strip().upper()
-    if not s:
-        return None
-    if "." in s:
-        return s
-    if s.isdigit():
-        if s.startswith(("3", "6", "8")):
-            return f"{s}.TWO"
-        return f"{s}.TW"
-    return s
-
-
-def parse_manual_symbols(text: str) -> list:
-    """手動輸入區塊專用：逐行 / 逗號分隔，並自動補齊 .TW / .TWO。"""
-    if not text:
-        return []
-    text = text.replace("，", ",")
-    tokens = []
-    for raw_line in text.splitlines():
-        for part in raw_line.split(","):
-            part = part.strip()
-            if part:
-                tokens.append(part)
-    symbols = []
-    seen = set()
-    for t in tokens:
-        sym = normalize_symbol_quick(t)
-        if sym and sym not in seen:
-            seen.add(sym)
-            symbols.append(sym)
-    return symbols
-
-
-@st.cache_data(ttl=86400)
-def load_code_to_ticker_map(file_path: str = STOCK_NAME_FILE) -> dict:
-    """從『代碼<TAB/空白>名稱』格式的清單檔載入『純數字代碼 -> 完整代碼(含.TW/.TWO)』對照表。
-    用來把使用者輸入或 Excel 匯入的純數字代碼，準確轉換成正確的 .TW / .TWO 後綴，
-    避免對每個代碼同時亂猜兩種後綴（那樣會讓批次 yfinance 請求膨脹、拖累抓取成功率）。
-    """
-    mapping = {}
-    if not os.path.exists(file_path):
-        return mapping
-    with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
         for raw_line in f:
-            line = raw_line.strip().replace("\u3000", "")
+            line = raw_line.strip().replace("\ufeff", "").replace("\u3000", "")
             if not line:
                 continue
-            parts = re.split(r"[\t]+", line) if "\t" in line else line.split(None, 1)
-            if not parts:
+            symbol = re.split(r"\s+", line, maxsplit=1)[0].strip().upper()
+            if not re.match(r"^[0-9A-Z]+\.(TW|TWO)$", symbol):
                 continue
-            ticker = parts[0].strip().upper()
-            if "." in ticker:
-                mapping[ticker.split(".")[0]] = ticker
-    return mapping
+            if symbol not in seen:
+                seen.add(symbol)
+                symbols.append(symbol)
+    return symbols
 
+def load_all_stock_group_from_file() -> dict:
+    symbols = load_stock_symbols_from_file(STOCK_SCAN_FILE)
+    return {ALL_STOCK_GROUP_NAME: symbols}
 
-def resolve_ticker_suffix(raw_code, code_map: dict = None) -> str:
-    """把單一輸入（可能是純數字、可能已含 .TW/.TWO）解析成正確的完整代碼。
-    已經帶明確後綴就直接使用；純數字則優先查對照表，查不到才退回猜測 .TW。"""
-    code_map = code_map or {}
-    raw = str(raw_code).strip().upper()
-    if not raw:
-        return ""
-    if "." in raw:
-        return raw
-    if raw in code_map:
-        return code_map[raw]
-    return normalize_symbol_quick(raw) or raw
-
-
-
+def _normalize_yfinance_ohlcv(df):
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -299,7 +190,6 @@ def resolve_ticker_suffix(raw_code, code_map: dict = None) -> str:
     for col in required_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df[["Date"] + required_cols].dropna(subset=["Date", "Open", "High", "Low", "Close"]).reset_index(drop=True)
-
 
 @st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
 def download_stock_data_yfinance_history(symbol: str, today_str: str):
@@ -315,7 +205,6 @@ def download_stock_data_yfinance_history(symbol: str, today_str: str):
     except Exception:
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=REFRESH_SEC)
 def download_stock_data_yfinance_today(symbol: str, today_str: str):
     if yf is None:
@@ -330,8 +219,21 @@ def download_stock_data_yfinance_today(symbol: str, today_str: str):
     except Exception:
         return pd.DataFrame()
 
+def download_stock_data_yfinance(symbol: str):
+    today_str = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d")
+    history_df = download_stock_data_yfinance_history(symbol, today_str)
+    today_df = download_stock_data_yfinance_today(symbol, today_str)
+
+    frames = [df for df in [history_df, today_df] if df is not None and not df.empty]
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    if "Date" in df.columns:
+        df = df.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
+    return df.reset_index(drop=True)
 
 def _split_yfinance_bulk_result(raw: pd.DataFrame, symbols: tuple) -> dict:
+    """把 yf.download 多檔批次結果拆成 {symbol: 單檔DataFrame} 字典"""
     result = {}
     if raw is None or raw.empty:
         return {s: pd.DataFrame() for s in symbols}
@@ -350,9 +252,14 @@ def _split_yfinance_bulk_result(raw: pd.DataFrame, symbols: tuple) -> dict:
             result[symbol] = pd.DataFrame()
     return result
 
-
 @st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
 def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
+    """
+    🚀 加速重點：一次批次下載整批股票『今日以前』的歷史資料（yfinance 內部會自動平行抓取多檔），
+    取代過去逐檔各打一次 API 的作法。全市場掃描時（可能上百檔股票），這能把歷史資料的
+    網路請求次數從「N次」降為「1次」，是掃描速度提升最主要的來源。
+    快取1小時，同一小時內重複掃描不會再次觸發下載。
+    """
     if yf is None or not symbols:
         return {}
     try:
@@ -362,6 +269,7 @@ def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
         )
     except Exception:
         return {s: pd.DataFrame() for s in symbols}
+
     today = pd.to_datetime(today_str).date()
     per_symbol = _split_yfinance_bulk_result(raw, symbols)
     return {
@@ -369,9 +277,9 @@ def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
         for s, df in per_symbol.items()
     }
 
-
 @st.cache_data(ttl=REFRESH_SEC)
 def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
+    """批次下載整批股票『今日』資料，供盤後(13:30後)全面改用Yfinance時使用"""
     if yf is None or not symbols:
         return {}
     try:
@@ -381,6 +289,7 @@ def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
         )
     except Exception:
         return {s: pd.DataFrame() for s in symbols}
+
     today = pd.to_datetime(today_str).date()
     per_symbol = _split_yfinance_bulk_result(raw, symbols)
     return {
@@ -388,23 +297,60 @@ def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
         for s, df in per_symbol.items()
     }
 
-
 def resolve_price_source(now_dt=None) -> str:
     mode = st.session_state.get("price_source_mode", "自動")
     if mode in ["WebSocket", "Yfinance"]:
         return mode
     if now_dt is None:
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
         now_dt = datetime.now(ZoneInfo("Asia/Taipei"))
     cutoff = now_dt.replace(hour=AUTO_YFINANCE_AFTER_HOUR, minute=AUTO_YFINANCE_AFTER_MINUTE, second=0, microsecond=0)
     return "Yfinance" if now_dt >= cutoff else "WebSocket"
 
+def render_price_source_selector(now_dt):
+    active_source = resolve_price_source(now_dt)
+    source_mode = st.session_state.get("price_source_mode", "自動")
+    with st.sidebar.expander("🧭 資料來源開關", expanded=True):
+        st.markdown(
+            f"""
+            <div style="background:#2f4563; color:#35a8ff; border-radius:8px; padding:14px 16px; line-height:1.8; font-weight:600;">
+            目前資料來源模式：{source_mode}；<br>
+            實際使用：{active_source}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"自動模式邏輯：{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 前 → "
+            f"富邦WebSocket(今日) + Yfinance(今日以前) 混合資料；"
+            f"{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 後 → 全部改用 Yfinance。"
+        )
+        mode_options = ["自動", "WebSocket", "Yfinance"]
+        selected_mode = st.radio(
+            "資料來源開關",
+            options=mode_options,
+            index=mode_options.index(source_mode) if source_mode in mode_options else 0,
+            horizontal=True,
+            key="price_source_mode_radio",
+            label_visibility="collapsed",
+        )
+        if selected_mode != source_mode:
+            st.session_state.price_source_mode = selected_mode
+            st.cache_data.clear()
+            st.rerun()
+    return active_source
 
 def download_stock_data_by_source(
     symbol: str, _sdk, source: str, today_str: str,
     history_map: dict = None, yf_today_map: dict = None,
 ):
+    """
+    依資料來源模式取得K線資料（邏輯維持不變，僅優化抓取方式加速）：
+    - Yfinance：優先查表使用外部預先批次下載好的 history_map / yf_today_map（一次API呼叫換來的整批結果），
+      查不到才退回單檔即時查詢（例如臨時加入、不在原批次清單中的股票）。
+    - WebSocket（盤中9:00-13:30混合模式）：『今日以前』歷史資料一樣查表使用 Yfinance 批次快取，
+      『今日』資料改成只跟富邦要當天單日K線（不再要90天），大幅減少富邦API的資料量與延遲。
+    - 兩種模式都抓不到資料時，才退回最慢但最保險的富邦90天完整歷史。
+    """
     history_map = history_map or {}
     yf_today_map = yf_today_map or {}
 
@@ -439,8 +385,8 @@ def download_stock_data_by_source(
     df = _combine(history_df, today_df)
     if not df.empty:
         return df
+    # 混合來源都抓不到資料時，退回原本較慢的富邦90天完整歷史作為最終備援
     return download_stock_data(symbol, _sdk)
-
 
 def get_last_price_by_source(symbol: str, df, _sdk, source: str):
     if source == "Yfinance":
@@ -453,12 +399,12 @@ def get_last_price_by_source(symbol: str, df, _sdk, source: str):
         raise ValueError("yfinance 無法取得價格")
     return get_last_price(symbol, df, _sdk)
 
-
 @st.cache_data(ttl=86400)
 def get_stock_name(symbol: str, _sdk) -> str:
     name_map = load_stock_name_map(STOCK_NAME_FILE)
     if symbol in name_map:
         return name_map[symbol]
+        
     fubon_symbol = str(symbol).split(".")[0]
     if _sdk is not None:
         try:
@@ -467,160 +413,6 @@ def get_stock_name(symbol: str, _sdk) -> str:
                 return res["name"].strip()
         except Exception:
             pass
+            
     return fubon_symbol
 
-
-# ===== 輔助工具 =====
-def yahoo_quote_url(symbol: str) -> str:
-    fubon_symbol = str(symbol).split(".")[0]
-    return f"https://tw.stock.yahoo.com/quote/{fubon_symbol}"
-
-
-def symbol_to_code(symbol: str) -> str:
-    return str(symbol).split(".")[0]
-
-
-def contains_cjk(text) -> bool:
-    if text is None:
-        return False
-    s = str(text)
-    return any(
-        ("\u4e00" <= ch <= "\u9fff") or
-        ("\u3400" <= ch <= "\u4dbf") or
-        ("\uf900" <= ch <= "\ufaff")
-        for ch in s
-    )
-
-
-def apply_excel_fonts(workbook):
-    from openpyxl.styles import Font
-    chinese_font_name = "Microsoft JhengHei"
-    english_font_name = "Calibri"
-    for worksheet in workbook.worksheets:
-        for row in worksheet.iter_rows():
-            for cell in row:
-                if cell.value is None:
-                    cell.font = Font(name=english_font_name)
-                elif contains_cjk(cell.value):
-                    cell.font = Font(name=chinese_font_name)
-                else:
-                    cell.font = Font(name=english_font_name)
-
-
-def format_color(val):
-    if isinstance(val, (int, float)):
-        if val > 0:
-            return f"🔴 +{val:.2f}%"
-        elif val < 0:
-            return f"🟢 {val:.2f}%"
-        else:
-            return f"{val:.2f}%"
-    return val
-
-
-def format_volume(val):
-    try:
-        return f"{float(val):,.1f}"
-    except Exception:
-        return val
-
-
-def ensure_fubon_session_state():
-    """讓任何一個頁面（包含子頁面）都能獨立初始化富邦連線相關的 session_state，
-    避免使用者直接從子頁面進站時 key 不存在而噴錯。"""
-    if "fubon_sdk" not in st.session_state:
-        st.session_state.fubon_sdk = None
-    if "fubon_logged_in" not in st.session_state:
-        st.session_state.fubon_logged_in = False
-    if "price_source_mode" not in st.session_state:
-        st.session_state.price_source_mode = "自動"
-
-
-def render_fubon_login_sidebar():
-    """共用的富邦登入元件，跟主程式行為一致，任何頁面都能掛在側邊欄使用。
-    因為 session_state 在整個瀏覽器 session 內跨頁共享，只要有一頁登入過，
-    其他頁面就能直接沿用已連線的 SDK，不需要重複登入。"""
-    ensure_fubon_session_state()
-    st.sidebar.markdown("## 🔑 富邦 API 設定 (Fubon Neo)")
-
-    if st.session_state.fubon_logged_in:
-        st.sidebar.success("✅ 富邦 API 已成功連線")
-        if st.sidebar.button("登出 / 重新連線", use_container_width=True, key="qmd_fubon_logout_btn"):
-            st.session_state.fubon_sdk = None
-            st.session_state.fubon_logged_in = False
-            st.rerun()
-        return
-
-    try:
-        from fubon_neo.sdk import FubonSDK
-    except ImportError:
-        st.sidebar.error("請先安裝富邦 API 套件：執行 `pip install fubon-neo`")
-        return
-
-    try:
-        fubon_secrets = st.secrets["fubon"]
-        pfx_base64 = fubon_secrets["pfx_base64"]
-    except KeyError:
-        st.sidebar.error("❌ 找不到 Streamlit Secrets 中的 pfx_base64 憑證資料。")
-        return
-
-    st.sidebar.info("請輸入富邦證券登入資訊")
-    f_id = st.sidebar.text_input("身分證字號", key="qmd_f_id_input")
-    f_pw = st.sidebar.text_input("富邦登入密碼", key="qmd_f_pw_input", type="password")
-    f_cert_pw = st.sidebar.text_input("憑證密碼", key="qmd_f_cert_pw_input", type="password")
-
-    if st.sidebar.button("連線行情伺服器", use_container_width=True, key="qmd_fubon_login_btn"):
-        if not f_id or not f_pw or not f_cert_pw:
-            st.sidebar.warning("請填寫完整的身分證字號與密碼！")
-        else:
-            try:
-                import base64
-                temp_cert_path = "temp_cloud_cert.pfx"
-                with open(temp_cert_path, "wb") as f:
-                    f.write(base64.b64decode(pfx_base64))
-                with st.spinner("連線富邦 API 中..."):
-                    sdk = FubonSDK()
-                    sdk.login(f_id.strip().upper(), f_pw, temp_cert_path, f_cert_pw)
-                    sdk.init_realtime()
-                    st.session_state.fubon_sdk = sdk
-                    st.session_state.fubon_logged_in = True
-                st.sidebar.success("✅ 富邦 API 連線成功！")
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"❌ 登入失敗: {e}")
-
-
-def render_price_source_selector_sidebar(now_dt):
-    """精簡版資料來源開關，跟主程式共用同一個 session_state key，兩頁設定互通。"""
-    ensure_fubon_session_state()
-    active_source = resolve_price_source(now_dt)
-    source_mode = st.session_state.get("price_source_mode", "自動")
-    with st.sidebar.expander("🧭 資料來源開關", expanded=False):
-        st.markdown(
-            f"""
-            <div style="background:#2f4563; color:#35a8ff; border-radius:8px; padding:14px 16px; line-height:1.8; font-weight:600;">
-            目前資料來源模式：{source_mode}；<br>
-            實際使用：{active_source}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            f"自動模式邏輯：{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 前 → "
-            f"富邦WebSocket(今日) + Yfinance(今日以前) 混合資料；"
-            f"{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 後 → 全部改用 Yfinance。"
-        )
-        mode_options = ["自動", "WebSocket", "Yfinance"]
-        selected_mode = st.radio(
-            "資料來源開關",
-            options=mode_options,
-            index=mode_options.index(source_mode) if source_mode in mode_options else 0,
-            horizontal=True,
-            key="qmd_price_source_mode_radio",
-            label_visibility="collapsed",
-        )
-        if selected_mode != source_mode:
-            st.session_state.price_source_mode = selected_mode
-            st.cache_data.clear()
-            st.rerun()
-    return active_source
