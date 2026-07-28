@@ -49,7 +49,7 @@ except Exception:
 
 
 # ==========================================
-# 1. 富邦 API 行情與基礎資料工具 (來自 Source 3)
+# 1. 富邦 API 行情與基礎資料工具
 # ==========================================
 def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFrame:
     if _sdk is None:
@@ -86,13 +86,13 @@ def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFram
 
     return pd.DataFrame()
 
-@st.cache_data(ttl=REFRESH_SEC)
+@st.cache_data(ttl=REFRESH_SEC, show_spinner=False)
 def download_stock_data(symbol: str, _sdk):
     end_date = date.today()
     start_date = end_date - timedelta(days=90)
     return _fetch_fubon_candles(symbol, _sdk, start_date, end_date)
 
-@st.cache_data(ttl=REFRESH_SEC)
+@st.cache_data(ttl=REFRESH_SEC, show_spinner=False)
 def download_stock_data_fubon_today(symbol: str, _sdk, today_str: str):
     if _sdk is None:
         return pd.DataFrame()
@@ -136,7 +136,7 @@ def get_last_price(symbol, df, _sdk):
         
     raise ValueError("無法取得即時價格")
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_stock_name_map(file_path: str = STOCK_NAME_FILE) -> dict:
     name_map = {}
     if not os.path.exists(file_path):
@@ -155,7 +155,7 @@ def load_stock_name_map(file_path: str = STOCK_NAME_FILE) -> dict:
                 name_map[m.group(1).strip().upper()] = m.group(2).strip()
     return name_map
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_stock_symbols_from_file(file_path: str = STOCK_SCAN_FILE) -> list:
     symbols = []
     seen = set()
@@ -193,7 +193,7 @@ def _normalize_yfinance_ohlcv(df):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df[["Date"] + required_cols].dropna(subset=["Date", "Open", "High", "Low", "Close"]).reset_index(drop=True)
 
-@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
+@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC, show_spinner=False)
 def download_stock_data_yfinance_history(symbol: str, today_str: str):
     if yf is None:
         return pd.DataFrame()
@@ -207,7 +207,7 @@ def download_stock_data_yfinance_history(symbol: str, today_str: str):
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=REFRESH_SEC)
+@st.cache_data(ttl=REFRESH_SEC, show_spinner=False)
 def download_stock_data_yfinance_today(symbol: str, today_str: str):
     if yf is None:
         return pd.DataFrame()
@@ -253,7 +253,7 @@ def _split_yfinance_bulk_result(raw: pd.DataFrame, symbols: tuple) -> dict:
             result[symbol] = pd.DataFrame()
     return result
 
-@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
+@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC, show_spinner=False)
 def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
     if yf is None or not symbols:
         return {}
@@ -272,7 +272,7 @@ def bulk_download_yfinance_history(symbols: tuple, today_str: str) -> dict:
         for s, df in per_symbol.items()
     }
 
-@st.cache_data(ttl=REFRESH_SEC)
+@st.cache_data(ttl=REFRESH_SEC, show_spinner=False)
 def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
     if yf is None or not symbols:
         return {}
@@ -383,7 +383,7 @@ def get_last_price_by_source(symbol: str, df, _sdk, source: str):
         raise ValueError("yfinance 無法取得價格")
     return get_last_price(symbol, df, _sdk)
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_name(symbol: str, _sdk) -> str:
     name_map = load_stock_name_map(STOCK_NAME_FILE)
     if symbol in name_map:
@@ -401,7 +401,7 @@ def get_stock_name(symbol: str, _sdk) -> str:
     return fubon_symbol
 
 # ==========================================
-# 2. 缺失的 UI、匯出與輔助工具 (從 Source 2 補回)
+# 2. 缺失的 UI、匯出與輔助工具
 # ==========================================
 
 # ===== Telegram 工具 =====
@@ -640,7 +640,7 @@ def parse_manual_symbols(text: str) -> list:
             symbols.append(sym)
     return symbols
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_code_to_ticker_map(file_path: str = STOCK_NAME_FILE) -> dict:
     mapping = {}
     if not os.path.exists(file_path):
