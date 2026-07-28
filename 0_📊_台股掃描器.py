@@ -1389,6 +1389,8 @@ if should_run_scan:
     all_signal_rows = []
     signal_buckets = {"優先追蹤": [], "漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
     trend_chart_store = {}  # symbol -> {df, p1_pos, p2_pos, p1_val, slope, name} 供「趨勢突破」分頁畫K線+趨勢線圖
+    missing_stocks_list = []  # 👈 新增這行：用來獨立記錄失敗的股票
+
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
 
     # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
@@ -1538,6 +1540,10 @@ if should_run_scan:
                         }
             except Exception as e:
                 error_count += 1
+                
+                # 👇 新增這行：直接把抓取失敗的股票代碼與名稱存起來
+                missing_stocks_list.append(f"{symbol} {get_stock_name(symbol, st.session_state.fubon_sdk)}")
+                
                 if not show_only_signal_rows:
                     rows.append({
                         "代碼": symbol, "代碼網址": "", "股票名稱": get_stock_name(symbol, st.session_state.fubon_sdk),
@@ -1587,6 +1593,7 @@ if should_run_scan:
         "all_signal_rows": all_signal_rows,
         "signal_buckets": signal_buckets,
         "trend_chart_store": trend_chart_store,
+        "missing_stocks_list": missing_stocks_list,  # 👈 新增這行：儲存錯誤清單
         "excel_filename": f"TWstock_signal_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
         "scan_completed_at": tw_now.strftime('%Y-%m-%d %H:%M:%S'),
         "progress_pct": 100,
@@ -1670,17 +1677,8 @@ with stat_col4:
     st.metric("符合勾選條件數", unique_signal_count)
 
 # ========== 2. 新增：找出缺少資料的股票並顯示浮動視窗 ==========
-missing_stocks = []
-# 走訪每個群組的資料表，把「訊號類型」為「錯誤」的股票挑出來
-for group_name, info in group_tables.items():
-    table_df = info.get("table")
-    if table_df is not None and not table_df.empty and "訊號類型" in table_df.columns:
-        error_rows = table_df[table_df["訊號類型"] == "錯誤"]
-        for _, row in error_rows.iterrows():
-            # 取得代碼並去除可能的連結格式，保留乾淨的代碼與名稱
-            code = str(row.get("代碼", "")).split(">")[-1].replace("</a", "") if "<a" in str(row.get("代碼", "")) else str(row.get("代碼", ""))
-            name = str(row.get("股票名稱", ""))
-            missing_stocks.append(f"{code} {name}")
+# 👇 改為直接從 last_scan_result 讀取獨立紀錄的清單
+missing_stocks = st.session_state.get("last_scan_result", {}).get("missing_stocks_list", [])
 
 # 如果有缺少資料，則利用 HTML/CSS 畫出位於右下角的浮動視窗
 if missing_stocks:
@@ -1853,7 +1851,7 @@ if all_signal_rows:
                         chart_info = trend_chart_store.get(sym)
                         if not chart_info:
                             continue
-                        expander_label = f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}{invisible_version_suffix}"
+                        expander_label = f"{sym} {r.get('股票名稱', '')} 量能倍數 {chart_info.get('vol_ratio', '-')}{invisible_version_suffix}"
                         with st.expander(
                             expander_label,
                             expanded=not st.session_state.get("trend_charts_collapsed", True),
