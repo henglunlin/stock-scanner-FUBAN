@@ -13,7 +13,7 @@ Features:
 - Optional: uploads the combined / updated CSV back to GitHub using a date filename.
 
 Place this file under your repo's pages/ folder:
-    pages/1_📈_訊號追蹤分析.py
+    pages/3_📈_訊號追蹤分析.py
 
 Required Streamlit secrets:
     GITHUB_TOKEN = "github_pat_xxx"  # or a token with Contents read/write
@@ -43,8 +43,10 @@ import yfinance as yf
 
 try:
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 except Exception:  # pragma: no cover
     go = None
+    make_subplots = None
 
 
 # =========================
@@ -367,20 +369,145 @@ def update_forward_performance(df: pd.DataFrame, max_days: int = 20, period: str
 # =========================
 # Chart helpers
 # =========================
-def build_post_signal_trend_frame(df: pd.DataFrame, symbol: str, scan_date: str, days_before: int = 10, days_after: int = 20) -> pd.DataFrame:
-    hist = download_price_history(symbol, period="6mo")
+def calc_kd(df: pd.DataFrame, n: int = 9) -> pd.DataFrame:
+    """Calculate stochastic K/D lines with 9-day RSV and EWMA smoothing."""
+    out = df.copy()
+    low_n = out["Low"].rolling(n, min_periods=1).min()
+    high_n = out["High"].rolling(n, min_periods=1).max()
+    denom = (high_n - low_n).replace(0, pd.NA)
+    out["RSV"] = ((out["Close"] - low_n) / denom * 100).fillna(50)
+    out["K"] = out["RSV"].ewm(alpha=1/3, adjust=False).mean()
+    out["D"] = out["K"].ewm(alpha=1/3, adjust=False).mean()
+    return out
+
+
+def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for n in [5, 10, 20, 60]:
+        out[f"MA{n}"] = out["Close"].rolling(n, min_periods=1).mean()
+    return out
+
+
+def build_60bar_signal_window(symbol: str, scan_date: str, bars: int = 60, period: str = "1y") -> pd.DataFrame:
+    """Return exactly up to 60 trading bars around the signal date.
+
+    Priority:
+    - Keep roughly 20 bars before the signal and 39 bars after the signal.
+    - If future bars are not enough, fill with earlier bars.
+    - If earlier bars are not enough, fill with later bars.
+    """
+    hist = download_price_history(symbol, period=period)
     if hist.empty:
         return pd.DataFrame()
+
     sd = pd.to_datetime(scan_date)
-    window = hist[(hist.index >= sd - pd.Timedelta(days=days_before * 2)) & (hist.index <= sd + pd.Timedelta(days=days_after * 2))].copy()
-    if window.empty:
-        return pd.DataFrame()
-    # Keep a practical trading-day-like range around the signal date
-    before = window[window.index <= sd].tail(days_before)
-    after = window[window.index > sd].head(days_after)
-    result = pd.concat([before, after])
-    result["relative_day"] = range(-len(before) + 1, len(after) + 1)
-    return result
+    hist = hist.sort_index().copy()
+
+    # First position whose date is >= signal date. If signal date is not trading day, use next trading day.
+    pos_candidates = [i for i, dt in enumerate(hist.index) if dt >= sd]
+    if pos_candidates:
+        sig_pos = pos_candidates[0]
+    else:
+        sig_pos = len(hist) - 1
+
+    before_target = 20
+    after_target = bars - before_target - 1
+    start_pos = max(0, sig_pos - before_target)
+    end_pos = min(len(hist), sig_pos + after_target + 1)
+
+    # Fill shortage to keep 60 bars when possible.
+    shortage = bars - (end_pos - start_pos)
+    if shortage > 0:
+        extra_start = max(0, start_pos - shortage)
+        shortage -= start_pos - extra_start
+        start_pos = extra_start
+    if shortage > 0:
+        end_pos = min(len(hist), end_pos + shortage)
+
+    window = hist.iloc[start_pos:end_pos].copy()
+    window = add_moving_averages(window)
+    window = calc_kd(window)
+    window["relative_bar"] = range(len(window))
+    window["is_signal_bar"] = window.index >= sd
+    return window
+
+
+def find_swing_highs(df: pd.DataFrame, left: int = 2, right: int = 2) -> List[Tuple[int, pd.Timestamp, float]]:
+    highs: List[Tuple[int, pd.Timestamp, float]] = []
+    if df.empty or "High" not in df.columns:
+        return highs
+    for i in range(left, len(df) - right):
+        val = float(df["High"].iloc[i])
+        prev_max = float(df["High"].iloc[i-left:i].max())
+        next_max = float(df["High"].iloc[i+1:i+right+1].max())
+        if val >= prev_max and val >= next_max:
+            highs.append((i, df.index[i], val))
+    return highs
+
+
+def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
+    """Find a simple descending resistance line from two descending swing highs.
+
+    Uses swing highs before or on signal date when possible. Falls back to all displayed bars.
+    """
+    if df.empty or len(df) < 8:
+        return None
+    sd = pd.to_datetime(scan_date)
+    base = df[df.index <= sd]
+    if len(base) < 8:
+        base = df
+    swings = find_swing_highs(base, left=2, right=2)
+    if len(swings) < 2:
+        # fallback: use top historical highs in chronological order if still descending
+        candidate_idx = base["High"].nlargest(min(5, len(base))).index.tolist()
+        swings = sorted([(base.index.get_loc(idx), idx, float(base.loc[idx, "High"])) for idx in candidate_idx], key=lambda x: x[0])
+
+    best = None
+    # Prefer wider, descending pair.
+    for i in range(len(swings)):
+        for j in range(i + 1, len(swings)):
+            p1 = swings[i]
+            p2 = swings[j]
+            if p2[0] <= p1[0]:
+                continue
+            if p2[2] < p1[2]:
+                width = p2[0] - p1[0]
+                drop = p1[2] - p2[2]
+                score = width * max(drop, 0.01)
+                if best is None or score > best["score"]:
+                    best = {"p1": p1, "p2": p2, "score": score}
+    if best is None:
+        return None
+
+    p1 = best["p1"]
+    p2 = best["p2"]
+    slope = (p2[2] - p1[2]) / max((p2[0] - p1[0]), 1)
+    x0 = 0
+    x1 = len(df) - 1
+    y0 = p1[2] + slope * (x0 - p1[0])
+    y1 = p1[2] + slope * (x1 - p1[0])
+    return {
+        "x": [df.index[x0], df.index[x1]],
+        "y": [y0, y1],
+        "p1_date": p1[1],
+        "p1_val": p1[2],
+        "p2_date": p2[1],
+        "p2_val": p2[2],
+        "slope": slope,
+    }
+
+
+def detect_horizontal_resistance(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
+    """Use highest high before/on signal date as a horizontal resistance line."""
+    if df.empty:
+        return None
+    sd = pd.to_datetime(scan_date)
+    base = df[df.index <= sd]
+    if base.empty:
+        base = df
+    idx = base["High"].idxmax()
+    level = float(base.loc[idx, "High"])
+    return {"level": level, "date": idx}
 
 
 def show_price_chart(row: pd.Series) -> None:
@@ -389,33 +516,145 @@ def show_price_chart(row: pd.Series) -> None:
     entry_price = safe_float(row.get("entry_price", 0))
     stock_name = row.get("股票名稱", "")
 
-    trend = build_post_signal_trend_frame(pd.DataFrame([row]), symbol, scan_date)
+    st.markdown("#### 圖表設定")
+    ma_cols = st.columns(4)
+    with ma_cols[0]:
+        show_ma5 = st.checkbox("5MA", value=False, key=f"ma5_{symbol}_{scan_date}")
+    with ma_cols[1]:
+        show_ma10 = st.checkbox("10MA", value=False, key=f"ma10_{symbol}_{scan_date}")
+    with ma_cols[2]:
+        show_ma20 = st.checkbox("20MA", value=False, key=f"ma20_{symbol}_{scan_date}")
+    with ma_cols[3]:
+        show_ma60 = st.checkbox("60MA", value=True, key=f"ma60_{symbol}_{scan_date}")
+
+    trend = build_60bar_signal_window(symbol, scan_date, bars=60, period="1y")
     if trend.empty:
         st.info("此股票目前沒有足夠股價資料可畫圖。")
         return
 
-    if go is None:
-        st.line_chart(trend["Close"])
+    if go is None or make_subplots is None:
+        st.line_chart(trend[["Close", "MA60"]])
+        st.line_chart(trend[["K", "D"]])
         return
 
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=trend.index,
-        open=trend["Open"],
-        high=trend["High"],
-        low=trend["Low"],
-        close=trend["Close"],
-        name="K線",
-    ))
-    fig.add_hline(y=entry_price, line_dash="dot", line_color="#6366f1", annotation_text=f"訊號價 {entry_price}")
-    fig.add_vline(x=pd.to_datetime(scan_date), line_dash="dash", line_color="#ef4444", annotation_text="訊號日")
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.72, 0.28],
+        subplot_titles=(f"{symbol} {stock_name}｜60個交易日K線 / 均線 / 趨勢線", "KD 指標"),
+    )
+
+    # Taiwan convention: close up = red, close down = green.
+    fig.add_trace(
+        go.Candlestick(
+            x=trend.index,
+            open=trend["Open"],
+            high=trend["High"],
+            low=trend["Low"],
+            close=trend["Close"],
+            name="K線",
+            increasing=dict(line=dict(color="#ef4444", width=1.4), fillcolor="rgba(239,68,68,0.55)"),
+            decreasing=dict(line=dict(color="#10b981", width=1.4), fillcolor="rgba(16,185,129,0.55)"),
+        ),
+        row=1,
+        col=1,
+    )
+
+    ma_config = [
+        ("MA5", show_ma5, "#f97316"),
+        ("MA10", show_ma10, "#8b5cf6"),
+        ("MA20", show_ma20, "#0ea5e9"),
+        ("MA60", show_ma60, "#111827"),
+    ]
+    for ma_name, enabled, color in ma_config:
+        if enabled and ma_name in trend.columns:
+            fig.add_trace(
+                go.Scatter(x=trend.index, y=trend[ma_name], mode="lines", name=ma_name, line=dict(color=color, width=1.8)),
+                row=1,
+                col=1,
+            )
+
+    # Entry / signal lines
+    if entry_price > 0:
+        fig.add_hline(y=entry_price, line_dash="dot", line_color="#6366f1", annotation_text=f"訊號價 {entry_price}", row=1, col=1)
+    fig.add_vline(x=pd.to_datetime(scan_date), line_dash="dash", line_color="#ef4444", annotation_text="訊號日", row=1, col=1)
+
+    # Descending trendline and horizontal resistance
+    trendline = detect_descending_trendline(trend, scan_date)
+    if trendline:
+        fig.add_trace(
+            go.Scatter(
+                x=trendline["x"],
+                y=trendline["y"],
+                mode="lines",
+                name="下降趨勢線",
+                line=dict(color="#dc2626", width=2, dash="dash"),
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[trendline["p1_date"], trendline["p2_date"]],
+                y=[trendline["p1_val"], trendline["p2_val"]],
+                mode="markers",
+                name="趨勢高點",
+                marker=dict(color="#dc2626", size=8, symbol="circle"),
+            ),
+            row=1,
+            col=1,
+        )
+
+    horizontal = detect_horizontal_resistance(trend, scan_date)
+    if horizontal:
+        fig.add_hline(
+            y=horizontal["level"],
+            line_dash="dot",
+            line_color="#2563eb",
+            annotation_text=f"水平壓力 {horizontal['level']:.2f}",
+            row=1,
+            col=1,
+        )
+
+    # KD panel
+    fig.add_trace(
+        go.Scatter(x=trend.index, y=trend["K"], mode="lines", name="K", line=dict(color="#f59e0b", width=1.8)),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=trend.index, y=trend["D"], mode="lines", name="D", line=dict(color="#3b82f6", width=1.8)),
+        row=2,
+        col=1,
+    )
+    fig.add_hline(y=80, line_dash="dot", line_color="#94a3b8", row=2, col=1)
+    fig.add_hline(y=20, line_dash="dot", line_color="#94a3b8", row=2, col=1)
+
     fig.update_layout(
         title=f"{symbol} {stock_name}｜訊號後股價走勢",
-        height=520,
-        margin=dict(l=20, r=20, t=60, b=20),
+        height=780,
+        margin=dict(l=20, r=20, t=75, b=25),
         xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
     )
+    fig.update_yaxes(title_text="價格", row=1, col=1)
+    fig.update_yaxes(title_text="KD", range=[0, 100], row=2, col=1)
     st.plotly_chart(fig, use_container_width=True)
+
+    info_cols = st.columns(3)
+    with info_cols[0]:
+        st.caption(f"顯示K線數：{len(trend)} 個交易日")
+    with info_cols[1]:
+        if trendline:
+            st.caption(f"下降趨勢線：{trendline['p1_date'].strftime('%Y-%m-%d')} {trendline['p1_val']:.2f} → {trendline['p2_date'].strftime('%Y-%m-%d')} {trendline['p2_val']:.2f}")
+        else:
+            st.caption("下降趨勢線：目前找不到明確的兩個下降高點")
+    with info_cols[2]:
+        if horizontal:
+            st.caption(f"水平壓力：{horizontal['level']:.2f}（{horizontal['date'].strftime('%Y-%m-%d')} 高點）")
 
 
 # =========================
