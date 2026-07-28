@@ -252,14 +252,13 @@ def detect_downtrend_breakout(
     return best if best else {"signal": "-"}
 
 
-def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
+def build_trend_breakout_chart_figure(symbol: str, name: str, chart_info: dict):
     """
-    繪製 K線 + 下降趨勢線(藍色) + 成交量 圖表，用來視覺化「趨勢突破」訊號。
-    chart_info 需包含：df（含 Date/Open/High/Low/Close/Volume 的片段）、p1_pos、p2_pos、p1_val、slope
+    建立 K線 + 下降趨勢線(藍色) + 成交量的 Plotly Figure。
+    這個 helper 讓 UI 顯示與「一鍵下載所有圖表」共用同一份繪圖邏輯。
     """
     if go is None or make_subplots is None:
-        st.caption("尚未安裝 plotly，無法繪製圖表（請在 requirements.txt 加入 plotly）。")
-        return
+        return None
 
     work = chart_info.get("df")
     p1_pos = chart_info.get("p1_pos")
@@ -267,8 +266,7 @@ def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
     p1_val = chart_info.get("p1_val")
     slope = chart_info.get("slope")
     if work is None or work.empty or p1_pos is None or slope is None or p1_val is None:
-        st.caption("此檔股票暫無圖表資料。")
-        return
+        return None
 
     work = work.reset_index(drop=True)
     n = len(work)
@@ -327,8 +325,24 @@ def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
         margin=dict(l=10, r=10, t=40, b=10),
         showlegend=False,
     )
-    st.plotly_chart(fig, use_container_width=True, key=f"trend_chart_{symbol}")
+    return fig
 
+
+def plot_trend_breakout_chart(symbol: str, name: str, chart_info: dict):
+    """
+    繪製 K線 + 下降趨勢線(藍色) + 成交量 圖表，用來視覺化「趨勢突破」訊號。
+    chart_info 需包含：df（含 Date/Open/High/Low/Close/Volume 的片段）、p1_pos、p2_pos、p1_val、slope
+    """
+    if go is None or make_subplots is None:
+        st.caption("尚未安裝 plotly，無法繪製圖表（請在 requirements.txt 加入 plotly）。")
+        return
+
+    fig = build_trend_breakout_chart_figure(symbol, name, chart_info)
+    if fig is None:
+        st.caption("此檔股票暫無圖表資料。")
+        return
+
+    st.plotly_chart(fig, use_container_width=True, key=f"trend_chart_{symbol}")
 
 
 def check_trend_breakout_signal(ctx: SignalContext, params: dict) -> dict:
