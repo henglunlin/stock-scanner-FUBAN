@@ -69,6 +69,14 @@ SIGNAL_SCORE_MIN = float(st.secrets.get("SIGNAL_SCORE_MIN", 55))
 PRIORITY_SCORE_MIN = float(st.secrets.get("PRIORITY_SCORE_MIN", 65))
 AUTO_UPLOAD_GITHUB = bool(st.secrets.get("AUTO_UPLOAD_GITHUB", False))
 
+# ===== UI 下拉選單相容工具 =====
+def open_dropdown(label: str):
+    """Streamlit 1.32+ 使用 st.popover；較舊版本自動退回 st.expander。"""
+    if hasattr(st, "popover"):
+        return st.popover(label, use_container_width=True)
+    return st.expander(label, expanded=False)
+
+
 
 # ===== Telegram 設定（請替換為你的資訊）=====
 TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
@@ -283,7 +291,7 @@ def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: s
         put_res = requests.put(url, headers=headers, json=payload, timeout=30)
         if put_res.status_code in (200, 201):
             html_url = put_res.json().get("content", {}).get("html_url", "")
-            st.success(f"已上傳到 GitHub：{html_url}")
+            st.success(f"上傳成功")
             return True
 
         st.error(f"上傳 GitHub 失敗：{put_res.status_code} {put_res.text}")
@@ -293,17 +301,34 @@ def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: s
         return False
 
 
+def tracking_github_filename(dt=None) -> str:
+    """同一天固定同一個檔名，重複上傳只會更新同日檔案。"""
+    if dt is None:
+        dt = datetime.now(ZoneInfo("Asia/Taipei"))
+    elif isinstance(dt, str):
+        try:
+            dt = datetime.strptime(dt[:10], "%Y-%m-%d")
+        except Exception:
+            dt = datetime.now(ZoneInfo("Asia/Taipei"))
+    return f"signal_tracking_{dt.strftime('%Y%m%d')}.csv"
+
+
+def tracking_github_path(dt=None) -> str:
+    return f"{GITHUB_DATABASE_DIR}/{tracking_github_filename(dt)}"
+
+
 def upload_tracking_file_to_github(commit_suffix: str = "") -> bool:
     if not os.path.exists(TRACKING_FILE):
         st.warning(f"尚未建立追蹤檔：{TRACKING_FILE}")
         return False
     with open(TRACKING_FILE, "rb") as f:
         data = f.read()
+    upload_dt = datetime.now(ZoneInfo("Asia/Taipei"))
     suffix = f" {commit_suffix}" if commit_suffix else ""
     return upload_file_to_github(
         data,
-        f"{GITHUB_DATABASE_DIR}/signal_tracking.csv",
-        f"Update signal tracking{suffix}",
+        tracking_github_path(upload_dt),
+        f"Update {tracking_github_filename(upload_dt)}{suffix}",
     )
 
 
@@ -1239,7 +1264,7 @@ rise_threshold = st.number_input(
 
 
 st.markdown("### 🎯 掃描條件")
-scan_btn_col1, scan_btn_col2, scan_col1, scan_gain_col, scan_col2, scan_col3, scan_week_kd_col, scan_macd_col, scan_trend_col, scan_vol_col, scan_col4 = st.columns([0.9, 0.9, 1.2, 0.9, 0.7, 1.3, 1.3, 0.9, 1.0, 1.1, 1.7])
+scan_btn_col1, scan_btn_col2, scan_setting_col, scan_status_col = st.columns([0.9, 0.9, 1.25, 5.95])
 with scan_btn_col1:
     if st.button("▶️ 開始掃描", use_container_width=True, disabled=st.session_state.scan_enabled):
         st.session_state.scan_enabled = True
@@ -1251,36 +1276,39 @@ with scan_btn_col2:
         st.session_state.scan_enabled = False
         st.session_state.scan_requested = False
         st.rerun()
-with scan_col1:
-    show_only_signal_rows = st.toggle("只顯示訊號股票", value=True)
-with scan_gain_col:
-    include_gain_threshold_filter = st.checkbox(
-        "漲幅達標",
-        value=True,
-        help="選出漲幅 >= 上方『儀表板漲幅達標門檻』的股票，並新增到漲幅達標分頁。"
-    )
-with scan_col2:
-    include_gap_signal_filter = st.checkbox("跳空", value=True)
-with scan_col3:
-    include_kd_signal_filter = st.checkbox("黃金交叉 / 即將黃金交叉", value=True)
-with scan_week_kd_col:
-    include_week_kd_signal_filter = st.checkbox(
-        "週KD 黃金交叉 / 即將黃金交叉",
-        value=True,
-        help="以同一批已下載的日線資料重採樣成週線後計算KD，資料抓取區間與日KD相同，不會多打API。"
-    )
-with scan_macd_col:
-    include_macd_signal_filter = st.checkbox("MACD翻正", value=True)
-with scan_trend_col:
-    include_trend_signal_filter = st.checkbox("趨勢突破", value=True, help="40日動態雙高點下降趨勢 + 8%坡度 + 60MA上揚")
-with scan_vol_col:
-    min_volume_lots = st.number_input(
-        "成交量(張)下限",
-        min_value=0,
-        value=1000,
-        step=100
-    )
-with scan_col4:
+with scan_setting_col:
+    with open_dropdown("⚙️ Setting"):
+        st.caption("掃描條件設定")
+        show_only_signal_rows = st.toggle("只顯示訊號股票", value=True, key="setting_show_only_signal_rows")
+        include_gain_threshold_filter = st.checkbox(
+            "漲幅達標",
+            value=True,
+            key="setting_include_gain_threshold_filter",
+            help="選出漲幅 >= 上方『儀表板漲幅達標門檻』的股票，並新增到漲幅達標分頁。",
+        )
+        include_gap_signal_filter = st.checkbox("跳空", value=True, key="setting_include_gap_signal_filter")
+        include_kd_signal_filter = st.checkbox("黃金交叉 / 即將黃金交叉", value=True, key="setting_include_kd_signal_filter")
+        include_week_kd_signal_filter = st.checkbox(
+            "週KD 黃金交叉 / 即將黃金交叉",
+            value=True,
+            key="setting_include_week_kd_signal_filter",
+            help="以同一批已下載的日線資料重採樣成週線後計算KD，資料抓取區間與日KD相同，不會多打API。",
+        )
+        include_macd_signal_filter = st.checkbox("MACD翻正", value=True, key="setting_include_macd_signal_filter")
+        include_trend_signal_filter = st.checkbox(
+            "趨勢突破",
+            value=True,
+            key="setting_include_trend_signal_filter",
+            help="40日動態雙高點下降趨勢 + 8%坡度 + 60MA上揚",
+        )
+        min_volume_lots = st.number_input(
+            "成交量(張)下限",
+            min_value=0,
+            value=1000,
+            step=100,
+            key="setting_min_volume_lots",
+        )
+with scan_status_col:
     scan_action_placeholder = st.empty()
 
 if st.session_state.scan_enabled:
@@ -1592,30 +1620,43 @@ excel_filename = st.session_state.get("last_scan_result", {}).get(
 )
 
 with scan_action_placeholder.container():
-    bcol1, bcol2, bcol3, bcol4 = st.columns(4)
-    with bcol1:
-        st.download_button("下載", data=excel_bytes, file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_signal_excel_btn")
-    with bcol2:
-        if st.button("推送到telegram", use_container_width=True, key="push_signal_excel_to_tg_btn"):
-            ok = send_telegram_document(excel_bytes, excel_filename, caption=f"TWstock 訊號掃描結果｜成交量下限 {st.session_state.get('last_scan_result', {}).get('min_volume_lots', min_volume_lots)} 張｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
-            if ok:
-                st.success("已將 Excel 推送到 Telegram。")
-    with bcol3:
-        if st.button("上傳Excel到GitHub", use_container_width=True, key="push_signal_excel_to_github_btn"):
-            upload_file_to_github(
-                excel_bytes,
-                f"{GITHUB_DATABASE_DIR}/{excel_filename}",
-                f"Upload TW stock scan result {tw_now.strftime('%Y-%m-%d %H:%M:%S')}",
+    download_col, info_col = st.columns([1.15, 6.85])
+    with download_col:
+        with open_dropdown("📁 Download"):
+            st.caption("下載 / 推播 / GitHub 上傳")
+            st.download_button(
+                "下載 Excel",
+                data=excel_bytes,
+                file_name=excel_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="download_signal_excel_btn",
             )
-    with bcol4:
-        if st.button("上傳追蹤CSV", use_container_width=True, key="push_tracking_csv_to_github_btn"):
-            upload_tracking_file_to_github(tw_now.strftime('%Y-%m-%d %H:%M:%S'))
+            if st.button("推送到 Telegram", use_container_width=True, key="push_signal_excel_to_tg_btn"):
+                ok = send_telegram_document(
+                    excel_bytes,
+                    excel_filename,
+                    caption=f"TWstock 訊號掃描結果｜成交量下限 {st.session_state.get('last_scan_result', {}).get('min_volume_lots', min_volume_lots)} 張｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}",
+                )
+                if ok:
+                    st.success("已將 Excel 推送到 Telegram。")
+            if st.button("上傳 Excel 到 GitHub", use_container_width=True, key="push_signal_excel_to_github_btn"):
+                upload_file_to_github(
+                    excel_bytes,
+                    f"{GITHUB_DATABASE_DIR}/{excel_filename}",
+                    f"Upload TW stock scan result {tw_now.strftime('%Y-%m-%d %H:%M:%S')}",
+                )
+            if st.button("上傳追蹤 CSV", use_container_width=True, key="push_tracking_csv_to_github_btn"):
+                upload_tracking_file_to_github(tw_now.strftime('%Y-%m-%d %H:%M:%S'))
+            st.caption(f"今日追蹤CSV檔名：{tracking_github_filename(tw_now)}")
+    with info_col:
+        st.caption(f"Excel：{excel_filename} ｜ 追蹤CSV GitHub 目標：{tracking_github_path(tw_now)}")
 
 st.markdown("### 🔎 訊號掃描結果")
 unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
 st.metric("符合勾選掃描條件股票數", unique_signal_count)
 if os.path.exists(TRACKING_FILE):
-    st.caption(f"追蹤檔：{TRACKING_FILE} ｜ GitHub 目標：{GITHUB_DATABASE_DIR}/signal_tracking.csv")
+    st.caption(f"追蹤檔：{TRACKING_FILE} ｜ GitHub 目標：{tracking_github_path(tw_now)}")
 else:
     st.caption(f"追蹤檔尚未建立；第一次掃描到符合二階段過濾的股票後會建立：{TRACKING_FILE}")
 
