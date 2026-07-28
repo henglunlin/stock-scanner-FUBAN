@@ -60,6 +60,16 @@ GROUPS_FILE = "stock_groups.json"
 BACKUP_DIR = "backups"
 APP_LOGO = "dog.jpg"
 
+# ===== 二階段過濾 / 追蹤 / GitHub Database 設定 =====
+# GitHub repo: https://github.com/henglunlin/stock-scanner-FUBAN/tree/main/Database
+GITHUB_DATABASE_DIR = st.secrets.get("GITHUB_DATABASE_DIR", "Database")
+LOCAL_DATABASE_DIR = st.secrets.get("LOCAL_DATABASE_DIR", "Database")
+TRACKING_FILE = os.path.join(LOCAL_DATABASE_DIR, "signal_tracking.csv")
+SIGNAL_SCORE_MIN = float(st.secrets.get("SIGNAL_SCORE_MIN", 55))
+PRIORITY_SCORE_MIN = float(st.secrets.get("PRIORITY_SCORE_MIN", 65))
+AUTO_UPLOAD_GITHUB = bool(st.secrets.get("AUTO_UPLOAD_GITHUB", False))
+
+
 # ===== Telegram 設定（請替換為你的資訊）=====
 TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")  
@@ -223,9 +233,298 @@ def check_telegram_push_command():
     return False
 
 
+# ===== GitHub Database 上傳工具 =====
+def ensure_local_database_dir():
+    os.makedirs(LOCAL_DATABASE_DIR, exist_ok=True)
+
+
+def github_repo_config():
+    return {
+        "token": st.secrets.get("GITHUB_TOKEN", ""),
+        "owner": st.secrets.get("GITHUB_OWNER", "henglunlin"),
+        "repo": st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN"),
+        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+    }
+
+
+def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: str) -> bool:
+    """使用 GitHub Contents API 將檔案建立或更新到 repo。"""
+    cfg = github_repo_config()
+    token, owner, repo, branch = cfg["token"], cfg["owner"], cfg["repo"], cfg["branch"]
+    if not token or not owner or not repo:
+        st.error("GitHub Token / Owner / Repo 尚未設定，無法上傳到 GitHub。")
+        return False
+
+    github_path = github_path.strip("/")
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{github_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    sha = None
+    try:
+        get_res = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
+        if get_res.status_code == 200:
+            sha = get_res.json().get("sha")
+        elif get_res.status_code != 404:
+            st.error(f"讀取 GitHub 既有檔案失敗：{get_res.status_code} {get_res.text}")
+            return False
+
+        payload = {
+            "message": commit_message,
+            "content": base64.b64encode(file_bytes).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_res = requests.put(url, headers=headers, json=payload, timeout=30)
+        if put_res.status_code in (200, 201):
+            html_url = put_res.json().get("content", {}).get("html_url", "")
+            st.success(f"已上傳到 GitHub：{html_url}")
+            return True
+
+        st.error(f"上傳 GitHub 失敗：{put_res.status_code} {put_res.text}")
+        return False
+    except Exception as e:
+        st.error(f"GitHub 上傳例外：{e}")
+        return False
+
+
+def upload_tracking_file_to_github(commit_suffix: str = "") -> bool:
+    if not os.path.exists(TRACKING_FILE):
+        st.warning(f"尚未建立追蹤檔：{TRACKING_FILE}")
+        return False
+    with open(TRACKING_FILE, "rb") as f:
+        data = f.read()
+    suffix = f" {commit_suffix}" if commit_suffix else ""
+    return upload_file_to_github(
+        data,
+        f"{GITHUB_DATABASE_DIR}/signal_tracking.csv",
+        f"Update signal tracking{suffix}",
+    )
+
+
+# ===== 二階段過濾：訊號品質分數 / 追蹤工具 =====
+def safe_float(x, default=0):
+    try:
+        if x in ["-", "", None]:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def classify_signal_grade(score):
+    score = safe_float(score, 0)
+    if score >= 75:
+        return "A強勢追蹤"
+    elif score >= 65:
+        return "B可追蹤"
+    elif score >= 55:
+        return "C觀察"
+    return "D過濾"
+
+
+def calc_signal_quality_score(data, signal_types):
+    score = 0
+
+    # 1. 價格位置：避免接刀
+    ma_range = data.get("ma_range", "")
+    ma_trend = data.get("ma_trend", "")
+
+    if ma_range == ">MA5":
+        score += 15
+    elif ma_range == "MA5~10":
+        score += 10
+    elif ma_range == "MA10~20":
+        score += 5
+    elif ma_range == "<MA20":
+        score -= 15
+
+    if ma_trend == "多頭":
+        score += 15
+    elif ma_trend == "糾結":
+        score += 5
+    elif ma_trend == "空頭":
+        score -= 10
+
+    # 2. 相對強度：優先抓比大盤 / 族群強的股票
+    rs = safe_float(data.get("rs_raw", 0))
+    if rs >= 5:
+        score += 20
+    elif rs >= 2:
+        score += 12
+    elif rs >= 0:
+        score += 5
+    else:
+        score -= 10
+
+    # 3. 量能確認
+    vol_ratio = safe_float(data.get("trend_vol_ratio", 0))
+    volume_lots = safe_float(data.get("volume_lots", 0))
+
+    if volume_lots >= 3000:
+        score += 8
+    elif volume_lots >= 1000:
+        score += 4
+
+    if vol_ratio >= 2:
+        score += 12
+    elif vol_ratio >= 1.2:
+        score += 6
+
+    # 4. KD 位置：避免太高追價，也避免太弱接刀
+    k = safe_float(data.get("k", 0))
+    d = safe_float(data.get("d", 0))
+    if 35 <= k <= 75 and k > d:
+        score += 12
+    elif k > 85:
+        score -= 8
+    elif k < 15:
+        score -= 6
+
+    # 5. 週KD：週線方向比日線更重要
+    week_signal = data.get("week_kd_signal", "")
+    if week_signal == "黃金交叉":
+        score += 15
+    elif week_signal == "即將黃金交叉":
+        score += 8
+    elif week_signal == "超賣":
+        score -= 5
+
+    # 6. MACD
+    macd_hist = safe_float(data.get("macd_hist", 0))
+    macd_signal = data.get("macd_signal", "")
+    if macd_signal == "MACD翻正":
+        score += 12
+    elif macd_hist > 0:
+        score += 6
+    elif macd_hist < 0:
+        score -= 5
+
+    # 7. 趨勢突破品質
+    if data.get("trend_signal") == "趨勢突破":
+        score += 20
+
+    touch_count = safe_float(data.get("trend_touch_count", 0))
+    violations = safe_float(data.get("trend_violations", 0))
+    if touch_count >= 2 and violations == 0:
+        score += 8
+    elif violations > 0:
+        score -= 10
+
+    # 8. 避免暴衝過熱
+    pct = safe_float(data.get("pct", 0))
+    volatility = safe_float(data.get("volatility_pct", 0))
+    if pct >= 8:
+        score -= 8
+    elif 1 <= pct <= 5:
+        score += 5
+
+    if volatility >= 15:
+        score -= 8
+    elif volatility <= 8:
+        score += 4
+
+    # 9. 訊號共振：多個訊號同時出現，比單一訊號可靠
+    unique_signal_count = len(set(signal_types))
+    if unique_signal_count >= 3:
+        score += 12
+    elif unique_signal_count == 2:
+        score += 6
+
+    # 10. 特殊修正：避免空頭弱反彈被誤判成強訊號
+    if "即將黃金交叉" in signal_types:
+        if ma_trend == "空頭" and ma_range == "<MA20":
+            score -= 20
+
+    if "黃金交叉" in signal_types:
+        if ma_range in [">MA5", "MA5~10"]:
+            score += 10
+        elif ma_range == "<MA20":
+            score -= 10
+
+    return max(0, min(100, round(score, 1)))
+
+
+def build_priority_rows(all_signal_rows, min_score=None):
+    if min_score is None:
+        min_score = PRIORITY_SCORE_MIN
+    if not all_signal_rows:
+        return []
+    priority_rows = []
+    for row in all_signal_rows:
+        score = safe_float(row.get("訊號分數", 0))
+        if score >= float(min_score):
+            priority_rows.append(row.copy())
+    return sorted(
+        priority_rows,
+        key=lambda r: (
+            safe_float(r.get("訊號分數", 0)),
+            safe_float(r.get("RS加權報酬%", 0)),
+            safe_float(r.get("量能倍數", 0)),
+        ),
+        reverse=True,
+    )
+
+
+def append_signal_tracking(row, scan_date, tracking_file=TRACKING_FILE):
+    ensure_local_database_dir()
+    base_cols = [
+        "scan_date", "代碼", "股票名稱", "entry_price",
+        "訊號類型", "訊號分數", "追蹤等級",
+        "RS加權報酬%", "MA位置", "MA排列",
+        "K值", "D值", "週K值", "週D值",
+        "MACD柱", "趨勢突破", "量能倍數",
+        "status",
+    ]
+    new_record = {
+        "scan_date": scan_date,
+        "代碼": row.get("代碼"),
+        "股票名稱": row.get("股票名稱"),
+        "entry_price": row.get("價格"),
+        "訊號類型": row.get("訊號類型"),
+        "訊號分數": row.get("訊號分數"),
+        "追蹤等級": row.get("追蹤等級"),
+        "RS加權報酬%": row.get("RS加權報酬%"),
+        "MA位置": row.get("MA位置"),
+        "MA排列": row.get("MA排列"),
+        "K值": row.get("K值"),
+        "D值": row.get("D值"),
+        "週K值": row.get("週K值"),
+        "週D值": row.get("週D值"),
+        "MACD柱": row.get("MACD柱"),
+        "趨勢突破": row.get("趨勢突破"),
+        "量能倍數": row.get("量能倍數"),
+        "status": "tracking",
+    }
+
+    if os.path.exists(tracking_file):
+        df = pd.read_csv(tracking_file, encoding="utf-8-sig")
+    else:
+        df = pd.DataFrame(columns=base_cols)
+
+    if df.empty:
+        should_append = True
+    else:
+        key = (
+            (df["scan_date"].astype(str) == str(scan_date))
+            & (df["代碼"].astype(str) == str(row.get("代碼")))
+        )
+        should_append = not key.any()
+
+    if should_append:
+        df = pd.concat([df, pd.DataFrame([new_record])], ignore_index=True)
+        df.to_csv(tracking_file, index=False, encoding="utf-8-sig")
+
+
+
 # ===== Excel 匯出工具 =====
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
     if not rows:
         return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
@@ -262,6 +561,7 @@ def apply_excel_fonts(workbook):
                     cell.font = Font(name=english_font_name)
 
 def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
+    priority_rows = signal_buckets.get("優先追蹤", [])
     gain_rows = signal_buckets.get("漲幅達標", [])
     gap_rows = signal_buckets.get("跳空", [])
     golden_rows = signal_buckets.get("黃金交叉", [])
@@ -273,6 +573,7 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        normalize_rows_for_excel(priority_rows).to_excel(writer, sheet_name="優先追蹤", index=False)
         normalize_rows_for_excel(gain_rows).to_excel(writer, sheet_name="漲幅達標", index=False)
         normalize_rows_for_excel(gap_rows).to_excel(writer, sheet_name="跳空", index=False)
         normalize_rows_for_excel(golden_rows).to_excel(writer, sheet_name="黃金交叉", index=False)
@@ -1058,7 +1359,7 @@ if should_run_scan:
     group_tables = {}
     group_up_summary = []
     all_signal_rows = []
-    signal_buckets = {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
+    signal_buckets = {"優先追蹤": [], "漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
     trend_chart_store = {}  # symbol -> {df, p1_pos, p2_pos, p1_val, slope, name} 供「趨勢突破」分頁畫K線+趨勢線圖
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
 
@@ -1111,8 +1412,15 @@ if should_run_scan:
                 for _sig_name, _sig_result in data["signal_results"].items():
                     signal_types.extend(_sig_result.get("labels", []))
 
+                signal_score = calc_signal_quality_score(data, signal_types)
+                signal_grade = classify_signal_grade(signal_score)
+
                 passes_volume_filter = float(data.get("volume_lots", 0)) >= float(min_volume_lots)
-                is_selected_signal = any(sig in selected_signal_names for sig in signal_types) and passes_volume_filter
+                is_selected_signal = (
+                    any(sig in selected_signal_names for sig in signal_types)
+                    and passes_volume_filter
+                    and signal_score >= SIGNAL_SCORE_MIN
+                )
 
                 # ===== 執行推播檢查 =====
                 is_high_gain = data["pct"] >= 5
@@ -1128,6 +1436,7 @@ if should_run_scan:
                             f"📈 價格：{data['price']}\n"
                             f"🔥 漲幅：{data['pct']}%\n"
                             f"📦 成交量：{data['volume_lots']:,.1f} 張\n"
+                            f"⭐ 訊號分數：{signal_score} / {signal_grade}\n"
                             f"🌊 波動率：{data['volatility_pct']}%\n"
                             f"📊 KD訊號：{data['kd_signal']}\n"
                             f"📊 週KD訊號：{data['week_kd_signal']}\n"
@@ -1155,6 +1464,8 @@ if should_run_scan:
                     "成交量(張)": data["volume_lots"],
                     "波動率%": data["volatility_pct"],
                     "RS加權報酬%": data["rs_raw"],
+                    "訊號分數": signal_score,
+                    "追蹤等級": signal_grade,
                     "P1日期": data["p1_date"], "區高P1": data["p1_val"],
                     "P2日期": data["p2_date"], "近高P2": data["p2_val"],
                     "坡度%": data["slope_pct"], "趨勢價": data["tl_val"], "趨勢突破": data["trend_signal"],
@@ -1175,6 +1486,9 @@ if should_run_scan:
                     rows.append(row)
                 if is_selected_signal:
                     all_signal_rows.append(row.copy())
+                    if signal_score >= PRIORITY_SCORE_MIN:
+                        signal_buckets["優先追蹤"].append(row.copy())
+                    append_signal_tracking(row, scan_today_str)
                     for sig in signal_types:
                         if sig in signal_buckets and sig in selected_signal_names:
                             signal_buckets[sig].append(row.copy())
@@ -1236,6 +1550,9 @@ if should_run_scan:
     if can_push_now and st.session_state.scheduled_push_enabled and current_schedule_key and not manual_push_triggered:
         st.session_state.processed_time_slots.add(current_schedule_key)
 
+    # 保險：掃描完成後重新產生「優先追蹤」分頁，確保排序與去重後結果一致。
+    signal_buckets["優先追蹤"] = build_priority_rows(all_signal_rows, PRIORITY_SCORE_MIN)
+
     st.session_state.last_scan_result = {
         "group_tables": group_tables,
         "group_up_summary": group_up_summary,
@@ -1247,6 +1564,17 @@ if should_run_scan:
         "progress_pct": 100,
         "min_volume_lots": min_volume_lots,
     }
+    if AUTO_UPLOAD_GITHUB:
+        auto_excel_bytes = build_signal_excel_bytes(signal_buckets)
+        auto_excel_filename = st.session_state.last_scan_result["excel_filename"]
+        upload_file_to_github(
+            auto_excel_bytes,
+            f"{GITHUB_DATABASE_DIR}/{auto_excel_filename}",
+            f"Auto upload TW stock scan result {tw_now.strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+        if os.path.exists(TRACKING_FILE):
+            upload_tracking_file_to_github(tw_now.strftime('%Y-%m-%d %H:%M:%S'))
+
     st.session_state.scan_enabled = False
 else:
     last_scan_result = st.session_state.last_scan_result
@@ -1264,7 +1592,7 @@ excel_filename = st.session_state.get("last_scan_result", {}).get(
 )
 
 with scan_action_placeholder.container():
-    bcol1, bcol2 = st.columns(2)
+    bcol1, bcol2, bcol3, bcol4 = st.columns(4)
     with bcol1:
         st.download_button("下載", data=excel_bytes, file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, key="download_signal_excel_btn")
     with bcol2:
@@ -1272,13 +1600,27 @@ with scan_action_placeholder.container():
             ok = send_telegram_document(excel_bytes, excel_filename, caption=f"TWstock 訊號掃描結果｜成交量下限 {st.session_state.get('last_scan_result', {}).get('min_volume_lots', min_volume_lots)} 張｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
             if ok:
                 st.success("已將 Excel 推送到 Telegram。")
+    with bcol3:
+        if st.button("上傳Excel到GitHub", use_container_width=True, key="push_signal_excel_to_github_btn"):
+            upload_file_to_github(
+                excel_bytes,
+                f"{GITHUB_DATABASE_DIR}/{excel_filename}",
+                f"Upload TW stock scan result {tw_now.strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+    with bcol4:
+        if st.button("上傳追蹤CSV", use_container_width=True, key="push_tracking_csv_to_github_btn"):
+            upload_tracking_file_to_github(tw_now.strftime('%Y-%m-%d %H:%M:%S'))
 
 st.markdown("### 🔎 訊號掃描結果")
 unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
 st.metric("符合勾選掃描條件股票數", unique_signal_count)
+if os.path.exists(TRACKING_FILE):
+    st.caption(f"追蹤檔：{TRACKING_FILE} ｜ GitHub 目標：{GITHUB_DATABASE_DIR}/signal_tracking.csv")
+else:
+    st.caption(f"追蹤檔尚未建立；第一次掃描到符合二階段過濾的股票後會建立：{TRACKING_FILE}")
 
 # 全域定義顯示的欄位，確保資料表一定找得到
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])
@@ -1312,12 +1654,15 @@ if all_signal_rows:
             
     st.dataframe(signal_display_df[display_columns], use_container_width=True, column_config={
         "代碼": st.column_config.LinkColumn("代碼", help="點擊前往台股 Yahoo", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
-        "股票名稱": st.column_config.TextColumn("股票名稱")
+        "股票名稱": st.column_config.TextColumn("股票名稱"),
+        "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
+        "追蹤等級": st.column_config.TextColumn("追蹤等級"),
     })
     
     st.markdown("### 📑 依訊號分頁查看")
 
     signal_tab_specs = [
+        ("優先追蹤", "優先追蹤"),
         ("漲幅達標", "漲幅達標"),
         ("跳空", "跳空"),
         ("黃金交叉", "黃金交叉"),
@@ -1373,7 +1718,9 @@ if all_signal_rows:
                         
                 st.dataframe(bucket_display_df[display_columns], use_container_width=True, column_config={
                     "代碼": st.column_config.LinkColumn("代碼", help="點擊前往台股 Yahoo", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
-                    "股票名稱": st.column_config.TextColumn("股票名稱")
+                    "股票名稱": st.column_config.TextColumn("股票名稱"),
+                    "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
+                    "追蹤等級": st.column_config.TextColumn("追蹤等級"),
                 })
 
                 # 🌟 趨勢突破分頁：額外提供 K線 + 下降趨勢線圖表，方便肉眼確認訊號品質
@@ -1438,7 +1785,9 @@ for group_name, info in group_tables.items():
             
     st.dataframe(table_df[display_columns], use_container_width=True, column_config={
         "代碼": st.column_config.LinkColumn("代碼", help="點擊前往台股 Yahoo", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
-        "股票名稱": st.column_config.TextColumn("股票名稱")
+        "股票名稱": st.column_config.TextColumn("股票名稱"),
+        "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
+        "追蹤等級": st.column_config.TextColumn("追蹤等級"),
     })
     st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
 
