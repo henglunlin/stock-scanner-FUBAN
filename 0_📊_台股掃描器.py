@@ -14,6 +14,7 @@ import time
 import gc
 import requests
 import base64
+import zipfile
 from html import escape
 from io import BytesIO
 from datetime import datetime
@@ -43,6 +44,11 @@ from signals import (
     plot_trend_breakout_chart,
     TREND_VOL_RATIO_MIN,
 )
+try:
+    from signals import build_trend_breakout_chart_figure
+except ImportError:
+    # 若 signals/__init__.py 尚未重新匯出，直接從趨勢突破模組匯入。
+    from signals.trend_breakout import build_trend_breakout_chart_figure
 
 # ===== Streamlit UI 基本設定（一定要放最前面）=====
 st.set_page_config(layout="wide")
@@ -280,6 +286,24 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
     return output.getvalue()
 
 
+def build_trend_chart_zip_bytes(trend_chart_store: dict) -> bytes:
+    """將所有趨勢突破圖表打包成 ZIP；每檔股票各一個可互動 HTML 圖表。"""
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for symbol, chart_info in sorted((trend_chart_store or {}).items()):
+            stock_name = str(chart_info.get("name", "") or "")
+            fig = build_trend_breakout_chart_figure(symbol, stock_name, chart_info)
+            if fig is None:
+                continue
+            safe_symbol = re.sub(r"[^0-9A-Za-z._-]+", "_", str(symbol)).strip("_") or "stock"
+            safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", stock_name).strip("_")
+            filename = f"{safe_symbol}_{safe_name}_trend_breakout.html" if safe_name else f"{safe_symbol}_trend_breakout.html"
+            html = fig.to_html(full_html=True, include_plotlyjs=True)
+            zf.writestr(filename, html)
+    output.seek(0)
+    return output.getvalue()
+
+
 # ===== 輔助工具函式 =====
 def make_anchor_id(group_name: str) -> str:
     anchor = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "-", group_name).strip("-")
@@ -443,6 +467,8 @@ if "notified_stocks" not in st.session_state:
 
 if "tg_last_update_id" not in st.session_state:
     st.session_state.tg_last_update_id = None
+if "trend_charts_collapsed" not in st.session_state:
+    st.session_state.trend_charts_collapsed = True
 
 if "_next_selected_group" in st.session_state:
     pending_group = st.session_state._next_selected_group
@@ -1314,13 +1340,34 @@ if all_signal_rows:
 
                 # 🌟 趨勢突破分頁：額外提供 K線 + 下降趨勢線圖表，方便肉眼確認訊號品質
                 if bucket_key == "趨勢突破" and trend_chart_store:
-                    st.markdown("##### 📈 個股圖表（K線 + 下降趨勢線）")
+                    chart_title_col, chart_download_col, chart_collapse_col = st.columns([3.8, 0.95, 0.95])
+                    with chart_title_col:
+                        st.markdown("##### 📈 個股圖表（K線 + 下降趨勢線）")
+                    with chart_download_col:
+                        trend_chart_zip_bytes = build_trend_chart_zip_bytes(trend_chart_store)
+                        st.download_button(
+                            "📥 下載全部圖",
+                            data=trend_chart_zip_bytes,
+                            file_name=f"trend_breakout_charts_{tw_now.strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip",
+                            use_container_width=True,
+                            key="download_all_trend_charts_btn",
+                            disabled=(len(trend_chart_zip_bytes) == 0),
+                        )
+                    with chart_collapse_col:
+                        if st.button("📁 收折全部圖", use_container_width=True, key="collapse_all_trend_charts_btn"):
+                            st.session_state.trend_charts_collapsed = True
+                            st.rerun()
+
                     for _, r in bucket_df.iterrows():
                         sym = r["代碼"]
                         chart_info = trend_chart_store.get(sym)
                         if not chart_info:
                             continue
-                        with st.expander(f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}"):
+                        with st.expander(
+                            f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}",
+                            expanded=not st.session_state.get("trend_charts_collapsed", True),
+                        ):
                             plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info)
             else:
                 st.caption(f"目前沒有符合「{display_name}」的股票。")
