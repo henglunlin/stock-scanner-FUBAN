@@ -1653,6 +1653,23 @@ with scan_action_placeholder.container():
         st.caption(f"Excel：{excel_filename} ｜ 追蹤CSV GitHub 目標：{tracking_github_path(tw_now)}")
 
 st.markdown("### 🔎 訊號掃描結果")
+# ========== 新增：掃描資料總計 ==========
+total_scanned = sum(item.get("總數", 0) for item in group_up_summary)
+total_errors = sum(item.get("錯誤數", 0) for item in group_up_summary)
+total_success = total_scanned - total_errors
+
+stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+with stat_col1:
+    st.metric("掃描資料總數", total_scanned)
+with stat_col2:
+    st.metric("得到資料數", total_success)
+with stat_col3:
+    st.metric("缺少資料數", total_errors)
+with stat_col4:
+    unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
+    st.metric("符合勾選條件數", unique_signal_count)
+# ========================================
+
 unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
 st.metric("符合勾選掃描條件股票數", unique_signal_count)
 if os.path.exists(TRACKING_FILE):
