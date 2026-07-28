@@ -287,19 +287,55 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
 
 
 def build_trend_chart_zip_bytes(trend_chart_store: dict) -> bytes:
-    """將所有趨勢突破圖表打包成 ZIP；每檔股票各一個可互動 HTML 圖表。"""
+    """
+    將所有趨勢突破圖表打包成 ZIP。
+    ZIP 內容包含：
+    1) 每檔股票各一個可互動 HTML 圖表。
+    2) 一個「全部圖統整.html」，把所有圖表集中在同一頁方便快速檢視。
+    """
     output = BytesIO()
+    combined_sections = []
+
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for symbol, chart_info in sorted((trend_chart_store or {}).items()):
             stock_name = str(chart_info.get("name", "") or "")
             fig = build_trend_breakout_chart_figure(symbol, stock_name, chart_info)
             if fig is None:
                 continue
+
             safe_symbol = re.sub(r"[^0-9A-Za-z._-]+", "_", str(symbol)).strip("_") or "stock"
             safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", stock_name).strip("_")
             filename = f"{safe_symbol}_{safe_name}_trend_breakout.html" if safe_name else f"{safe_symbol}_trend_breakout.html"
-            html = fig.to_html(full_html=True, include_plotlyjs=True)
-            zf.writestr(filename, html)
+
+            # 個別圖檔：每個 HTML 自帶 plotly.js，方便單獨開啟。
+            individual_html = fig.to_html(full_html=True, include_plotlyjs=True)
+            zf.writestr(filename, individual_html)
+
+            # 統整圖檔：第一張圖帶 plotly.js，其餘圖共用，避免檔案過大。
+            include_js = "cdn" if not combined_sections else False
+            combined_sections.append(
+                f"<section style='margin: 0 0 36px 0; padding-bottom: 24px; border-bottom: 1px solid #e5e7eb;'>"
+                f"<h2 style='font-family: Arial, Microsoft JhengHei, sans-serif;'>{symbol} {stock_name}</h2>"
+                f"{fig.to_html(full_html=False, include_plotlyjs=include_js)}"
+                f"</section>"
+            )
+
+        if combined_sections:
+            combined_html = (
+                "<!doctype html>\n"
+                "<html lang=\"zh-Hant\">\n"
+                "<head>\n"
+                "  <meta charset=\"utf-8\">\n"
+                "  <title>趨勢突破全部圖統整</title>\n"
+                "</head>\n"
+                "<body style=\"margin: 24px; font-family: Arial, Microsoft JhengHei, sans-serif;\">\n"
+                "  <h1>趨勢突破全部圖統整</h1>\n"
+                "  <p>本檔案彙整本次掃描中所有「趨勢突破」個股圖表。</p>\n"
+                + "\n".join(combined_sections)
+                + "\n</body>\n</html>"
+            )
+            zf.writestr("00_趨勢突破_全部圖統整.html", combined_html)
+
     output.seek(0)
     return output.getvalue()
 
@@ -469,6 +505,8 @@ if "tg_last_update_id" not in st.session_state:
     st.session_state.tg_last_update_id = None
 if "trend_charts_collapsed" not in st.session_state:
     st.session_state.trend_charts_collapsed = True
+if "trend_charts_collapse_version" not in st.session_state:
+    st.session_state.trend_charts_collapse_version = 0
 
 if "_next_selected_group" in st.session_state:
     pending_group = st.session_state._next_selected_group
@@ -1353,19 +1391,24 @@ if all_signal_rows:
                             use_container_width=True,
                             key="download_all_trend_charts_btn",
                             disabled=(len(trend_chart_zip_bytes) == 0),
+                            help="ZIP 內含每檔個別 HTML 圖表，以及 00_趨勢突破_全部圖統整.html。",
                         )
                     with chart_collapse_col:
                         if st.button("📁 收折全部圖", use_container_width=True, key="collapse_all_trend_charts_btn"):
                             st.session_state.trend_charts_collapsed = True
+                            # st.expander 會記住前端展開狀態；改變不可見 label suffix 可強制重建 expander。
+                            st.session_state.trend_charts_collapse_version = st.session_state.get("trend_charts_collapse_version", 0) + 1
                             st.rerun()
 
+                    invisible_version_suffix = "\u200b" * int(st.session_state.get("trend_charts_collapse_version", 0))
                     for _, r in bucket_df.iterrows():
                         sym = r["代碼"]
                         chart_info = trend_chart_store.get(sym)
                         if not chart_info:
                             continue
+                        expander_label = f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}{invisible_version_suffix}"
                         with st.expander(
-                            f"{sym}　{r.get('股票名稱', '')}　量能倍數 {chart_info.get('vol_ratio', '-')}",
+                            expander_label,
                             expanded=not st.session_state.get("trend_charts_collapsed", True),
                         ):
                             plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info)
