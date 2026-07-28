@@ -1668,7 +1668,49 @@ with stat_col3:
 with stat_col4:
     unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
     st.metric("符合勾選條件數", unique_signal_count)
-# ========================================
+
+# ========== 2. 新增：找出缺少資料的股票並顯示浮動視窗 ==========
+missing_stocks = []
+# 走訪每個群組的資料表，把「訊號類型」為「錯誤」的股票挑出來
+for group_name, info in group_tables.items():
+    table_df = info.get("table")
+    if table_df is not None and not table_df.empty and "訊號類型" in table_df.columns:
+        error_rows = table_df[table_df["訊號類型"] == "錯誤"]
+        for _, row in error_rows.iterrows():
+            # 取得代碼並去除可能的連結格式，保留乾淨的代碼與名稱
+            code = str(row.get("代碼", "")).split(">")[-1].replace("</a", "") if "<a" in str(row.get("代碼", "")) else str(row.get("代碼", ""))
+            name = str(row.get("股票名稱", ""))
+            missing_stocks.append(f"{code} {name}")
+
+# 如果有缺少資料，則利用 HTML/CSS 畫出位於右下角的浮動視窗
+if missing_stocks:
+    missing_text_html = "<br>".join(missing_stocks)
+    floating_html = f"""
+    <div style="
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        background-color: #fff1f0;
+        border: 2px solid #ff4d4f;
+        border-radius: 8px;
+        padding: 16px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        z-index: 99999;
+        max-height: 250px;
+        overflow-y: auto;
+        width: 220px;
+        font-family: Arial, sans-serif;
+    ">
+        <div style="font-size: 15px; font-weight: 700; color: #cf1322; margin-bottom: 8px; border-bottom: 1px solid #ffccc7; padding-bottom: 4px;">
+            ⚠️ 缺少資料股票 ({len(missing_stocks)})
+        </div>
+        <div style="font-size: 13px; color: #333; line-height: 1.5;">
+            {missing_text_html}
+        </div>
+    </div>
+    """
+    st.markdown(floating_html, unsafe_allow_html=True)
+# ===========================================================
 
 unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
 st.metric("符合勾選掃描條件股票數", unique_signal_count)
