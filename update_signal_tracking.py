@@ -1,22 +1,12 @@
 """
 update_signal_tracking.py
 =========================
-更新台股掃描器 signal_tracking.csv 的後續績效，並可選擇上傳到 GitHub Database 目錄。
+每日更新 Database/signal_tracking.csv 的追蹤績效，並以日期檔名上傳到 GitHub：
+Database/signal_tracking_YYYYMMDD.csv
 
-預設 GitHub 目標：
-https://github.com/henglunlin/stock-scanner-FUBAN/tree/main/Database
+同一天重複執行只會更新同一份檔案；不同天會留下不同日期快照。
 
-需要套件：
-    pip install pandas yfinance requests
-
-建議環境變數或 .streamlit/secrets.toml：
-    GITHUB_TOKEN = "github_pat_xxx"
-    GITHUB_OWNER = "henglunlin"
-    GITHUB_REPO = "stock-scanner-FUBAN"
-    GITHUB_BRANCH = "main"
-    GITHUB_DATABASE_DIR = "Database"
-
-用法：
+Usage:
     python update_signal_tracking.py
     python update_signal_tracking.py --upload-github
     python update_signal_tracking.py --download-github --upload-github
@@ -27,13 +17,14 @@ from __future__ import annotations
 import argparse
 import base64
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import yfinance as yf
-
 
 DEFAULT_OWNER = "henglunlin"
 DEFAULT_REPO = "stock-scanner-FUBAN"
@@ -43,7 +34,6 @@ DEFAULT_TRACKING_FILENAME = "signal_tracking.csv"
 
 
 def load_toml_secrets() -> Dict[str, Any]:
-    """讀取本機 .streamlit/secrets.toml，讓本機執行也可沿用 Streamlit secrets。"""
     possible_paths = [
         Path.cwd() / ".streamlit" / "secrets.toml",
         Path.home() / ".streamlit" / "secrets.toml",
@@ -53,7 +43,7 @@ def load_toml_secrets() -> Dict[str, Any]:
             continue
         try:
             try:
-                import tomllib  # Python 3.11+
+                import tomllib
             except ImportError:  # pragma: no cover
                 import tomli as tomllib
             with open(secrets_path, "rb") as f:
@@ -67,7 +57,6 @@ SECRETS = load_toml_secrets()
 
 
 def get_config_value(key: str, default: str = "") -> str:
-    """優先順序：環境變數 > secrets.toml > default。"""
     value = os.getenv(key)
     if value not in [None, ""]:
         return str(value)
@@ -94,6 +83,21 @@ def tracking_file_path() -> Path:
     return local_database_dir() / DEFAULT_TRACKING_FILENAME
 
 
+def today_tw() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Taipei"))
+
+
+def tracking_github_filename(dt: Optional[datetime] = None) -> str:
+    if dt is None:
+        dt = today_tw()
+    return f"signal_tracking_{dt.strftime('%Y%m%d')}.csv"
+
+
+def tracking_github_path(dt: Optional[datetime] = None) -> str:
+    cfg = github_config()
+    return f"{cfg['database_dir']}/{tracking_github_filename(dt)}"
+
+
 def safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x in ["-", "", None]:
@@ -117,38 +121,39 @@ def github_contents_url(owner: str, repo: str, path: str) -> str:
     return f"https://api.github.com/repos/{owner}/{repo}/contents/{path.strip('/')}"
 
 
-def download_tracking_from_github() -> bool:
-    """從 GitHub Database/signal_tracking.csv 下載到本機 Database/signal_tracking.csv。"""
+def download_file_from_github(github_path: str, local_path: Path) -> bool:
     cfg = github_config()
     token = cfg["token"]
     if not token:
         print("[WARN] GITHUB_TOKEN 未設定，略過 GitHub 下載。")
         return False
 
-    github_path = f"{cfg['database_dir']}/{DEFAULT_TRACKING_FILENAME}"
     url = github_contents_url(cfg["owner"], cfg["repo"], github_path)
-    res = requests.get(
-        url,
-        headers=github_headers(token),
-        params={"ref": cfg["branch"]},
-        timeout=20,
-    )
+    res = requests.get(url, headers=github_headers(token), params={"ref": cfg["branch"]}, timeout=20)
     if res.status_code == 404:
-        print(f"[INFO] GitHub 尚無追蹤檔：{github_path}")
+        print(f"[INFO] GitHub 找不到檔案：{github_path}")
         return False
     if res.status_code != 200:
         raise RuntimeError(f"GitHub 下載失敗：{res.status_code} {res.text}")
 
-    payload = res.json()
-    encoded = payload.get("content", "")
-    if not encoded:
+    content = res.json().get("content", "")
+    if not content:
         raise RuntimeError("GitHub 回傳內容為空，無法下載追蹤檔。")
-
-    data = base64.b64decode(encoded)
-    local_database_dir().mkdir(parents=True, exist_ok=True)
-    tracking_file_path().write_bytes(data)
-    print(f"[OK] 已從 GitHub 下載：{github_path} -> {tracking_file_path()}")
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(base64.b64decode(content))
+    print(f"[OK] 已下載：{github_path} -> {local_path}")
     return True
+
+
+def download_tracking_from_github() -> bool:
+    """優先下載今日日期檔；若今日檔不存在，再退回 signal_tracking.csv。"""
+    local_path = tracking_file_path()
+    dated_path = tracking_github_path(today_tw())
+    if download_file_from_github(dated_path, local_path):
+        return True
+    cfg = github_config()
+    fallback_path = f"{cfg['database_dir']}/{DEFAULT_TRACKING_FILENAME}"
+    return download_file_from_github(fallback_path, local_path)
 
 
 def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: str) -> bool:
@@ -160,8 +165,8 @@ def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: s
 
     url = github_contents_url(cfg["owner"], cfg["repo"], github_path)
     headers = github_headers(token)
-
     sha: Optional[str] = None
+
     get_res = requests.get(url, headers=headers, params={"ref": cfg["branch"]}, timeout=20)
     if get_res.status_code == 200:
         sha = get_res.json().get("sha")
@@ -190,12 +195,11 @@ def upload_tracking_to_github() -> bool:
     if not path.exists():
         print(f"[WARN] 找不到追蹤檔：{path}")
         return False
-    cfg = github_config()
-    github_path = f"{cfg['database_dir']}/{DEFAULT_TRACKING_FILENAME}"
+    dt = today_tw()
     return upload_file_to_github(
         path.read_bytes(),
-        github_path,
-        "Update signal tracking performance",
+        tracking_github_path(dt),
+        f"Update {tracking_github_filename(dt)}",
     )
 
 
@@ -219,7 +223,6 @@ def calc_max_drawdown(lows: pd.Series, entry_price: float) -> Optional[float]:
 
 
 def classify_success(max_gain: float, max_drawdown: float, close_return: float) -> int:
-    """預設成功定義：5日內最高漲幅 >= 5%、最大回撤 > -5%、5日收盤報酬 >= 2%。"""
     if max_gain >= 5 and max_drawdown > -5 and close_return >= 2:
         return 1
     return 0
@@ -241,8 +244,7 @@ def update_tracking_result() -> pd.DataFrame:
         print("[INFO] tracking file is empty")
         return df
 
-    required_cols = ["scan_date", "代碼", "entry_price"]
-    for col in required_cols:
+    for col in ["scan_date", "代碼", "entry_price"]:
         if col not in df.columns:
             raise ValueError(f"追蹤檔缺少必要欄位：{col}")
 
@@ -273,7 +275,6 @@ def update_tracking_result() -> pd.DataFrame:
         hist = hist.copy()
         hist.index = pd.to_datetime(hist.index).tz_localize(None)
         future = hist[hist.index > scan_date].head(10)
-
         if future.empty:
             result_rows.append(r)
             continue
@@ -299,31 +300,16 @@ def update_tracking_result() -> pd.DataFrame:
         result_rows.append(r)
 
     out = pd.DataFrame(result_rows)
-    local_database_dir().mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(path, index=False, encoding="utf-8-sig")
     print(f"[OK] tracking updated：{path}")
-
-    done = out[out.get("status", "") == "done"].copy()
-    if not done.empty and "is_success_5d" in done.columns:
-        print("\n===== 追蹤績效摘要 =====")
-        print(f"整體 5D 成功率：{done['is_success_5d'].mean():.2%} / 樣本數：{len(done)}")
-        if "追蹤等級" in done.columns:
-            print("\n依追蹤等級：")
-            print(done.groupby("追蹤等級")["is_success_5d"].agg(["count", "mean"]))
-        if "MA排列" in done.columns:
-            print("\n依 MA 排列：")
-            print(done.groupby("MA排列")["is_success_5d"].agg(["count", "mean"]))
-        if "MA位置" in done.columns:
-            print("\n依 MA 位置：")
-            print(done.groupby("MA位置")["is_success_5d"].agg(["count", "mean"]))
-
     return out
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="更新台股掃描器 signal_tracking.csv 追蹤績效")
-    parser.add_argument("--download-github", action="store_true", help="更新前先從 GitHub Database 下載 signal_tracking.csv")
-    parser.add_argument("--upload-github", action="store_true", help="更新完成後上傳 signal_tracking.csv 到 GitHub Database")
+    parser.add_argument("--download-github", action="store_true", help="更新前先從 GitHub Database 下載今日或 fallback 追蹤 CSV")
+    parser.add_argument("--upload-github", action="store_true", help="更新完成後用日期檔名上傳追蹤 CSV 到 GitHub Database")
     return parser.parse_args()
 
 
