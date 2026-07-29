@@ -367,7 +367,6 @@ def _dedupe_points(points: List[Tuple[int, pd.Timestamp, float]]) -> List[Tuple[
     return sorted(best_by_pos.values(), key=lambda x: x[0])
 
 
-
 def calc_high_points_regression(
     points: List[Tuple[int, pd.Timestamp, float]],
     min_points: int = 3,
@@ -449,8 +448,8 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
     def to_full_pos(ts: pd.Timestamp) -> int:
         return int(df.index.get_loc(ts))
 
-    # 候選點 = local swing high + 前幾大高價，避免重要壓力點剛好不是 pivot 而漏掉。
-    swing_base = find_swing_highs(base, left=2, right=2)
+    # [修改點 1]：將 left=2, right=2 改為 1。只要比前後 1 天高，就允許成為候選點，避免漏掉短暫的小反彈高點。
+    swing_base = find_swing_highs(base, left=1, right=1)
     swing_points = [(to_full_pos(dt), dt, val) for _, dt, val in swing_base]
 
     top_n = min(10, len(base))
@@ -467,26 +466,24 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
     # regression 品質檢查：確認候選高點整體偏下降。
     # 不用 scipy，避免部署環境缺套件。
     reg_info = calc_high_points_regression(candidates, min_points=3)
-    # min_reg_down_slope = max(price_range * 0.0003, 0.0001)
 
     if reg_info is not None:
         reg_slope = float(reg_info["slope"])
         reg_r2 = float(reg_info["r2"])
         
-        # [修改點 1]：註解掉下方這段限制，不再強制要求「全部候選高點」都必須是下坡。
-        # 這樣即使股票是 U 型谷、或是短期急跌，也能畫出短期的下降趨勢線。
+        # [先前的修改]：註解掉下方這段限制，不再強制要求「全部候選高點」都必須是下坡。
         # if reg_slope >= -min_reg_down_slope:
         #     return None
     else:
         reg_slope = None
         reg_r2 = 0.0
 
-    # [修改點 2]：縮短 P1 與 P2 之間的最短距離限制。
-    # 將原本的 min_gap = max(4, full_len // 12) 放寬。
-    # 設定為 2，代表 P1 和 P2 之間只要間隔 2 根 K 棒即可連線。
+    # [先前的修改]：將 min_gap 從 max(4, full_len // 12) 放寬為 2。
     min_gap = 2 
     min_drop = max(price_range * 0.008, 0.01)
-    tolerance = max(price_range * 0.015, 0.01)
+    
+    # [修改點 2]：將容忍度放大一倍，避免被細微上影線淘汰
+    tolerance = max(price_range * 0.03, 0.02)
 
     # P1 優先從最高主要壓力開始嘗試。
     p1_candidates = sorted(candidates, key=lambda x: (-x[2], x[0]))
@@ -524,7 +521,8 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
             violation_count = len(excess)
             max_excess = max(excess) if excess else 0.0
 
-            if violation_count > 3 or max_excess > tolerance * 3.0:
+            # [修改點 3]：將允許刺破次數限制從 3 次放寬到 5 次
+            if violation_count > 5 or max_excess > tolerance * 3.0:
                 continue
 
             span_score = (p2_pos - p1_pos) / max(full_len, 1)
@@ -548,11 +546,11 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
                 elif reg_r2 < 0.10:
                     reg_penalty += 1.5
 
-            # slope 是負數；slope * 250 會讓過陡的線分數變差，避免選到不合理急跌線。
+            # [修改點 4]：將過度陡峭的懲罰減輕 (slope * 250 -> slope * 50)
             score = (
                 recent_p2_score * 25
                 + span_score * 8
-                + slope * 250
+                + slope * 50
                 - violation_count * 12
                 - max_excess * 5
                 + touch_bonus
