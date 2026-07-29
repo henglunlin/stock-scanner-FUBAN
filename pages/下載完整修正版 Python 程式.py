@@ -467,19 +467,24 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
     # regression 品質檢查：確認候選高點整體偏下降。
     # 不用 scipy，避免部署環境缺套件。
     reg_info = calc_high_points_regression(candidates, min_points=3)
-    min_reg_down_slope = max(price_range * 0.0003, 0.0001)
+    # min_reg_down_slope = max(price_range * 0.0003, 0.0001)
 
     if reg_info is not None:
         reg_slope = float(reg_info["slope"])
         reg_r2 = float(reg_info["r2"])
-        # 如果候選高點整體不是下降，直接不畫下降趨勢線。
-        if reg_slope >= -min_reg_down_slope:
-            return None
+        
+        # [修改點 1]：註解掉下方這段限制，不再強制要求「全部候選高點」都必須是下坡。
+        # 這樣即使股票是 U 型谷、或是短期急跌，也能畫出短期的下降趨勢線。
+        # if reg_slope >= -min_reg_down_slope:
+        #     return None
     else:
         reg_slope = None
         reg_r2 = 0.0
 
-    min_gap = max(4, full_len // 12)
+    # [修改點 2]：縮短 P1 與 P2 之間的最短距離限制。
+    # 將原本的 min_gap = max(4, full_len // 12) 放寬。
+    # 設定為 2，代表 P1 和 P2 之間只要間隔 2 根 K 棒即可連線。
+    min_gap = 2 
     min_drop = max(price_range * 0.008, 0.01)
     tolerance = max(price_range * 0.015, 0.01)
 
