@@ -346,7 +346,11 @@ def build_60bar_signal_window(symbol: str, scan_date: str, bars: int = 60, perio
 
 
 def find_swing_highs(df: pd.DataFrame, left: int = 2, right: int = 2) -> List[Tuple[int, pd.Timestamp, float]]:
-    """找出局部高點，回傳：(位置, 日期, High)。"""
+    """找出局部高點，回傳：(位置, 日期, High)。
+
+    left/right = 2 代表該根 K 棒的 High 需要大於等於左右各 2 根 K 棒的 High，
+    才視為一個 swing high。後續會搭配「上緣外點」檢查，避免用到被價格穿越的內部高點。
+    """
     highs: List[Tuple[int, pd.Timestamp, float]] = []
     if df.empty:
         return highs
@@ -367,14 +371,56 @@ def _dedupe_points(points: List[Tuple[int, pd.Timestamp, float]]) -> List[Tuple[
     return sorted(best_by_pos.values(), key=lambda x: x[0])
 
 
-def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
-    """偵測下降趨勢線：至少三個高點 + 不允許歷史 K 棒高點穿越。
+def _line_y(p_left: Tuple[int, pd.Timestamp, float], slope: float, x: int) -> float:
+    """計算通過 p_left、斜率 slope 的直線在 x 位置的 y 值。"""
+    return float(p_left[2]) + slope * (x - int(p_left[0]))
 
-    本版邏輯依照使用者標註的藍色實線精神調整：
-    1. 訊號日 / 今日的 High 不可作為 P1/P2/P3，也不參與穿越檢查。
-    2. 在訊號日前的區間，尋找至少 3 個高點 P1、P2、P3 靠近同一條下降壓力線。
-    3. 除了訊號日 / 今日之外，所有 K 棒 High 都必須在下降趨勢線下方，不可穿越。
-    4. 若找不到符合「三點 + 不穿越」的下降壓力線，回傳 None，不硬畫錯線。
+
+def _validate_no_high_break(
+    df: pd.DataFrame,
+    p_left: Tuple[int, pd.Timestamp, float],
+    p_right: Tuple[int, pd.Timestamp, float],
+    check_end_pos: int,
+    tolerance: float,
+) -> Tuple[bool, float, int]:
+    """驗證兩個外點連出來的下降趨勢線沒有被 K 棒 High 穿過。
+
+    規則：
+    - 只從 p_left 之後開始檢查，因為下降壓力線是從第一個外點開始生效。
+    - check_end_pos 會設定為訊號日 / 最新日期前一根，因此今日 K 棒完全不參與驗證。
+    - 若任一 High > trendline_y + tolerance，代表價格穿過趨勢線，該趨勢線無效。
+    """
+    left_pos, right_pos = int(p_left[0]), int(p_right[0])
+    if right_pos <= left_pos:
+        return False, 0.0, 0
+    slope = (float(p_right[2]) - float(p_left[2])) / max(right_pos - left_pos, 1)
+    if slope >= 0:
+        return False, 0.0, 0
+
+    max_excess = 0.0
+    break_count = 0
+    for x in range(left_pos, check_end_pos + 1):
+        high = float(df["High"].iloc[x])
+        y = _line_y(p_left, slope, x)
+        excess = high - y
+        if excess > tolerance:
+            break_count += 1
+            max_excess = max(max_excess, excess)
+    return break_count == 0, max_excess, break_count
+
+
+def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
+    """偵測真正有效的下降趨勢線。
+
+    下降趨勢線定義：
+    1. 在「訊號日 / 最新日期之前」的區間內找出至少 3 個下降高點外點：P1、P2、P3。
+    2. P1、P2、P3 需依時間由左到右排列，且 High 需逐步下降：P1 > P2 > P3。
+    3. 檢查三組趨勢線：P1-P2、P1-P3、P2-P3。
+       只要任一組趨勢線被任何歷史 K 棒 High 穿過，該組 P1/P2/P3 即視為無效。
+    4. 最新日期 / 訊號日當天的 K 棒完全排除：
+       - 不可當 P1/P2/P3
+       - 不參與「是否穿越趨勢線」檢查
+    5. 最後畫出的下降趨勢線使用 P1-P3 這條覆蓋最完整區間的線，並延伸到圖表右側。
     """
     if df.empty or len(df) < 8:
         return None
@@ -382,14 +428,14 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
     sd = pd.to_datetime(scan_date)
     full_len = len(df)
 
-    # signal_pos 為訊號日/今日所在位置；趨勢線高點與穿越檢查都只用 signal_pos 之前。
+    # 找到訊號日 / 最新日期位置；當日完全排除。
     pos_candidates = [i for i, dt in enumerate(df.index) if dt >= sd]
     signal_pos = pos_candidates[0] if pos_candidates else full_len - 1
-    candidate_end_pos = signal_pos - 1
-    if candidate_end_pos < 2:
+    check_end_pos = signal_pos - 1
+    if check_end_pos < 5:
         return None
 
-    base = df.iloc[:candidate_end_pos + 1].copy()
+    base = df.iloc[:check_end_pos + 1].copy()
     if len(base) < 8:
         return None
 
@@ -397,113 +443,113 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
         return int(df.index.get_loc(ts))
 
     price_range = max(float(base["High"].max() - base["Low"].min()), 0.01)
-    # touch_tolerance 用來判斷 P1/P2/P3 是否貼近同一條線；penetration_tolerance 只容許極小數值誤差。
-    touch_tolerance = max(price_range * 0.018, 0.02)
-    penetration_tolerance = max(price_range * 0.002, 0.005)
-    min_gap = max(3, full_len // 15)
+    # penetration_tolerance 只處理小數/資料精度誤差；不是允許實質穿越。
+    penetration_tolerance = max(price_range * 0.0015, 0.003)
+    # P2 允許在 P1-P3 主線下方一點點，但必須接近同一條下降趨勢線。
+    touch_tolerance = max(price_range * 0.025, 0.02)
+    min_gap = max(2, full_len // 18)
+    min_drop = max(price_range * 0.006, 0.005)
 
-    # 高點候選：swing high 為主，搭配前幾大高價與全區間高點，避免圖上肉眼高點被 left/right 參數漏掉。
+    # 候選高點：swing high 為主，加入前幾大 high，避免高點剛好不是標準 pivot 而漏掉。
     swing_base = find_swing_highs(base, left=2, right=2)
     swing_points = [(to_full_pos(dt), dt, val) for _, dt, val in swing_base]
-    top_n = min(14, len(base))
+    top_n = min(18, len(base))
     top_points = [(to_full_pos(idx), idx, float(base.loc[idx, "High"])) for idx in base["High"].nlargest(top_n).index]
-    all_high_points = [(to_full_pos(idx), idx, float(base.loc[idx, "High"])) for idx in base.index]
+    candidates = _dedupe_points(swing_points + top_points)
 
-    # 用於畫線枚舉的候選點要精簡，避免過度雜訊；用於 touch count 則可納入所有高點。
-    line_candidates = _dedupe_points(swing_points + top_points)
-    line_candidates = [p for p in line_candidates if p[0] < signal_pos]
-    touch_candidates = _dedupe_points(swing_points + top_points + all_high_points)
-    touch_candidates = [p for p in touch_candidates if p[0] < signal_pos]
-
-    if len(line_candidates) < 3:
+    # 再保險：候選高點必須早於訊號日 / 最新日期。
+    candidates = [p for p in candidates if p[0] < signal_pos]
+    candidates = sorted(candidates, key=lambda x: x[0])
+    if len(candidates) < 3:
         return None
 
     best: Optional[Dict[str, Any]] = None
 
-    # 枚舉兩個端點形成下降線，再要求至少第三個高點貼線，且所有歷史 High 不穿越。
-    for i in range(len(line_candidates)):
-        for j in range(i + 1, len(line_candidates)):
-            p_start, p_end = line_candidates[i], line_candidates[j]
-            if p_end[0] - p_start[0] < min_gap:
+    # 枚舉 P1/P2/P3 三個外點。
+    for a in range(len(candidates) - 2):
+        p1 = candidates[a]
+        for b in range(a + 1, len(candidates) - 1):
+            p2 = candidates[b]
+            if p2[0] - p1[0] < min_gap:
                 continue
-            if p_end[2] >= p_start[2]:
-                continue
-            slope = (p_end[2] - p_start[2]) / max(p_end[0] - p_start[0], 1)
-            if slope >= 0:
+            if p2[2] >= p1[2] - min_drop:
                 continue
 
-            # 趨勢線以 p_start/p_end 決定；所有訊號日前 High 都不能穿越線。
-            xs = range(0, candidate_end_pos + 1)
-            line_vals = [p_start[2] + slope * (x - p_start[0]) for x in xs]
-            highs = base["High"].astype(float).tolist()
-            excess = [h - y for h, y in zip(highs, line_vals) if h > y + penetration_tolerance]
-            if excess:
-                continue
+            for c in range(b + 1, len(candidates)):
+                p3 = candidates[c]
+                if p3[0] - p2[0] < min_gap:
+                    continue
+                if p3[2] >= p2[2] - min_drop:
+                    continue
 
-            touches: List[Tuple[int, pd.Timestamp, float, float]] = []
-            for p in touch_candidates:
-                line_y = p_start[2] + slope * (p[0] - p_start[0])
-                gap = line_y - p[2]
-                if -penetration_tolerance <= gap <= touch_tolerance:
-                    touches.append((p[0], p[1], p[2], gap))
+                # 主線使用 P1-P3；P2 必須接近 P1-P3 線，才算同一組下降外點。
+                main_slope = (p3[2] - p1[2]) / max(p3[0] - p1[0], 1)
+                if main_slope >= 0:
+                    continue
+                p2_line_y = _line_y(p1, main_slope, p2[0])
+                p2_gap = p2_line_y - p2[2]
+                # P2 不可穿過 P1-P3，也不可離主下降線太遠。
+                if p2_gap < -penetration_tolerance or p2_gap > touch_tolerance:
+                    continue
 
-            # 至少三個不同高點貼近同一條下降線。
-            touches = sorted(touches, key=lambda x: x[0])
-            distinct_touches = []
-            used_pos = set()
-            for t in touches:
-                if t[0] not in used_pos:
-                    distinct_touches.append(t)
-                    used_pos.add(t[0])
-            if len(distinct_touches) < 3:
-                continue
+                # 三組下降趨勢線都必須有效：P1-P2、P1-P3、P2-P3。
+                valid_12, max_excess_12, breaks_12 = _validate_no_high_break(df, p1, p2, check_end_pos, penetration_tolerance)
+                if not valid_12:
+                    continue
+                valid_13, max_excess_13, breaks_13 = _validate_no_high_break(df, p1, p3, check_end_pos, penetration_tolerance)
+                if not valid_13:
+                    continue
+                valid_23, max_excess_23, breaks_23 = _validate_no_high_break(df, p2, p3, check_end_pos, penetration_tolerance)
+                if not valid_23:
+                    continue
 
-            # P1/P2/P3 取由左到右最能代表下降壓力線的三個貼線高點。
-            p1_touch = distinct_touches[0]
-            p3_touch = distinct_touches[-1]
-            mid_candidates = distinct_touches[1:-1]
-            if not mid_candidates:
-                continue
-            p2_touch = min(mid_candidates, key=lambda t: abs(t[3]))
+                # 計算有多少歷史高點貼近主線 P1-P3，作為穩定度評分。
+                touch_count = 0
+                touch_gap_sum = 0.0
+                for x in range(p1[0], check_end_pos + 1):
+                    high = float(df["High"].iloc[x])
+                    y = _line_y(p1, main_slope, x)
+                    gap = y - high
+                    if -penetration_tolerance <= gap <= touch_tolerance:
+                        touch_count += 1
+                        touch_gap_sum += max(gap, 0.0)
+                mean_touch_gap = touch_gap_sum / max(touch_count, 1)
 
-            coverage = (p3_touch[0] - p1_touch[0]) / max(candidate_end_pos, 1)
-            recent_score = p3_touch[0] / max(candidate_end_pos, 1)
-            mean_gap = sum(max(t[3], 0.0) for t in distinct_touches) / len(distinct_touches)
-            max_gap = max(max(t[3], 0.0) for t in distinct_touches)
-            slope_strength = abs(slope) / max(price_range, 0.01) * full_len
+                coverage = (p3[0] - p1[0]) / max(check_end_pos, 1)
+                recent_p3_score = p3[0] / max(check_end_pos, 1)
+                slope_strength = abs(main_slope) / max(price_range, 0.01) * full_len
 
-            # 分數目標：多點貼線、涵蓋區間長、P3 越接近訊號日前越好、整條線越貼上緣越好。
-            score = (
-                len(distinct_touches) * 120
-                + coverage * 60
-                + recent_score * 35
-                + min(slope_strength, 2.5) * 20
-                - (mean_gap / price_range) * 150
-                - (max_gap / price_range) * 80
-            )
+                # 分數：三點有效為前提，再偏好覆蓋長、P3 接近訊號日前、貼線點較多、P2 更貼近主線。
+                score = (
+                    coverage * 90
+                    + recent_p3_score * 45
+                    + touch_count * 18
+                    + min(slope_strength, 3.0) * 15
+                    - (abs(p2_gap) / price_range) * 150
+                    - (mean_touch_gap / price_range) * 80
+                )
 
-            if best is None or score > best["score"]:
-                best = {
-                    "p1": (p1_touch[0], p1_touch[1], p1_touch[2]),
-                    "p2": (p2_touch[0], p2_touch[1], p2_touch[2]),
-                    "p3": (p3_touch[0], p3_touch[1], p3_touch[2]),
-                    "anchor_start": p_start,
-                    "anchor_end": p_end,
-                    "slope": slope,
-                    "score": score,
-                    "touch_count": len(distinct_touches),
-                    "mean_gap": mean_gap,
-                }
+                if best is None or score > best["score"]:
+                    best = {
+                        "p1": p1,
+                        "p2": p2,
+                        "p3": p3,
+                        "slope": main_slope,
+                        "score": score,
+                        "touch_count": touch_count,
+                        "p2_gap": p2_gap,
+                        "max_excess": max(max_excess_12, max_excess_13, max_excess_23),
+                        "breaks": breaks_12 + breaks_13 + breaks_23,
+                    }
 
     if best is None:
         return None
 
-    anchor_start, slope = best["anchor_start"], best["slope"]
+    p1, p2, p3, slope = best["p1"], best["p2"], best["p3"], best["slope"]
     x0, x1 = 0, full_len - 1
-    y0 = anchor_start[2] + slope * (x0 - anchor_start[0])
-    y1 = anchor_start[2] + slope * (x1 - anchor_start[0])
+    y0 = _line_y(p1, slope, x0)
+    y1 = _line_y(p1, slope, x1)
 
-    p1, p2, p3 = best["p1"], best["p2"], best["p3"]
     return {
         "x": [df.index[x0], df.index[x1]],
         "y": [y0, y1],
@@ -515,7 +561,8 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
         "p3_val": p3[2],
         "slope": slope,
         "touch_count": best.get("touch_count", 3),
-        "mean_gap": best.get("mean_gap", 0.0),
+        "p2_gap": best.get("p2_gap", 0.0),
+        "breaks": best.get("breaks", 0),
     }
 
 def detect_horizontal_resistance(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
@@ -577,11 +624,8 @@ def show_price_chart(row: pd.Series) -> None:
     trendline = detect_descending_trendline(trend, scan_date)
     if trendline:
         fig.add_trace(go.Scatter(x=trendline["x"], y=trendline["y"], mode="lines", name="下降趨勢線", line=dict(color="#f97316", width=3, dash="dash")), row=1, col=1)
-        trend_dates = [trendline["p1_date"], trendline["p2_date"]]
-        trend_vals = [trendline["p1_val"], trendline["p2_val"]]
-        if trendline.get("p3_date") is not None:
-            trend_dates.append(trendline["p3_date"])
-            trend_vals.append(trendline["p3_val"])
+        trend_dates = [trendline["p1_date"], trendline["p2_date"], trendline["p3_date"]]
+        trend_vals = [trendline["p1_val"], trendline["p2_val"], trendline["p3_val"]]
         fig.add_trace(go.Scatter(x=trend_dates, y=trend_vals, mode="markers", name="趨勢高點", marker=dict(color="#f97316", size=8)), row=1, col=1)
     horizontal = detect_horizontal_resistance(trend, scan_date)
     if horizontal:
@@ -601,16 +645,14 @@ def show_price_chart(row: pd.Series) -> None:
         st.caption(f"顯示K線數：{len(trend)} 個交易日")
     with info_cols[1]:
         if trendline:
-            if trendline.get("p3_date") is not None:
-                st.caption(
-                    f"下降趨勢線：P1 {trendline['p1_date'].strftime('%Y-%m-%d')} {trendline['p1_val']:.2f} → "
-                    f"P2 {trendline['p2_date'].strftime('%Y-%m-%d')} {trendline['p2_val']:.2f} → "
-                    f"P3 {trendline['p3_date'].strftime('%Y-%m-%d')} {trendline['p3_val']:.2f}｜貼線高點 {trendline.get('touch_count', 3)} 個"
-                )
-            else:
-                st.caption(f"下降趨勢線：{trendline['p1_date'].strftime('%Y-%m-%d')} {trendline['p1_val']:.2f} → {trendline['p2_date'].strftime('%Y-%m-%d')} {trendline['p2_val']:.2f}")
+            st.caption(
+                f"有效下降趨勢線：P1 {trendline['p1_date'].strftime('%Y-%m-%d')} {trendline['p1_val']:.2f} → "
+                f"P2 {trendline['p2_date'].strftime('%Y-%m-%d')} {trendline['p2_val']:.2f} → "
+                f"P3 {trendline['p3_date'].strftime('%Y-%m-%d')} {trendline['p3_val']:.2f}｜"
+                f"貼線高點 {trendline.get('touch_count', 3)} 個｜穿越數 {trendline.get('breaks', 0)}"
+            )
         else:
-            st.caption("下降趨勢線：找不到符合三個高點且無歷史高點穿越的下降趨勢線")
+            st.caption("下降趨勢線：找不到符合 P1/P2/P3 三點且無歷史高點穿越的有效下降趨勢線")
     with info_cols[2]:
         if horizontal:
             st.caption(f"水平壓力：{horizontal['level']:.2f}（{horizontal['date'].strftime('%Y-%m-%d')} 高點）")
