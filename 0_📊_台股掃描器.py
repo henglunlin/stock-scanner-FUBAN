@@ -738,6 +738,30 @@ def leave_edit_mode():
 def symbol_to_code(symbol: str) -> str:
     return str(symbol).split(".")[0]
 
+
+def record_missing_stock(missing_stock_details, fetch_errors, symbol, stock_name=None, reason="未知原因", group_name="", source=""):
+    """
+    統一記錄掃描時抓不到資料/資料異常的股票。
+    - missing_stock_details：給畫面 DataFrame 顯示與下載
+    - fetch_errors：給除錯 expander 顯示完整錯誤原因
+    """
+    symbol = str(symbol).strip()
+    try:
+        resolved_name = stock_name or get_stock_name(symbol, st.session_state.get("fubon_sdk"))
+    except Exception:
+        resolved_name = stock_name or ""
+
+    reason_text = str(reason).strip() or "未知原因"
+    item = {
+        "代碼": symbol,
+        "股票名稱": str(resolved_name or ""),
+        "分類": str(group_name or ""),
+        "原因": reason_text,
+        "來源": str(source or ""),
+    }
+    missing_stock_details.append(item)
+    fetch_errors[symbol] = reason_text
+
 def build_top3_html(valid_stock_stats):
     if not valid_stock_stats:
         return '<span style="color:#666666;">無可用資料</span>'
@@ -1389,6 +1413,9 @@ if should_run_scan:
     all_signal_rows = []
     signal_buckets = {"優先追蹤": [], "漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
     trend_chart_store = {}  # symbol -> {df, p1_pos, p2_pos, p1_val, slope, name} 供「趨勢突破」分頁畫K線+趨勢線圖
+    # 新增：缺資料/抓取失敗統計。掃描當下記錄，避免事後從「訊號類型=錯誤」回推造成漏抓。
+    missing_stock_details = []
+    fetch_errors = {}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
 
     # 🚀 批次預先抓取：把整批股票的Yfinance歷史資料一次抓回來，取代掃描迴圈中逐檔各打一次API。
@@ -1423,12 +1450,20 @@ if should_run_scan:
                 render_scan_progress_card(scan_progress_card_placeholder, progress_pct, "掃描進度")
                 progress_bar.progress(progress_value, text=f"掃描進度：{progress_pct:.1f}%（{processed_count}/{scan_total_count}：{symbol}）")
             try:
-                df = download_stock_data_by_source(
+                raw_df = download_stock_data_by_source(
                     symbol, st.session_state.fubon_sdk, active_price_source, scan_today_str,
                     history_map=yf_history_map, yf_today_map=yf_today_map,
                 )
-                df = normalize_ohlc(df)
-                if df.empty: raise ValueError("無效的 K 線資料")
+                if raw_df is None or raw_df.empty:
+                    raise ValueError("查無歷史資料 / API 回傳空資料")
+
+                df = normalize_ohlc(raw_df)
+                if df is None or df.empty:
+                    raise ValueError("normalize_ohlc 後無有效 K 線資料")
+
+                # 指標計算通常至少需要一段日K資料；不足時明確列入缺資料清單。
+                if len(df) < 60:
+                    raise ValueError(f"歷史資料不足：僅 {len(df)} 筆，少於 60 筆")
 
                 price = get_last_price_by_source(symbol, df, st.session_state.fubon_sdk, active_price_source)
                 stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
@@ -1538,9 +1573,20 @@ if should_run_scan:
                         }
             except Exception as e:
                 error_count += 1
+                error_reason = f"{type(e).__name__}: {e}"
+                error_stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
+                record_missing_stock(
+                    missing_stock_details=missing_stock_details,
+                    fetch_errors=fetch_errors,
+                    symbol=symbol,
+                    stock_name=error_stock_name,
+                    reason=error_reason,
+                    group_name=group_name,
+                    source=active_price_source,
+                )
                 if not show_only_signal_rows:
                     rows.append({
-                        "代碼": symbol, "代碼網址": "", "股票名稱": get_stock_name(symbol, st.session_state.fubon_sdk),
+                        "代碼": symbol, "代碼網址": "", "股票名稱": error_stock_name,
                         "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-",
                         "P1日期": "-", "區高P1": "-", "P2日期": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-", "貼線數": "-", "穿線數": "-", "量能倍數": "-",
                         "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-",
@@ -1587,6 +1633,8 @@ if should_run_scan:
         "all_signal_rows": all_signal_rows,
         "signal_buckets": signal_buckets,
         "trend_chart_store": trend_chart_store,
+        "missing_stock_details": missing_stock_details,
+        "fetch_errors": fetch_errors,
         "excel_filename": f"TWstock_signal_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
         "scan_completed_at": tw_now.strftime('%Y-%m-%d %H:%M:%S'),
         "progress_pct": 100,
@@ -1611,6 +1659,8 @@ else:
     all_signal_rows = last_scan_result.get("all_signal_rows", [])
     signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
     trend_chart_store = last_scan_result.get("trend_chart_store", {})
+    missing_stock_details = last_scan_result.get("missing_stock_details", [])
+    fetch_errors = last_scan_result.get("fetch_errors", {})
     render_scan_progress_card(scan_progress_card_placeholder, last_scan_result.get("progress_pct", 100), "掃描進度")
 
 excel_bytes = build_signal_excel_bytes(signal_buckets)
@@ -1653,10 +1703,20 @@ with scan_action_placeholder.container():
         st.caption(f"Excel：{excel_filename} ｜ 追蹤CSV GitHub 目標：{tracking_github_path(tw_now)}")
 
 st.markdown("### 🔎 訊號掃描結果")
-# ========== 新增：掃描資料總計 ==========
+# ========== 新增：掃描資料總計 + 缺資料股票列表 ==========
+
 total_scanned = sum(item.get("總數", 0) for item in group_up_summary)
-total_errors = sum(item.get("錯誤數", 0) for item in group_up_summary)
-total_success = total_scanned - total_errors
+
+# 優先使用掃描當下記錄的 missing_stock_details；若讀到舊版 session，則保留 group_up_summary 的錯誤數當 fallback。
+missing_stock_details = locals().get("missing_stock_details", [])
+fetch_errors = locals().get("fetch_errors", {})
+missing_df = pd.DataFrame(missing_stock_details) if missing_stock_details else pd.DataFrame(columns=["代碼", "股票名稱", "分類", "原因", "來源"])
+if not missing_df.empty:
+    missing_df = missing_df.drop_duplicates(subset=["代碼"], keep="first").reset_index(drop=True)
+
+total_errors = len(missing_df) if not missing_df.empty else sum(item.get("錯誤數", 0) for item in group_up_summary)
+total_success = max(total_scanned - total_errors, 0)
+unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
 
 stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
 with stat_col1:
@@ -1666,25 +1726,42 @@ with stat_col2:
 with stat_col3:
     st.metric("缺少資料數", total_errors)
 with stat_col4:
-    unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
     st.metric("符合勾選條件數", unique_signal_count)
 
-# ========== 2. 新增：找出缺少資料的股票並顯示浮動視窗 ==========
-missing_stocks = []
-# 走訪每個群組的資料表，把「訊號類型」為「錯誤」的股票挑出來
-for group_name, info in group_tables.items():
-    table_df = info.get("table")
-    if table_df is not None and not table_df.empty and "訊號類型" in table_df.columns:
-        error_rows = table_df[table_df["訊號類型"] == "錯誤"]
-        for _, row in error_rows.iterrows():
-            # 取得代碼並去除可能的連結格式，保留乾淨的代碼與名稱
-            code = str(row.get("代碼", "")).split(">")[-1].replace("</a", "") if "<a" in str(row.get("代碼", "")) else str(row.get("代碼", ""))
-            name = str(row.get("股票名稱", ""))
-            missing_stocks.append(f"{code} {name}")
+# 直接列出抓不到/資料不足/處理異常的股票清單
+if not missing_df.empty:
+    st.warning(f"⚠️ 本次掃描共有 {len(missing_df)} 檔股票缺少資料或處理失敗。")
 
+    with st.expander(f"⚠️ 缺少資料股票列表（{len(missing_df)} 檔）", expanded=True):
+        st.dataframe(missing_df, use_container_width=True, hide_index=True)
 
-unique_signal_count = len(pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"])) if all_signal_rows else 0
-st.metric("符合勾選掃描條件股票數", unique_signal_count)
+        missing_txt = "\n".join(missing_df["代碼"].astype(str).tolist())
+        missing_csv = missing_df.to_csv(index=False).encode("utf-8-sig")
+
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            st.download_button(
+                "📥 下載缺資料股票代碼 TXT",
+                data=missing_txt,
+                file_name=f"missing_stock_codes_{tw_now.strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        with dl_col2:
+            st.download_button(
+                "📥 下載缺資料明細 CSV",
+                data=missing_csv,
+                file_name=f"missing_stock_details_{tw_now.strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+if fetch_errors:
+    with st.expander(f"🔧 抓取/處理失敗除錯資訊（{len(fetch_errors)} 檔）", expanded=False):
+        st.json(dict(list(fetch_errors.items())[:100]))
+        if len(fetch_errors) > 100:
+            st.caption(f"...另外還有 {len(fetch_errors) - 100} 檔錯誤未顯示")
+
 if os.path.exists(TRACKING_FILE):
     st.caption(f"追蹤檔：{TRACKING_FILE} ｜ GitHub 目標：{tracking_github_path(tw_now)}")
 else:
