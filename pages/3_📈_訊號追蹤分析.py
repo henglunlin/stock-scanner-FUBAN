@@ -404,14 +404,17 @@ def _fit_hull_trendline(
     df: pd.DataFrame,
     start_pos: int,
     end_pos_exclusive: int,
-    min_span: int = 4,
+    min_span: int = 3,
 ) -> Optional[Dict[str, Any]]:
     """在 [start_pos, end_pos_exclusive) 範圍內（此範圍刻意不含「今日」那一根）
     用上凸包找出下降趨勢線的兩個高點 P1、P2。
 
-    找到 P1、P2 後，會沿著「整段可見K線」（含今日）逐根往右檢查，只要某根K棒
-    的最高價超過線的延伸值，就把畫線範圍收在被穿越之前，確保整條畫出來的線
-    絕對不會被任何K棒穿過（若之後真的突破，線就自然停在突破前一根）。
+    重要修正：上凸包是「向上鼓起」的形狀，P1 與凸包「最後一個」頂點的直線，
+    中間的凸包頂點反而會凸出在這條線之上（等於被穿越）。所以 P2 不能只取
+    最後一個頂點，而是要把 P1 之後每一個凸包頂點都當作候選 P2，各自算出
+    「從 P1 延伸出去、沿整段可見K線（含今日）逐根檢查後最遠能畫到哪裡」，
+    再挑「畫線範圍最長、且完全不被任何K棒穿越」的那一組，這樣線才會像
+    人工畫的趨勢線一樣，盡量貼著多個高點延伸到最新的K棒。
     """
     if end_pos_exclusive - start_pos < min_span:
         return None
@@ -424,40 +427,40 @@ def _fit_hull_trendline(
 
     # P1：這段區間上凸包裡的全域最高點（同價取位置較左者，代表壓力起點）。
     p1 = max(hull, key=lambda p: (p[1], -p[0]))
-    hull_after_p1 = [p for p in hull if p[0] > p1[0]]
+    hull_after_p1 = [p for p in hull if p[0] > p1[0] and p[1] < p1[1]]
     if not hull_after_p1:
         return None
 
-    # P2：優先取 P1 之後、上凸包裡最靠右且價格更低的頂點，代表最新一次的下降壓力點。
-    lower_after_p1 = [p for p in hull_after_p1 if p[1] < p1[1]]
-    if not lower_after_p1:
-        return None
-    p2 = lower_after_p1[-1]
-
-    if p2[0] - p1[0] < min_span:
-        # 太靠近則改找次靠右、但間距足夠的頂點。
-        far_enough = [p for p in lower_after_p1 if p[0] - p1[0] >= min_span]
-        if not far_enough:
-            return None
-        p2 = far_enough[-1]
-
-    slope = (p2[1] - p1[1]) / max(p2[0] - p1[0], 1)
-    if slope >= 0:
-        return None
-
-    # 沿整段可見K線（含今日）逐根檢查，找到第一次被穿越的位置，畫線只延伸到那之前。
     full_len = len(df)
     tol = max((float(df["High"].max()) - float(df["Low"].min())) * 0.001, 0.001)
-    draw_end = full_len - 1
-    for x in range(p1[0], full_len):
-        line_val = p1[1] + slope * (x - p1[0])
-        high_val = float(df["High"].iloc[x])
-        if high_val > line_val + tol:
-            draw_end = x - 1
-            break
 
-    if draw_end <= p1[0]:
+    best: Optional[Dict[str, Any]] = None
+    for p2 in hull_after_p1:
+        slope = (p2[1] - p1[1]) / max(p2[0] - p1[0], 1)
+        if slope >= 0:
+            continue
+
+        # 沿整段可見K線（含今日）逐根檢查，找到第一次被穿越的位置，畫線只延伸到那之前。
+        draw_end = full_len - 1
+        for x in range(p1[0], full_len):
+            line_val = p1[1] + slope * (x - p1[0])
+            high_val = float(df["High"].iloc[x])
+            if high_val > line_val + tol:
+                draw_end = x - 1
+                break
+        if draw_end <= p1[0]:
+            continue
+
+        # 評分：畫線能延伸得越遠越好（最重要），其次是 P1、P2 兩點間距越大代表越具代表性。
+        span = p2[0] - p1[0]
+        score = draw_end * 1000 + span
+        if best is None or score > best["score"]:
+            best = {"p1": p1, "p2": p2, "slope": slope, "draw_end": draw_end, "score": score}
+
+    if best is None:
         return None
+
+    p1, p2, slope, draw_end = best["p1"], best["p2"], best["slope"], best["draw_end"]
 
     y_start = p1[1]
     y_end = p1[1] + slope * (draw_end - p1[0])
