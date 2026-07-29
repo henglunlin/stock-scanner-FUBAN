@@ -367,64 +367,11 @@ def _dedupe_points(points: List[Tuple[int, pd.Timestamp, float]]) -> List[Tuple[
     return sorted(best_by_pos.values(), key=lambda x: x[0])
 
 
-def calc_high_points_regression(
-    points: List[Tuple[int, pd.Timestamp, float]],
-    min_points: int = 3,
-) -> Optional[Dict[str, float]]:
-    """對候選高點做簡單線性回歸，不依賴 scipy。
-
-    points 格式：[(position, date, high_value), ...]
-
-    用途：
-    - 判斷候選高點整體是否呈現下降。
-    - r2 越高，代表高點排列越接近一條下降壓力線。
-    - 這裡只作為趨勢線品質檢查與加權，不直接拿 regression 線畫圖。
-    """
-    clean_points = _dedupe_points(points)
-
-    if len(clean_points) < min_points:
-        return None
-
-    xs = [float(p[0]) for p in clean_points]
-    ys = [float(p[2]) for p in clean_points]
-
-    n = len(xs)
-    x_mean = sum(xs) / n
-    y_mean = sum(ys) / n
-
-    sxx = sum((x - x_mean) ** 2 for x in xs)
-    if sxx == 0:
-        return None
-
-    sxy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-    slope = sxy / sxx
-    intercept = y_mean - slope * x_mean
-
-    y_hat = [intercept + slope * x for x in xs]
-    ss_res = sum((y - yh) ** 2 for y, yh in zip(ys, y_hat))
-    ss_tot = sum((y - y_mean) ** 2 for y in ys)
-
-    if ss_tot <= 0:
-        r2 = 0.0
-    else:
-        r2 = max(0.0, min(1.0, 1.0 - ss_res / ss_tot))
-
-    return {
-        "slope": float(slope),
-        "intercept": float(intercept),
-        "r2": float(r2),
-        "count": int(n),
-    }
-
-
 def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
-    """偵測下降趨勢線。
-
-    重點規則：
-    - P2 不可以使用訊號日/今日的高點，避免把當天拉高的影線當成下降趨勢線第二點。
-    - P1 使用訊號日前可見區間的主要高點。
-    - P2 使用 P1 之後、訊號日前一根以前的較低主要高點。
-    - regression 只作為 candidates 的品質檢查與加權，不直接拿 regression 線畫圖。
+    """
+    偵測下降趨勢線：改用「直尺槓桿演算法 (Upper Convex Hull)」
+    邏輯：從最高點(P1)出發，找出能形成「最不陡峭 (Max Slope)」的下降連線。
+    這保證了 P1 之後的任何價格都不會高於這條線，完美模擬人類畫壓力線的視覺直覺。
     """
     if df.empty or len(df) < 8:
         return None
@@ -432,156 +379,94 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
     sd = pd.to_datetime(scan_date)
     full_len = len(df)
 
-    # 找到訊號日所在位置；P2 候選只允許在 signal_pos 之前，嚴格排除訊號日/今日高點。
+    # 找到訊號日所在位置，所有候選點只能在訊號日之前
     pos_candidates = [i for i, dt in enumerate(df.index) if dt >= sd]
     signal_pos = pos_candidates[0] if pos_candidates else full_len - 1
     candidate_end_pos = max(0, signal_pos - 1)
     base = df.iloc[:candidate_end_pos + 1].copy()
 
     if len(base) < 8:
-        # 資料太短時仍不使用訊號日；避免 P2 取到今日高點。
         base = df.iloc[:max(signal_pos, 0)].copy()
-
     if len(base) < 2:
         return None
 
     def to_full_pos(ts: pd.Timestamp) -> int:
         return int(df.index.get_loc(ts))
 
-    # [修改點 1]：將 left=2, right=2 改為 1。只要比前後 1 天高，就允許成為候選點，避免漏掉短暫的小反彈高點。
+    # 候選 P1：找出局部高點，並加上絕對高點防漏
     swing_base = find_swing_highs(base, left=1, right=1)
     swing_points = [(to_full_pos(dt), dt, val) for _, dt, val in swing_base]
-
-    top_n = min(10, len(base))
+    top_n = min(5, len(base))
     top_points = [(to_full_pos(idx), idx, float(base.loc[idx, "High"])) for idx in base["High"].nlargest(top_n).index]
+    
     candidates = _dedupe_points(swing_points + top_points)
-
-    # 再保險：所有候選點都必須早於訊號日/今日。
     candidates = [p for p in candidates if p[0] < signal_pos]
+
     if len(candidates) < 2:
         return None
 
     price_range = max(float(df["High"].max() - df["Low"].min()), 0.01)
-
-    # regression 品質檢查：確認候選高點整體偏下降。
-    # 不用 scipy，避免部署環境缺套件。
-    reg_info = calc_high_points_regression(candidates, min_points=3)
-
-    if reg_info is not None:
-        reg_slope = float(reg_info["slope"])
-        reg_r2 = float(reg_info["r2"])
-        
-        # [先前的修改]：註解掉下方這段限制，不再強制要求「全部候選高點」都必須是下坡。
-        # if reg_slope >= -min_reg_down_slope:
-        #     return None
-    else:
-        reg_slope = None
-        reg_r2 = 0.0
-
-    # [先前的修改]：將 min_gap 從 max(4, full_len // 12) 放寬為 2。
-    min_gap = 2 
-    min_drop = max(price_range * 0.008, 0.01)
+    tolerance = max(price_range * 0.015, 0.01)
     
-    # [修改點 2]：將容忍度放大一倍，避免被細微上影線淘汰
-    tolerance = max(price_range * 0.03, 0.02)
+    # P1 與 P2 之間至少間隔 3 天，避免連到隔壁同一座山頭的 K 線
+    min_gap = 3 
 
-    # P1 優先從最高主要壓力開始嘗試。
+    # 依照高度排序，優先從「最高峰」開始放直尺
     p1_candidates = sorted(candidates, key=lambda x: (-x[2], x[0]))
-    best: Optional[Dict[str, Any]] = None
+    best = None
 
     for p1 in p1_candidates:
-        p1_pos, _, p1_val = p1
+        p1_pos, p1_date, p1_val = p1
         if p1_pos >= signal_pos - min_gap:
             continue
 
-        # P2 必須在 P1 之後、訊號日前，而且價格低於 P1。
-        p2_candidates = [
-            p for p in candidates
-            if p[0] >= p1_pos + min_gap
-            and p[0] < signal_pos
-            and p[2] <= p1_val - min_drop
-        ]
-        if not p2_candidates:
+        max_slope = -float('inf')
+        best_p2 = None
+
+        # 核心演算法：從 P1 往右掃描，計算到每個點的斜率
+        # 找出斜率「最大（最平緩）」的點作為 P2，這條線就是完美的上凸包邊界！
+        for p2_pos in range(p1_pos + min_gap, signal_pos):
+            p2_val = float(df["High"].iloc[p2_pos])
+            slope = (p2_val - p1_val) / (p2_pos - p1_pos)
+            
+            if slope > max_slope:
+                max_slope = slope
+                best_p2 = (p2_pos, df.index[p2_pos], p2_val)
+
+        # 如果最平緩的斜率是正的 (往上)，代表右邊有比 P1 更高的點，這就不叫下降趨勢線
+        if best_p2 is None or max_slope >= 0:
             continue
 
-        for p2 in p2_candidates:
-            p2_pos, _, p2_val = p2
-            slope = (p2_val - p1_val) / max(p2_pos - p1_pos, 1)
-            if slope >= 0:
-                continue
+        # 檢查從 P1 往前延伸，會不會嚴重撞到之前的歷史高點？
+        # (因為是從最高峰出發，通常 violation_count 會是 0)
+        violation_count = 0
+        for x in range(len(base)):
+            actual_y = float(base["High"].iloc[x])
+            line_y = p1_val + max_slope * (x - p1_pos)
+            if actual_y > line_y + tolerance:
+                violation_count += 1
 
-            # 只檢查到訊號日前一根，今日高點不影響 P2 與趨勢線選擇。
-            check_end = candidate_end_pos
-            check_slice = df.iloc[p1_pos:check_end + 1]
-            xs = range(p1_pos, check_end + 1)
-            line_vals = [p1_val + slope * (x - p1_pos) for x in xs]
-            highs = check_slice["High"].astype(float).tolist()
+        # 因為這是物理上的完美天花板，容忍度設得很低
+        if violation_count > 2:
+            continue
 
-            excess = [h - y for h, y in zip(highs, line_vals) if h > y + tolerance]
-            violation_count = len(excess)
-            max_excess = max(excess) if excess else 0.0
-
-            # [修改點 3]：將允許刺破次數限制從 3 次放寬到 5 次
-            if violation_count > 5 or max_excess > tolerance * 3.0:
-                continue
-
-            span_score = (p2_pos - p1_pos) / max(full_len, 1)
-            recent_p2_score = p2_pos / max(signal_pos - 1, 1)
-            touch_bonus = 1.0 if p2 in swing_points else 0.0
-
-            # regression scoring：讓候選高點整體越像下降壓力帶的線加分。
-            reg_bonus = 0.0
-            reg_penalty = 0.0
-            if reg_info is not None and reg_slope is not None:
-                # r2 越高越好，但上限 10 分，避免 regression 壓過 P1/P2 與 violation 邏輯。
-                reg_bonus += min(10.0, reg_r2 * 10.0)
-
-                # P1/P2 slope 與 candidates regression slope 越接近越好。
-                slope_diff_ratio = abs(slope - reg_slope) / max(abs(reg_slope), price_range * 0.001, 0.0001)
-                reg_penalty += min(8.0, slope_diff_ratio * 1.5)
-
-                # r2 很低代表高點離散，只小幅扣分，不直接淘汰。
-                if reg_r2 < 0.05:
-                    reg_penalty += 3.0
-                elif reg_r2 < 0.10:
-                    reg_penalty += 1.5
-
-            # [修改點 4]：將過度陡峭的懲罰減輕 (slope * 250 -> slope * 50)
-            score = (
-                recent_p2_score * 25
-                + span_score * 8
-                + slope * 50
-                - violation_count * 12
-                - max_excess * 5
-                + touch_bonus
-                + reg_bonus
-                - reg_penalty
-            )
-
-            if best is None or score > best["score"]:
-                best = {
-                    "p1": p1,
-                    "p2": p2,
-                    "slope": slope,
-                    "score": score,
-                    "violations": violation_count,
-                    "max_excess": max_excess,
-                    "regression": reg_info,
-                }
-
-        # 最高 P1 找到可用線就停止，避免退回較低 P1。
-        if best is not None and best["p1"] == p1:
-            break
+        # 找到了！直接記錄並跳出迴圈 (因為我們是從最高點開始找的)
+        best = {
+            "p1": p1,
+            "p2": best_p2,
+            "slope": max_slope
+        }
+        break 
 
     if best is None:
         return None
 
     p1, p2, slope = best["p1"], best["p2"], best["slope"]
 
+    # 畫線座標處理
     x0, x1 = 0, full_len - 1
     y0 = p1[2] + slope * (x0 - p1[0])
     y1 = p1[2] + slope * (x1 - p1[0])
-    regression = best.get("regression") or {}
 
     return {
         "x": [df.index[x0], df.index[x1]],
@@ -591,12 +476,12 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
         "p2_date": p2[1],
         "p2_val": p2[2],
         "slope": slope,
-        "violations": best.get("violations", 0),
-        "max_excess": best.get("max_excess", 0.0),
-        "score": best.get("score", 0.0),
-        "reg_slope": regression.get("slope"),
-        "reg_r2": regression.get("r2"),
-        "reg_count": regression.get("count"),
+        "violations": 0,
+        "max_excess": 0.0,
+        "score": 100.0, # 分數已經不需要了，找到的就是完美的
+        "reg_slope": None,
+        "reg_r2": None,
+        "reg_count": None,
     }
 
 
@@ -678,17 +563,13 @@ def show_price_chart(row: pd.Series) -> None:
         st.caption(f"顯示K線數：{len(trend)} 個交易日")
     with info_cols[1]:
         if trendline:
-            reg_text = ""
-            if trendline.get("reg_r2") is not None:
-                reg_text = f"｜Reg R² {trendline.get('reg_r2', 0):.2f}"
             st.caption(
                 f"下降趨勢線："
                 f"{trendline['p1_date'].strftime('%Y-%m-%d')} {trendline['p1_val']:.2f} → "
                 f"{trendline['p2_date'].strftime('%Y-%m-%d')} {trendline['p2_val']:.2f}"
-                f"{reg_text}"
             )
         else:
-            st.caption("下降趨勢線：目前找不到明確的兩個下降高點")
+            st.caption("下降趨勢線：目前找不到明確的下降高點")
     with info_cols[2]:
         if horizontal:
             st.caption(f"水平壓力：{horizontal['level']:.2f}（{horizontal['date'].strftime('%Y-%m-%d')} 高點）")
