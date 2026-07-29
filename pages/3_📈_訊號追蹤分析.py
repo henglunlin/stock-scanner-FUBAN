@@ -358,7 +358,7 @@ def find_swing_highs(df: pd.DataFrame, left: int = 2, right: int = 2) -> List[Tu
 
 
 def _dedupe_points(points: List[Tuple[int, pd.Timestamp, float]]) -> List[Tuple[int, pd.Timestamp, float]]:
-    """同一根 K 棒只保留一筆，並依位置排序。"""
+    """同一個 K 棒只保留一筆，並依位置排序。"""
     best_by_pos: Dict[int, Tuple[int, pd.Timestamp, float]] = {}
     for p in points:
         old = best_by_pos.get(p[0])
@@ -367,127 +367,146 @@ def _dedupe_points(points: List[Tuple[int, pd.Timestamp, float]]) -> List[Tuple[
     return sorted(best_by_pos.values(), key=lambda x: x[0])
 
 
-def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
-    """偵測下降趨勢線。
+def _upper_convex_hull(points: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
+    """計算「上凸包」(upper convex hull)。
 
-    重點規則：
-    - P2 不可以使用訊號日/今日的高點，避免把當天拉高的影線當成下降趨勢線第二點。
-    - P1 使用訊號日前可見區間的主要高點。
-    - P2 使用 P1 之後、訊號日前一根以前的較低主要高點。
-    - 優先挑「能形成有效下降壓力、且後續沒有被大量穿越」的 P2。
+    傳入 (位置, 高點價格) 點集，回傳的頂點序列具有數學保證：原始點集中
+    每一個點的價格都不會高於這條凸包折線本身。也就是說，只要趨勢線的
+    P1、P2 取自同一組上凸包，這條線在該範圍內絕對不會被任何一根K棒的
+    最高價「穿越」。這是畫壓力／下降趨勢線最穩固的作法。
     """
-    if df.empty or len(df) < 8:
+    if len(points) < 2:
+        return list(points)
+
+    # 同一個 x（位置）只保留最高價，並依位置排序。
+    dedup: Dict[int, float] = {}
+    for x, y in points:
+        if x not in dedup or y > dedup[x]:
+            dedup[x] = y
+    seq = sorted(dedup.items(), key=lambda p: p[0])
+    if len(seq) < 2:
+        return seq
+
+    hull: List[Tuple[int, float]] = []
+    for p in seq:
+        while len(hull) >= 2:
+            o, a = hull[-2], hull[-1]
+            cross = (a[0] - o[0]) * (p[1] - o[1]) - (a[1] - o[1]) * (p[0] - o[0])
+            if cross >= 0:
+                hull.pop()
+            else:
+                break
+        hull.append(p)
+    return hull
+
+
+def _fit_hull_trendline(
+    df: pd.DataFrame,
+    start_pos: int,
+    end_pos_exclusive: int,
+    min_span: int = 4,
+) -> Optional[Dict[str, Any]]:
+    """在 [start_pos, end_pos_exclusive) 範圍內（此範圍刻意不含「今日」那一根）
+    用上凸包找出下降趨勢線的兩個高點 P1、P2。
+
+    找到 P1、P2 後，會沿著「整段可見K線」（含今日）逐根往右檢查，只要某根K棒
+    的最高價超過線的延伸值，就把畫線範圍收在被穿越之前，確保整條畫出來的線
+    絕對不會被任何K棒穿過（若之後真的突破，線就自然停在突破前一根）。
+    """
+    if end_pos_exclusive - start_pos < min_span:
         return None
 
-    sd = pd.to_datetime(scan_date)
+    seg = df.iloc[start_pos:end_pos_exclusive]
+    pts = [(start_pos + i, float(h)) for i, h in enumerate(seg["High"].tolist())]
+    hull = _upper_convex_hull(pts)
+    if len(hull) < 2:
+        return None
+
+    # P1：這段區間上凸包裡的全域最高點（同價取位置較左者，代表壓力起點）。
+    p1 = max(hull, key=lambda p: (p[1], -p[0]))
+    hull_after_p1 = [p for p in hull if p[0] > p1[0]]
+    if not hull_after_p1:
+        return None
+
+    # P2：優先取 P1 之後、上凸包裡最靠右且價格更低的頂點，代表最新一次的下降壓力點。
+    lower_after_p1 = [p for p in hull_after_p1 if p[1] < p1[1]]
+    if not lower_after_p1:
+        return None
+    p2 = lower_after_p1[-1]
+
+    if p2[0] - p1[0] < min_span:
+        # 太靠近則改找次靠右、但間距足夠的頂點。
+        far_enough = [p for p in lower_after_p1 if p[0] - p1[0] >= min_span]
+        if not far_enough:
+            return None
+        p2 = far_enough[-1]
+
+    slope = (p2[1] - p1[1]) / max(p2[0] - p1[0], 1)
+    if slope >= 0:
+        return None
+
+    # 沿整段可見K線（含今日）逐根檢查，找到第一次被穿越的位置，畫線只延伸到那之前。
     full_len = len(df)
-
-    # 找到訊號日所在位置；P2 候選只允許在 signal_pos 之前，嚴格排除訊號日/今日高點。
-    pos_candidates = [i for i, dt in enumerate(df.index) if dt >= sd]
-    signal_pos = pos_candidates[0] if pos_candidates else full_len - 1
-    candidate_end_pos = max(0, signal_pos - 1)
-    base = df.iloc[:candidate_end_pos + 1].copy()
-    if len(base) < 8:
-        # 資料太短時仍不使用訊號日；避免 P2 取到今日高點。
-        base = df.iloc[:max(signal_pos, 0)].copy()
-    if len(base) < 2:
-        return None
-
-    def to_full_pos(ts: pd.Timestamp) -> int:
-        return int(df.index.get_loc(ts))
-
-    # 候選點 = local swing high + 前幾大高價，避免重要壓力點剛好不是 pivot 而漏掉。
-    swing_base = find_swing_highs(base, left=2, right=2)
-    swing_points = [(to_full_pos(dt), dt, val) for _, dt, val in swing_base]
-    top_n = min(10, len(base))
-    top_points = [(to_full_pos(idx), idx, float(base.loc[idx, "High"])) for idx in base["High"].nlargest(top_n).index]
-    candidates = _dedupe_points(swing_points + top_points)
-
-    # 再保險：所有候選點都必須早於訊號日/今日。
-    candidates = [p for p in candidates if p[0] < signal_pos]
-    if len(candidates) < 2:
-        return None
-
-    price_range = max(float(df["High"].max() - df["Low"].min()), 0.01)
-    min_gap = max(4, full_len // 12)
-    min_drop = max(price_range * 0.008, 0.01)
-    tolerance = max(price_range * 0.015, 0.01)
-
-    # P1 優先從最高主要壓力開始嘗試。
-    p1_candidates = sorted(candidates, key=lambda x: (-x[2], x[0]))
-    best: Optional[Dict[str, Any]] = None
-
-    for p1 in p1_candidates:
-        p1_pos, _, p1_val = p1
-        if p1_pos >= signal_pos - min_gap:
-            continue
-
-        # P2 必須在 P1 之後、訊號日前，而且價格低於 P1。
-        p2_candidates = [
-            p for p in candidates
-            if p[0] >= p1_pos + min_gap
-            and p[0] < signal_pos
-            and p[2] <= p1_val - min_drop
-        ]
-        if not p2_candidates:
-            continue
-
-        for p2 in p2_candidates:
-            p2_pos, _, p2_val = p2
-            slope = (p2_val - p1_val) / max(p2_pos - p1_pos, 1)
-            if slope >= 0:
-                continue
-
-            # 只檢查到訊號日前一根，因為今日高點不應該影響 P2 與趨勢線選擇。
-            check_end = candidate_end_pos
-            check_slice = df.iloc[p1_pos:check_end + 1]
-            xs = range(p1_pos, check_end + 1)
-            line_vals = [p1_val + slope * (x - p1_pos) for x in xs]
-            highs = check_slice["High"].astype(float).tolist()
-            excess = [h - y for h, y in zip(highs, line_vals) if h > y + tolerance]
-            violation_count = len(excess)
-            max_excess = max(excess) if excess else 0.0
-            if violation_count > 3 or max_excess > tolerance * 3.0:
-                continue
-
-            # P2 越接近訊號日前、越能代表最近一次下降壓力；但仍需維持下降與不被大量穿越。
-            span_score = (p2_pos - p1_pos) / max(full_len, 1)
-            recent_p2_score = p2_pos / max(signal_pos - 1, 1)
-            touch_bonus = 1.0 if p2 in swing_points else 0.0
-            # 不再偏好「過緩且把今日高點當 P2」的線；P2 已排除訊號日，並提高近期 P2 權重。
-            score = recent_p2_score * 25 + span_score * 8 + slope * 250 - violation_count * 12 - max_excess * 5 + touch_bonus
-
-            if best is None or score > best["score"]:
-                best = {
-                    "p1": p1,
-                    "p2": p2,
-                    "slope": slope,
-                    "score": score,
-                    "violations": violation_count,
-                }
-
-        # 最高 P1 找到可用線就停止，避免退回較低 P1。
-        if best is not None and best["p1"] == p1:
+    tol = max((float(df["High"].max()) - float(df["Low"].min())) * 0.001, 0.001)
+    draw_end = full_len - 1
+    for x in range(p1[0], full_len):
+        line_val = p1[1] + slope * (x - p1[0])
+        high_val = float(df["High"].iloc[x])
+        if high_val > line_val + tol:
+            draw_end = x - 1
             break
 
-    if best is None:
+    if draw_end <= p1[0]:
         return None
 
-    p1, p2, slope = best["p1"], best["p2"], best["slope"]
-    x0, x1 = 0, full_len - 1
-    y0 = p1[2] + slope * (x0 - p1[0])
-    y1 = p1[2] + slope * (x1 - p1[0])
+    y_start = p1[1]
+    y_end = p1[1] + slope * (draw_end - p1[0])
 
     return {
-        "x": [df.index[x0], df.index[x1]],
-        "y": [y0, y1],
-        "p1_date": p1[1],
-        "p1_val": p1[2],
-        "p2_date": p2[1],
-        "p2_val": p2[2],
+        "x": [df.index[p1[0]], df.index[draw_end]],
+        "y": [y_start, y_end],
+        "p1_date": df.index[p1[0]],
+        "p1_val": p1[1],
+        "p2_date": df.index[p2[0]],
+        "p2_val": p2[1],
         "slope": slope,
-        "violations": best.get("violations", 0),
     }
+
+
+def detect_descending_trendlines(df: pd.DataFrame, short_term_bars: int = 25) -> Dict[str, Optional[Dict[str, Any]]]:
+    """偵測長期／短期兩條下降趨勢線。
+
+    重點規則：
+    1. 高點（P1、P2）判斷一律排除「今日」那一根K棒（也就是視窗最後一根），
+       避免當天盤中拉高的影線被誤判成趨勢高點。
+    2. 同時找「長期」（用整個可見視窗）與「短期」（只用最近一段區間）兩條線。
+    3. 兩條線都用上凸包（upper convex hull）計算，數學上保證延伸出去的線段
+       不會被任何一根K棒的最高價穿越；若後續走高突破，畫線會自動停在突破前
+       一根，不會硬拉一條被打穿的線。
+    """
+    result: Dict[str, Optional[Dict[str, Any]]] = {"long": None, "short": None}
+    if df.empty or len(df) < 8:
+        return result
+
+    full_len = len(df)
+    today_pos = full_len - 1  # 視窗最後一根＝今日，高點判斷不可使用這一根
+
+    # 長期線：用「今日」以前的整段可見資料找高點。
+    result["long"] = _fit_hull_trendline(df, 0, today_pos, min_span=max(4, full_len // 12))
+
+    # 短期線：只用最近一段（今日之前）資料找高點，反映近期較陡的下降壓力。
+    short_start = max(0, today_pos - short_term_bars)
+    result["short"] = _fit_hull_trendline(df, short_start, today_pos, min_span=3)
+
+    # 若短期線與長期線的兩個高點幾乎相同，代表是同一條線，短期線就不重複顯示。
+    if result["long"] and result["short"]:
+        same_p1 = result["long"]["p1_date"] == result["short"]["p1_date"]
+        same_p2 = result["long"]["p2_date"] == result["short"]["p2_date"]
+        if same_p1 and same_p2:
+            result["short"] = None
+
+    return result
+
 
 def detect_horizontal_resistance(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
     if df.empty:
@@ -545,10 +564,16 @@ def show_price_chart(row: pd.Series) -> None:
         fig.add_hline(y=entry_price, line_dash="dot", line_color="#6366f1", annotation_text=f"訊號價 {entry_price}", row=1, col=1)
     fig.add_vline(x=pd.to_datetime(scan_date), line_dash="dash", line_color="#ef4444", annotation_text="訊號日", row=1, col=1)
 
-    trendline = detect_descending_trendline(trend, scan_date)
-    if trendline:
-        fig.add_trace(go.Scatter(x=trendline["x"], y=trendline["y"], mode="lines", name="下降趨勢線", line=dict(color="#f97316", width=3)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=[trendline["p1_date"], trendline["p2_date"]], y=[trendline["p1_val"], trendline["p2_val"]], mode="markers", name="趨勢高點", marker=dict(color="#f97316", size=8)), row=1, col=1)
+    trendlines = detect_descending_trendlines(trend)
+    trend_long = trendlines.get("long")
+    trend_short = trendlines.get("short")
+    # 兩條下降趨勢線統一用「深橘色虛線」；長期線較粗、短期線較細，方便區分但格式一致。
+    if trend_long:
+        fig.add_trace(go.Scatter(x=trend_long["x"], y=trend_long["y"], mode="lines", name="長期下降趨勢線", line=dict(color="#c2410c", width=2.6, dash="dash")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=[trend_long["p1_date"], trend_long["p2_date"]], y=[trend_long["p1_val"], trend_long["p2_val"]], mode="markers", name="長期趨勢高點", marker=dict(color="#c2410c", size=8)), row=1, col=1)
+    if trend_short:
+        fig.add_trace(go.Scatter(x=trend_short["x"], y=trend_short["y"], mode="lines", name="短期下降趨勢線", line=dict(color="#c2410c", width=1.6, dash="dash")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=[trend_short["p1_date"], trend_short["p2_date"]], y=[trend_short["p1_val"], trend_short["p2_val"]], mode="markers", name="短期趨勢高點", marker=dict(color="#c2410c", size=6, symbol="diamond")), row=1, col=1)
     horizontal = detect_horizontal_resistance(trend, scan_date)
     if horizontal:
         fig.add_hline(y=horizontal["level"], line_dash="dot", line_color="#2563eb", annotation_text=f"水平壓力 {horizontal['level']:.2f}", row=1, col=1)
@@ -566,10 +591,12 @@ def show_price_chart(row: pd.Series) -> None:
     with info_cols[0]:
         st.caption(f"顯示K線數：{len(trend)} 個交易日")
     with info_cols[1]:
-        if trendline:
-            st.caption(f"下降趨勢線：{trendline['p1_date'].strftime('%Y-%m-%d')} {trendline['p1_val']:.2f} → {trendline['p2_date'].strftime('%Y-%m-%d')} {trendline['p2_val']:.2f}")
+        if trend_long:
+            st.caption(f"長期下降趨勢線：{trend_long['p1_date'].strftime('%Y-%m-%d')} {trend_long['p1_val']:.2f} → {trend_long['p2_date'].strftime('%Y-%m-%d')} {trend_long['p2_val']:.2f}")
         else:
-            st.caption("下降趨勢線：目前找不到明確的兩個下降高點")
+            st.caption("長期下降趨勢線：目前找不到明確的兩個下降高點")
+        if trend_short:
+            st.caption(f"短期下降趨勢線：{trend_short['p1_date'].strftime('%Y-%m-%d')} {trend_short['p1_val']:.2f} → {trend_short['p2_date'].strftime('%Y-%m-%d')} {trend_short['p2_val']:.2f}")
     with info_cols[2]:
         if horizontal:
             st.caption(f"水平壓力：{horizontal['level']:.2f}（{horizontal['date'].strftime('%Y-%m-%d')} 高點）")
