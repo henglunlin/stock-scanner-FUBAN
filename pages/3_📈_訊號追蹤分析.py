@@ -370,57 +370,76 @@ def _dedupe_points(points: List[Tuple[int, pd.Timestamp, float]]) -> List[Tuple[
 def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Dict[str, Any]]:
     """偵測下降趨勢線。
 
-    這版改成貼近你截圖中綠線的畫法：
-    - p1 取訊號日前可見區間的主要高點/最高壓力點。
-    - p2 取 p1 之後的較低主要高點，優先選「斜率較緩、延伸後仍壓在價格上緣」的點。
-    - 避免舊版用「時間距離 * 跌幅」挑出過陡的紅色虛線。
+    重點規則：
+    - P2 不可以使用訊號日/今日的高點，避免把當天拉高的影線當成下降趨勢線第二點。
+    - P1 使用訊號日前可見區間的主要高點。
+    - P2 使用 P1 之後、訊號日前一根以前的較低主要高點。
+    - 優先挑「能形成有效下降壓力、且後續沒有被大量穿越」的 P2。
     """
     if df.empty or len(df) < 8:
         return None
 
     sd = pd.to_datetime(scan_date)
-    base = df[df.index <= sd]
+    full_len = len(df)
+
+    # 找到訊號日所在位置；P2 候選只允許在 signal_pos 之前，嚴格排除訊號日/今日高點。
+    pos_candidates = [i for i, dt in enumerate(df.index) if dt >= sd]
+    signal_pos = pos_candidates[0] if pos_candidates else full_len - 1
+    candidate_end_pos = max(0, signal_pos - 1)
+    base = df.iloc[:candidate_end_pos + 1].copy()
     if len(base) < 8:
-        base = df
+        # 資料太短時仍不使用訊號日；避免 P2 取到今日高點。
+        base = df.iloc[:max(signal_pos, 0)].copy()
+    if len(base) < 2:
+        return None
 
     def to_full_pos(ts: pd.Timestamp) -> int:
         return int(df.index.get_loc(ts))
 
-    # 候選點 = local swing high + 前幾大高價，避免最高壓力剛好不是 pivot 被漏掉。
+    # 候選點 = local swing high + 前幾大高價，避免重要壓力點剛好不是 pivot 而漏掉。
     swing_base = find_swing_highs(base, left=2, right=2)
     swing_points = [(to_full_pos(dt), dt, val) for _, dt, val in swing_base]
     top_n = min(10, len(base))
     top_points = [(to_full_pos(idx), idx, float(base.loc[idx, "High"])) for idx in base["High"].nlargest(top_n).index]
     candidates = _dedupe_points(swing_points + top_points)
+
+    # 再保險：所有候選點都必須早於訊號日/今日。
+    candidates = [p for p in candidates if p[0] < signal_pos]
     if len(candidates) < 2:
         return None
 
     price_range = max(float(df["High"].max() - df["Low"].min()), 0.01)
-    min_gap = max(5, len(df) // 10)
-    min_drop = max(price_range * 0.012, 0.01)
+    min_gap = max(4, full_len // 12)
+    min_drop = max(price_range * 0.008, 0.01)
     tolerance = max(price_range * 0.015, 0.01)
 
-    # 由最高壓力點開始嘗試。最高點可用就不再退而求其次，這能避免畫到較低、較陡的紅線。
+    # P1 優先從最高主要壓力開始嘗試。
     p1_candidates = sorted(candidates, key=lambda x: (-x[2], x[0]))
     best: Optional[Dict[str, Any]] = None
 
-    # p2 只從主要高點找，但會用 p1 之後的全部 High 檢查線是否被明顯穿越。
     for p1 in p1_candidates:
         p1_pos, _, p1_val = p1
-        if p1_pos >= len(df) - min_gap:
+        if p1_pos >= signal_pos - min_gap:
             continue
 
-        after = [p for p in candidates if p[0] >= p1_pos + min_gap and p[2] <= p1_val - min_drop]
-        if not after:
+        # P2 必須在 P1 之後、訊號日前，而且價格低於 P1。
+        p2_candidates = [
+            p for p in candidates
+            if p[0] >= p1_pos + min_gap
+            and p[0] < signal_pos
+            and p[2] <= p1_val - min_drop
+        ]
+        if not p2_candidates:
             continue
 
-        for p2 in after:
+        for p2 in p2_candidates:
             p2_pos, _, p2_val = p2
             slope = (p2_val - p1_val) / max(p2_pos - p1_pos, 1)
             if slope >= 0:
                 continue
 
-            check_end = max(to_full_pos(base.index[-1]), p2_pos)
+            # 只檢查到訊號日前一根，因為今日高點不應該影響 P2 與趨勢線選擇。
+            check_end = candidate_end_pos
             check_slice = df.iloc[p1_pos:check_end + 1]
             xs = range(p1_pos, check_end + 1)
             line_vals = [p1_val + slope * (x - p1_pos) for x in xs]
@@ -428,17 +447,26 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
             excess = [h - y for h, y in zip(highs, line_vals) if h > y + tolerance]
             violation_count = len(excess)
             max_excess = max(excess) if excess else 0.0
-            if violation_count > 2 or max_excess > tolerance * 2.5:
+            if violation_count > 3 or max_excess > tolerance * 3.0:
                 continue
 
-            # slope 是負數，越接近 0 表示線越緩，越像綠色上緣壓力線。
-            span_score = (p2_pos - p1_pos) / max(len(df), 1)
-            recent_score = p2_pos / max(len(df) - 1, 1)
+            # P2 越接近訊號日前、越能代表最近一次下降壓力；但仍需維持下降與不被大量穿越。
+            span_score = (p2_pos - p1_pos) / max(full_len, 1)
+            recent_p2_score = p2_pos / max(signal_pos - 1, 1)
             touch_bonus = 1.0 if p2 in swing_points else 0.0
-            score = slope * 1000 + span_score * 8 + recent_score * 3 + touch_bonus - violation_count * 20 - max_excess * 5
-            if best is None or score > best["score"]:
-                best = {"p1": p1, "p2": p2, "slope": slope, "score": score, "violations": violation_count}
+            # 不再偏好「過緩且把今日高點當 P2」的線；P2 已排除訊號日，並提高近期 P2 權重。
+            score = recent_p2_score * 25 + span_score * 8 + slope * 250 - violation_count * 12 - max_excess * 5 + touch_bonus
 
+            if best is None or score > best["score"]:
+                best = {
+                    "p1": p1,
+                    "p2": p2,
+                    "slope": slope,
+                    "score": score,
+                    "violations": violation_count,
+                }
+
+        # 最高 P1 找到可用線就停止，避免退回較低 P1。
         if best is not None and best["p1"] == p1:
             break
 
@@ -446,9 +474,10 @@ def detect_descending_trendline(df: pd.DataFrame, scan_date: str) -> Optional[Di
         return None
 
     p1, p2, slope = best["p1"], best["p2"], best["slope"]
-    x0, x1 = 0, len(df) - 1
+    x0, x1 = 0, full_len - 1
     y0 = p1[2] + slope * (x0 - p1[0])
     y1 = p1[2] + slope * (x1 - p1[0])
+
     return {
         "x": [df.index[x0], df.index[x1]],
         "y": [y0, y1],
@@ -518,8 +547,8 @@ def show_price_chart(row: pd.Series) -> None:
 
     trendline = detect_descending_trendline(trend, scan_date)
     if trendline:
-        fig.add_trace(go.Scatter(x=trendline["x"], y=trendline["y"], mode="lines", name="下降趨勢線", line=dict(color="#16a34a", width=3)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=[trendline["p1_date"], trendline["p2_date"]], y=[trendline["p1_val"], trendline["p2_val"]], mode="markers", name="趨勢高點", marker=dict(color="#16a34a", size=8)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=trendline["x"], y=trendline["y"], mode="lines", name="下降趨勢線", line=dict(color="#f97316", width=3)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=[trendline["p1_date"], trendline["p2_date"]], y=[trendline["p1_val"], trendline["p2_val"]], mode="markers", name="趨勢高點", marker=dict(color="#f97316", size=8)), row=1, col=1)
     horizontal = detect_horizontal_resistance(trend, scan_date)
     if horizontal:
         fig.add_hline(y=horizontal["level"], line_dash="dot", line_color="#2563eb", annotation_text=f"水平壓力 {horizontal['level']:.2f}", row=1, col=1)
