@@ -2,13 +2,14 @@
 """
 common_fubon.py
 ================
-台股資料源模組：富邦(Fubon Neo) WebSocket/REST 行情 + Yfinance 備援/批次抓取。
+台股資料源模組：富邦(Fubon Neo) WebSocket/REST 行情 + Yfinance 備援/批次抓取 + 本地SQLite。
 已整併缺失的 UI 輔助函式 (Session State, Sidebar) 與匯出工具 (Telegram, Excel)。
 """
 
 import os
 import re
 import requests
+import sqlite3
 from io import BytesIO
 from html import escape
 from datetime import datetime, date, timedelta
@@ -49,7 +50,7 @@ except Exception:
 
 
 # ==========================================
-# 1. 富邦 API 行情與基礎資料工具 (來自 Source 3)
+# 1. 富邦 API 行情與基礎資料工具
 # ==========================================
 def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFrame:
     if _sdk is None:
@@ -221,18 +222,75 @@ def download_stock_data_yfinance_today(symbol: str, today_str: str):
     except Exception:
         return pd.DataFrame()
 
-def download_stock_data_yfinance(symbol: str):
-    today_str = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d")
-    history_df = download_stock_data_yfinance_history(symbol, today_str)
-    today_df = download_stock_data_yfinance_today(symbol, today_str)
+# ==========================================
+# 新增: 本地資料庫 (SQLite) 讀取工具
+# ==========================================
+def _get_db_path():
+    if os.path.exists("twse_ohlcv.db"):
+        return "twse_ohlcv.db"
+    if os.path.exists("twse_ohlcv.dB"):
+        return "twse_ohlcv.dB"
+    return "twse_ohlcv.db"
 
-    frames = [df for df in [history_df, today_df] if df is not None and not df.empty]
-    if not frames:
+@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
+def download_stock_data_db_history(symbol: str, today_str: str):
+    """單檔股票從本地 SQLite 抓取歷史資料"""
+    db_path = _get_db_path()
+    if not os.path.exists(db_path):
         return pd.DataFrame()
-    df = pd.concat(frames, ignore_index=True)
-    if "Date" in df.columns:
-        df = df.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
-    return df.reset_index(drop=True)
+    
+    code = symbol.split(".")[0]
+    try:
+        with sqlite3.connect(db_path) as conn:
+            query = f"SELECT Date, Open, High, Low, Close, Volume FROM ohlcv_data WHERE SecurityCode='{code}'"
+            df = pd.read_sql(query, conn)
+            
+            if df.empty:
+                return pd.DataFrame()
+            
+            df["Date"] = pd.to_datetime(df["Date"]).dt.date
+            today = pd.to_datetime(today_str).date()
+            df = df[df["Date"] < today].sort_values("Date").reset_index(drop=True)
+            return df
+    except Exception as e:
+        print(f"本地資料庫讀取失敗 ({symbol}): {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=YFINANCE_HISTORY_CACHE_TTL_SEC)
+def bulk_download_db_history(symbols: tuple, today_str: str) -> dict:
+    """批次從本地 SQLite 抓取歷史資料，大幅提升全市場掃描速度"""
+    db_path = _get_db_path()
+    if not os.path.exists(db_path) or not symbols:
+        return {s: pd.DataFrame() for s in symbols}
+    
+    codes = [str(s).split(".")[0] for s in symbols]
+    placeholders = ",".join("?" * len(codes))
+    
+    try:
+        with sqlite3.connect(db_path) as conn:
+            query = f"SELECT Date, Open, High, Low, Close, Volume, SecurityCode FROM ohlcv_data WHERE SecurityCode IN ({placeholders})"
+            df = pd.read_sql(query, conn, params=codes)
+            
+            if df.empty:
+                return {s: pd.DataFrame() for s in symbols}
+            
+            df["Date"] = pd.to_datetime(df["Date"]).dt.date
+            today = pd.to_datetime(today_str).date()
+            df = df[df["Date"] < today]
+            
+            result = {}
+            grouped = df.groupby("SecurityCode")
+            for sym in symbols:
+                c = sym.split(".")[0]
+                if c in grouped.groups:
+                    sub = grouped.get_group(c)[["Date", "Open", "High", "Low", "Close", "Volume"]].sort_values("Date").reset_index(drop=True)
+                    result[sym] = sub
+                else:
+                    result[sym] = pd.DataFrame()
+            return result
+    except Exception as e:
+        print(f"本地資料庫批次讀取失敗: {e}")
+        return {s: pd.DataFrame() for s in symbols}
 
 def _split_yfinance_bulk_result(raw: pd.DataFrame, symbols: tuple) -> dict:
     result = {}
@@ -293,7 +351,7 @@ def bulk_download_yfinance_today(symbols: tuple, today_str: str) -> dict:
 
 def resolve_price_source(now_dt=None) -> str:
     mode = st.session_state.get("price_source_mode", "自動")
-    if mode in ["WebSocket", "Yfinance"]:
+    if mode in ["WebSocket", "Yfinance", "本地資料庫(twse_ohlcv.db)"]:
         return mode
     if now_dt is None:
         now_dt = datetime.now(ZoneInfo("Asia/Taipei"))
@@ -314,11 +372,10 @@ def render_price_source_selector(now_dt):
             unsafe_allow_html=True,
         )
         st.caption(
-            f"自動模式邏輯：{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 前 → "
-            f"富邦WebSocket(今日) + Yfinance(今日以前) 混合資料；"
-            f"{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 後 → 全部改用 Yfinance。"
+            f"自動模式：{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 前為富邦+Yfinance，之後全轉 Yfinance。<br>"
+            f"本地資料庫模式：歷史資料從 DB 讀取，今日資料從 Yfinance/富邦 獲取。"
         )
-        mode_options = ["自動", "WebSocket", "Yfinance"]
+        mode_options = ["自動", "WebSocket", "Yfinance", "本地資料庫(twse_ohlcv.db)"]
         selected_mode = st.radio(
             "資料來源開關",
             options=mode_options,
@@ -348,6 +405,24 @@ def download_stock_data_by_source(
         if "Date" in combined.columns:
             combined = combined.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
         return combined
+
+    if source == "本地資料庫(twse_ohlcv.db)":
+        history_df = history_map.get(symbol)
+        if history_df is None:
+            history_df = download_stock_data_db_history(symbol, today_str)
+            
+        # 今日資料優先使用富邦 (若有登入)，否則用 Yfinance 補齊
+        if _sdk is not None:
+            today_df = download_stock_data_fubon_today(symbol, _sdk, today_str)
+        else:
+            today_df = yf_today_map.get(symbol)
+            if today_df is None:
+                today_df = download_stock_data_yfinance_today(symbol, today_str)
+                
+        df = _combine(history_df, today_df)
+        if not df.empty:
+            return df
+        return pd.DataFrame()
 
     if source == "Yfinance":
         history_df = history_map.get(symbol)
@@ -401,50 +476,9 @@ def get_stock_name(symbol: str, _sdk) -> str:
     return fubon_symbol
 
 # ==========================================
-# 2. 缺失的 UI、匯出與輔助工具 (從 Source 2 補回)
+# 2. 缺失的 UI、匯出與輔助工具
 # ==========================================
 
-# ===== Telegram 工具 =====
-def send_telegram_message(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code != 200:
-            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
-    except Exception as e:
-        st.error(f"Telegram 連線失敗: {e}")
-
-def send_telegram_document(file_bytes: bytes, filename: str, caption: str = "") -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        st.error("Telegram Bot Token 或 Chat ID 尚未設定，無法推送檔案。")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
-    files = {
-        "document": (
-            filename,
-            file_bytes,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    }
-    try:
-        res = requests.post(url, data=data, files=files, timeout=20)
-        if res.status_code == 200:
-            return True
-        st.error(f"Telegram 檔案傳送失敗，API 回傳：{res.text}")
-    except Exception as e:
-        st.error(f"Telegram 檔案傳送連線失敗: {e}")
-    return False
-
-# ===== UI (Sidebar) 工具 =====
 def ensure_fubon_session_state():
     if "fubon_sdk" not in st.session_state:
         st.session_state.fubon_sdk = None
@@ -521,11 +555,10 @@ def render_price_source_selector_sidebar(now_dt):
             unsafe_allow_html=True,
         )
         st.caption(
-            f"自動模式邏輯：{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 前 → "
-            f"富邦WebSocket(今日) + Yfinance(今日以前) 混合資料；"
-            f"{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 後 → 全部改用 Yfinance。"
+            f"自動模式：{AUTO_YFINANCE_AFTER_HOUR}:{AUTO_YFINANCE_AFTER_MINUTE:02d} 前為富邦+Yfinance，之後全轉 Yfinance。<br>"
+            f"本地資料庫模式：歷史資料從 DB 讀取，今日資料從 Yfinance/富邦 獲取。"
         )
-        mode_options = ["自動", "WebSocket", "Yfinance"]
+        mode_options = ["自動", "WebSocket", "Yfinance", "本地資料庫(twse_ohlcv.db)"]
         selected_mode = st.radio(
             "資料來源開關",
             options=mode_options,
@@ -540,7 +573,6 @@ def render_price_source_selector_sidebar(now_dt):
             st.rerun()
     return active_source
 
-# ===== 格式與輔助工具 =====
 def yahoo_quote_url(symbol: str) -> str:
     fubon_symbol = str(symbol).split(".")[0]
     return f"https://tw.stock.yahoo.com/quote/{fubon_symbol}"
@@ -575,12 +607,9 @@ def apply_excel_fonts(workbook):
 
 def format_color(val):
     if isinstance(val, (int, float)):
-        if val > 0:
-            return f"🔴 +{val:.2f}%"
-        elif val < 0:
-            return f"🟢 {val:.2f}%"
-        else:
-            return f"{val:.2f}%"
+        if val > 0: return f"🔴 +{val:.2f}%"
+        elif val < 0: return f"🟢 {val:.2f}%"
+        else: return f"{val:.2f}%"
     return val
 
 def format_volume(val):
@@ -594,8 +623,7 @@ def _parse_symbol_lines(lines):
     seen = set()
     for raw_line in lines:
         line = str(raw_line).strip().replace("\ufeff", "").replace("\u3000", "")
-        if not line:
-            continue
+        if not line: continue
         symbol = re.split(r"[\s,，]+", line, maxsplit=1)[0].strip().upper()
         if not re.match(r"^[0-9A-Z]+\.(TW|TWO)$", symbol):
             continue
@@ -605,32 +633,26 @@ def _parse_symbol_lines(lines):
     return symbols
 
 def parse_stock_symbols_from_text(text: str) -> list:
-    if not text:
-        return []
+    if not text: return []
     return _parse_symbol_lines(text.splitlines())
 
 def normalize_symbol_quick(input_text: str):
     s = str(input_text).strip().upper()
-    if not s:
-        return None
-    if "." in s:
-        return s
+    if not s: return None
+    if "." in s: return s
     if s.isdigit():
-        if s.startswith(("3", "6", "8")):
-            return f"{s}.TWO"
+        if s.startswith(("3", "6", "8")): return f"{s}.TWO"
         return f"{s}.TW"
     return s
 
 def parse_manual_symbols(text: str) -> list:
-    if not text:
-        return []
+    if not text: return []
     text = text.replace("，", ",")
     tokens = []
     for raw_line in text.splitlines():
         for part in raw_line.split(","):
             part = part.strip()
-            if part:
-                tokens.append(part)
+            if part: tokens.append(part)
     symbols = []
     seen = set()
     for t in tokens:
@@ -643,28 +665,21 @@ def parse_manual_symbols(text: str) -> list:
 @st.cache_data(ttl=86400)
 def load_code_to_ticker_map(file_path: str = STOCK_NAME_FILE) -> dict:
     mapping = {}
-    if not os.path.exists(file_path):
-        return mapping
+    if not os.path.exists(file_path): return mapping
     with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
         for raw_line in f:
             line = raw_line.strip().replace("\u3000", "")
-            if not line:
-                continue
+            if not line: continue
             parts = re.split(r"[\t]+", line) if "\t" in line else line.split(None, 1)
-            if not parts:
-                continue
+            if not parts: continue
             ticker = parts[0].strip().upper()
-            if "." in ticker:
-                mapping[ticker.split(".")[0]] = ticker
+            if "." in ticker: mapping[ticker.split(".")[0]] = ticker
     return mapping
 
 def resolve_ticker_suffix(raw_code, code_map: dict = None) -> str:
     code_map = code_map or {}
     raw = str(raw_code).strip().upper()
-    if not raw:
-        return ""
-    if "." in raw:
-        return raw
-    if raw in code_map:
-        return code_map[raw]
+    if not raw: return ""
+    if "." in raw: return raw
+    if raw in code_map: return code_map[raw]
     return normalize_symbol_quick(raw) or raw
