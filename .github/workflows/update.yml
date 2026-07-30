@@ -1,0 +1,39 @@
+name: Auto Update TWSE OHLCV DB
+
+on:
+  schedule:
+    - cron: '0 9,13 * * 1-5'
+  workflow_dispatch: 
+
+jobs:
+  update-db:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write 
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas requests urllib3 openpyxl
+
+      - name: Run update script
+        env:
+          # ======== 這裡會將 GitHub Secrets 載入給 Python 使用 ========
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python update_db.py
+
+      - name: Commit and push DB changes
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add twse_ohlcv.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update twse_ohlcv.db" && git push)
