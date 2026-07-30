@@ -131,27 +131,43 @@ if __name__ == "__main__":
     # 設定台灣時區
     tw_tz = timezone(timedelta(hours=8))
     tw_now = datetime.now(tw_tz)
-    date_str = tw_now.strftime("%Y%m%d")
     
-    print(f"開始執行自動抓取: {date_str}")
-    twse_df = fetch_twse_daily(date_str)
-    time.sleep(2)
-    tpex_df = fetch_tpex_daily(date_str)
+    # 建立要抓取的日期清單 (昨天與今天)
+    dates_to_fetch = [
+        (tw_now - timedelta(days=1)).strftime("%Y%m%d"),
+        tw_now.strftime("%Y%m%d")
+    ]
     
-    daily_df = pd.concat([twse_df, tpex_df], ignore_index=True)
-    if not daily_df.empty:
-        save_to_database(daily_df)
+    summary_lines = []
+    has_valid_data = False
+    
+    for date_str in dates_to_fetch:
+        print(f"開始執行自動抓取: {date_str}")
+        twse_df = fetch_twse_daily(date_str)
+        time.sleep(2) # 稍微等待，避免請求過於頻繁
+        tpex_df = fetch_tpex_daily(date_str)
         
-        # 整理要發送的訊息並呼叫 Telegram 函數
+        daily_df = pd.concat([twse_df, tpex_df], ignore_index=True)
+        if not daily_df.empty:
+            save_to_database(daily_df)
+            msg = f"📅 {date_str}: 上市 {len(twse_df)} 檔 / 上櫃 {len(tpex_df)} 檔"
+            print(f"✅ {msg}")
+            summary_lines.append(msg)
+            has_valid_data = True
+        else:
+            msg = f"⏸️ {date_str}: 無交易資料 (可能為假日)"
+            print(msg)
+            summary_lines.append(msg)
+            
+        time.sleep(2) # 迴圈之間保護性暫停
+        
+    # 如果這兩天之中至少有一天有資料，就發送 Telegram 推播
+    if has_valid_data:
         success_msg = (
-            f"✅ <b>自動資料庫更新成功</b>\n"
-            f"📅 日期：{date_str}\n"
-            f"📈 上市：{len(twse_df)} 檔\n"
-            f"📉 上櫃：{len(tpex_df)} 檔\n"
-            f"🤖 Github Actions 已將資料推回 Repo。"
+            f"✅ <b>自動資料庫更新成功</b>\n" +
+            "\n".join(summary_lines) +
+            f"\n🤖 Github Actions 已將資料推回 Repo。"
         )
-        print(success_msg.replace("<b>", "").replace("</b>", ""))
         send_telegram_message(success_msg)
-        
     else:
-        print(f"⏸️ {date_str} 無交易資料 (可能為假日)。")
+        print("兩日皆無交易資料，不發送推播。")
