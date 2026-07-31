@@ -31,9 +31,39 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python update_db.py
 
-      - name: Commit and push DB changes
+      - name: Commit and push DB changes to CURRENT repo
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add twse_ohlcv.db
           git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update twse_ohlcv.db" && git push)
+
+      - name: Push DB to henglunlin-stock-monitor-FUBON
+        env:
+          TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+          TARGET_REPO: "henglunlin/henglunlin-stock-monitor-FUBON" 
+          TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
+        run: |
+          mkdir -p target_repo_1
+          git clone https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${TARGET_REPO}.git target_repo_1
+          cp twse_ohlcv.db target_repo_1/
+          cd target_repo_1
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add twse_ohlcv.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Sync latest twse_ohlcv.db from scanner" && git push origin ${TARGET_BRANCH})
+
+      - name: Push DB to henglunlin-stock-monitor-FUBAN
+        env:
+          TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+          TARGET_REPO: "henglunlin/henglunlin-stock-monitor-FUBAN" 
+          TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
+        run: |
+          mkdir -p target_repo_2
+          git clone https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${TARGET_REPO}.git target_repo_2
+          cp twse_ohlcv.db target_repo_2/
+          cd target_repo_2
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add twse_ohlcv.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Sync latest twse_ohlcv.db from scanner" && git push origin ${TARGET_BRANCH})
