@@ -2,7 +2,7 @@ name: Auto Update TWSE OHLCV DB
 
 on:
   schedule:
-    - cron: '0 9,13 * * 1-5'
+    - cron: '17 9,13 * * 1-5'
   workflow_dispatch: 
 
 jobs:
