@@ -906,11 +906,20 @@ if should_run_scan:
                     "訊號類型": "、".join(signal_types) if signal_types else "-", "來源": active_price_source,
                 }
                 if (not show_only_signal_rows or is_selected_signal) and passes_volume_filter: rows.append(row)
+
+                # 「漲幅達標」分頁：獨立於 SIGNAL_SCORE_MIN 訊號分數門檻之外，
+                # 只要「漲幅達標」訊號有觸發（漲跌% >= 側邊欄設定的門檻）且成交量符合下限，就列入。
+                # 「訊號分數」欄位仍會照算、照顯示在表格中，只是不再拿來當作是否列入此分頁的篩選條件。
+                if "漲幅達標" in signal_types and "漲幅達標" in selected_signal_names and passes_volume_filter:
+                    signal_buckets["漲幅達標"].append(row.copy())
+
                 if is_selected_signal:
                     all_signal_rows.append(row.copy())
                     if signal_score >= PRIORITY_SCORE_MIN: signal_buckets["優先追蹤"].append(row.copy())
                     append_signal_tracking(row, scan_today_str)
                     for sig in signal_types:
+                        if sig == "漲幅達標":
+                            continue  # 已在上面獨立處理，這裡跳過避免重複加入同一筆資料
                         if sig in signal_buckets and sig in selected_signal_names: signal_buckets[sig].append(row.copy())
 
                     if data["trend_signal"] == "趨勢突破" and data.get("trend_chart_df") is not None:
