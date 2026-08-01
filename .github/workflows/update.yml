@@ -3,7 +3,12 @@ name: Auto Update TWSE OHLCV DB
 on:
   schedule:
     - cron: '17 9,13 * * 1-5'
-  workflow_dispatch: 
+  workflow_dispatch:
+    inputs:
+      message:
+        description: '來自 Telegram 的觸發訊息'
+        required: false
+        default: 'database_update'
 
 jobs:
   update-db:
@@ -42,7 +47,7 @@ jobs:
         env:
           TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
           TARGET_REPO: "henglunlin/henglunlin-stock-monitor-FUBON" 
-          TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
+          TARGET_BRANCH: "main" 
         run: |
           mkdir -p target_repo_1
           git clone https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${TARGET_REPO}.git target_repo_1
@@ -57,7 +62,7 @@ jobs:
         env:
           TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
           TARGET_REPO: "henglunlin/henglunlin-stock-monitor-FUBAN" 
-          TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
+          TARGET_BRANCH: "main" 
         run: |
           mkdir -p target_repo_2
           git clone https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${TARGET_REPO}.git target_repo_2
