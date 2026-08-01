@@ -419,8 +419,19 @@ if start_btn and start_date <= end_date:
         if i < total_days - 1:
             time.sleep(3)
             
-    st.success(f"🎉 抓取任務完成！資料已存入 {DB_NAME}")
+    st.success(f"🎉 抓取任務完成！資料已暫存於雲端的 {DB_NAME}")
     
+    # 🌟 新增：提供下載本地端 DB 檔案的按鈕
+    if os.path.exists(DB_NAME):
+        with open(DB_NAME, "rb") as file:
+            st.download_button(
+                label="⬇️ 點此下載最新抓取的資料庫 (.db 檔)",
+                data=file,
+                file_name=f"twse_ohlcv_{datetime.today().strftime('%Y%m%d')}.db",
+                mime="application/octet-stream",
+                use_container_width=True
+            )
+            
     if all_data_frames:
         st.subheader("📊 資料庫最新入庫預覽")
         combined_df = pd.concat(all_data_frames, ignore_index=True)
