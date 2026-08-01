@@ -30,7 +30,7 @@ LOW_PRICE = "最低價"
 CLOSE_PRICE = "收盤價"
 VOLUME = "成交股數"
 
-DB_NAME = "twse_ohlcv.db"
+DB_NAME = "Data_ohlcv.db"
 
 # ==========================================
 # 2. 輔助函數
