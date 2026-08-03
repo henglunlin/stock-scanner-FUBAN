@@ -291,7 +291,7 @@ st.title("📈 台灣台股 (上市+上櫃) OHLCV 抓取與入庫系統")
 
 st.markdown("""
 這個工具會向證交所與櫃買中心 API 請求每日收盤行情，提取**所有個股的開、高、低、收與成交量**，
-並自動儲存到本地端的 `twse_ohlcv.db` 資料庫中。
+並自動儲存到本地端的 `data_ohlcv.db` 資料庫中。
 """)
 
 with st.sidebar:
@@ -345,7 +345,7 @@ with st.sidebar:
 
     # ======== 上傳多個 db 檔，整合去重後輸出一個新的 db 檔 ========
     st.header("🧩 多DB整合去重輸出")
-    st.markdown("上傳多個 `.db` 備份檔，依 **日期+市場** 自動去重覆蓋，整合成一個新的 `.db` 檔案供下載（**不會**寫入或影響本地的 `twse_ohlcv.db`）。")
+    st.markdown("上傳多個 `.db` 備份檔，依 **日期+市場** 自動去重覆蓋，整合成一個新的 `.db` 檔案供下載（**不會**寫入或影響本地的 `data_ohlcv.db`）。")
 
     merge_files = st.file_uploader(
         "選擇要整合的 .db 檔案（可多選）",
@@ -372,7 +372,7 @@ with st.sidebar:
         st.download_button(
             label="2. ⬇️ 下載整合後的 DB 檔案",
             data=st.session_state["merged_db_bytes"],
-            file_name=f"twse_ohlcv_整合_{datetime.today().strftime('%Y%m%d')}.db",
+            file_name=f"data_ohlcv_整合_{datetime.today().strftime('%Y%m%d')}.db",
             mime="application/octet-stream",
             use_container_width=True
         )
@@ -430,7 +430,7 @@ if start_btn and start_date <= end_date:
             st.download_button(
                 label="⬇️ 點此下載最新抓取的資料庫 (.db 檔)",
                 data=file,
-                file_name=f"twse_ohlcv_{datetime.today().strftime('%Y%m%d')}.db",
+                file_name=f"data_ohlcv_{datetime.today().strftime('%Y%m%d')}.db",
                 mime="application/octet-stream",
                 use_container_width=True
             )
