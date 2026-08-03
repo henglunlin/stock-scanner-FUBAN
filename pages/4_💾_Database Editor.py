@@ -183,13 +183,16 @@ def save_to_database(df: pd.DataFrame):
         # 如果資料庫已經有這些日期的資料，先將它們刪除，實現自動去重/覆蓋更新
         for d in dates:
             for m in markets:
-                conn.execute(
-                    "DELETE FROM ohlcv_data WHERE Date = ? AND Market = ?", 
-                    (str(d), m)
-                )
+                try:
+                    conn.execute(
+                        "DELETE FROM ohlcv_data WHERE Date = ? AND Market = ?", 
+                        (str(d), m)
+                    )
+                except sqlite3.OperationalError:
+                    pass  # 表尚未建立，第一次寫入時屬正常情況，直接略過刪除步驟
         conn.commit()
         
-        # 將乾淨的新資料寫入
+        # 將乾淨的新資料寫入，若表格不存在 pandas 會自動建立
         df.to_sql("ohlcv_data", conn, if_exists="append", index=False)
     finally:
         conn.close()
