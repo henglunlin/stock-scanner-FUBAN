@@ -706,6 +706,7 @@ def render_stock_detail_picker(bucket_key: str, bucket_rows: list, stock_detail_
         render_signal_detail_panel(
             matched_symbol, info.get("name", ""), info.get("chart_df"),
             info.get("signal_details", {}), info.get("signal_marks", {}),
+            key_suffix=bucket_key,
         )
     else:
         st.caption("找不到此股票的詳細訊號資料（可能來自舊的掃描結果）。")
