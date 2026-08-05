@@ -1,4 +1,4 @@
-starlette<0.40.0
+starlette==0.39.2
 streamlit>=1.40.0
 yfinance
 pandas
