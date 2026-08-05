@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.35.0  # 或直接指定最新版本
 yfinance
 pandas
 requests
@@ -8,3 +8,4 @@ fubon_neo-2.2.8-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 openpyxl
 plotly
 kaleido
+starlette<0.37.0   # 限制 starlette 的版本避免與舊 streamlit 衝突
