@@ -78,8 +78,13 @@ def build_signal_chart_figure(symbol: str, name: str, chart_df: pd.DataFrame, ma
     return fig
 
 
-def render_signal_detail_panel(symbol: str, name: str, chart_df: pd.DataFrame, signal_details: dict, signal_marks: dict):
-    """顯示「訊號說明 + K線圖」，給主程式在使用者選取股票時呼叫（滿足『股票名稱要能顯示訊號說明&K線』需求）。"""
+def render_signal_detail_panel(symbol: str, name: str, chart_df: pd.DataFrame, signal_details: dict, signal_marks: dict, key_suffix: str = ""):
+    """顯示「訊號說明 + K線圖」，給主程式在使用者選取股票時呼叫（滿足『股票名稱要能顯示訊號說明&K線』需求）。
+
+    key_suffix: 同一檔股票可能會在「全部訊號」與多個分頁的詳情查看器中重複出現，
+    plotly_chart 需要全站唯一的 key，因此呼叫端(通常是每個分頁/區塊)應傳入不同的 key_suffix
+    (例如分頁名稱)，避免 StreamlitDuplicateElementKey 錯誤。
+    """
     if signal_details:
         st.markdown("**📋 訊號說明：**")
         for label, detail in signal_details.items():
@@ -90,6 +95,7 @@ def render_signal_detail_panel(symbol: str, name: str, chart_df: pd.DataFrame, s
     all_marks = sorted({d for marks in (signal_marks or {}).values() for d in marks})
     fig = build_signal_chart_figure(symbol, name, chart_df, marks=all_marks)
     if fig is not None:
-        st.plotly_chart(fig, use_container_width=True, key=f"signal_chart_{symbol}")
+        chart_key = f"signal_chart_{symbol}_{key_suffix}" if key_suffix else f"signal_chart_{symbol}"
+        st.plotly_chart(fig, use_container_width=True, key=chart_key)
     else:
         st.caption("尚未安裝 plotly 或暫無圖表資料，無法繪製K線圖。")
