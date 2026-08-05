@@ -8,12 +8,10 @@
 import re
 import os
 import json
-import copy
 import time
 import gc
 import requests
 import base64
-import zipfile
 from html import escape
 from io import BytesIO
 from datetime import datetime
@@ -42,8 +40,6 @@ from common_fubon import (
 from signals import (
     compute_indicators,
     get_signal_registry,
-    build_signal_chart_figure,
-    render_signal_detail_panel,
 )
 
 from scoring import (
@@ -63,9 +59,7 @@ from scoring import (
 st.set_page_config(layout="wide")
 
 # ===== 常數設定 =====
-GROUP_EDIT_PIN = "1219"
 GROUPS_FILE = "stock_groups.json"
-BACKUP_DIR = "backups"
 APP_LOGO = "dog.jpg"
 
 GITHUB_DATABASE_DIR = st.secrets.get("GITHUB_DATABASE_DIR", "Database")
@@ -80,17 +74,6 @@ def open_dropdown(label: str):
 # ===== Telegram 設定 =====
 TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")  
-
-DEFAULT_STOCK_GROUPS = {
-    "權值股": [
-        "2330.TW", "00981A.TW", "2449.TW", "2317.TW", "3711.TW",
-        "6488.TWO", "2327.TW", "6176.TW", "2303.TW", "5347.TWO",
-    ],
-    "自選股1": [
-        "3008.TW", "3035.TW", "4566.TW", "4956.TW", "6456.TW",
-        "4749.TWO", "6271.TW", "6290.TWO", "4919.TW"
-    ]
-}
 
 # ===== CSS =====
 st.markdown("""
@@ -119,37 +102,9 @@ def load_stock_groups():
                 return data
         except Exception:
             pass
-    return copy.deepcopy(DEFAULT_STOCK_GROUPS)
-
-def save_stock_groups(groups):
-    with open(GROUPS_FILE, "w", encoding="utf-8") as f:
-        json.dump(groups, f, ensure_ascii=False, indent=2)
-
-def ensure_backup_dir():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-def create_backup_filename():
-    tw_now = datetime.now(ZoneInfo("Asia/Taipei"))
-    return f"stock_groups_backup_{tw_now.strftime('%Y%m%d_%H%M%S')}.json"
-
-def save_backup_snapshot(groups):
-    ensure_backup_dir()
-    filename = create_backup_filename()
-    file_path = os.path.join(BACKUP_DIR, filename)
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(groups, f, ensure_ascii=False, indent=2)
-    return file_path
-
-def list_backup_files():
-    if not os.path.exists(BACKUP_DIR): return []
-    files = []
-    for name in os.listdir(BACKUP_DIR):
-        if name.lower().endswith(".json"):
-            full_path = os.path.join(BACKUP_DIR, name)
-            if os.path.isfile(full_path):
-                files.append((name, os.path.getmtime(full_path)))
-    files.sort(key=lambda x: x[1], reverse=True)
-    return [name for name, _ in files]
+    # 股票分組現在改由「股票列表編輯器」頁面管理 stock_groups.json，
+    # 這裡找不到檔案時就回傳空字典，不再內建預設分組。
+    return {}
 
 # ===== Telegram 工具 =====
 def send_telegram_message(text: str):
@@ -288,85 +243,12 @@ def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
     output.seek(0)
     return output.getvalue()
 
-def build_signal_chart_zip_bytes(stock_detail_store: dict) -> bytes:
-    """把每檔命中訊號股票的 K線圖(含訊號標記) + 訊號說明打包成 ZIP，取代舊版僅限趨勢突破用的圖表下載。"""
-    output = BytesIO()
-    combined_sections = []
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for symbol, info in sorted((stock_detail_store or {}).items()):
-            stock_name = str(info.get("name", "") or "")
-            marks = sorted({d for m in (info.get("signal_marks") or {}).values() for d in m})
-            fig = build_signal_chart_figure(symbol, stock_name, info.get("chart_df"), marks=marks)
-            if fig is None: continue
-            safe_symbol = re.sub(r"[^0-9A-Za-z._-]+", "_", str(symbol)).strip("_") or "stock"
-            safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", stock_name).strip("_")
-            filename = f"{safe_symbol}_{safe_name}_signal.html" if safe_name else f"{safe_symbol}_signal.html"
-            zf.writestr(filename, fig.to_html(full_html=True, include_plotlyjs=True))
-            include_js = "cdn" if not combined_sections else False
-            detail_html = "<br>".join(
-                escape(f"{k}：{v}") for k, v in (info.get("signal_details") or {}).items()
-            )
-            combined_sections.append(
-                f"<section style='margin: 0 0 36px 0; padding-bottom: 24px; border-bottom: 1px solid #e5e7eb;'>"
-                f"<h2 style='font-family: Arial, Microsoft JhengHei, sans-serif;'>{symbol} {stock_name}</h2>"
-                f"<p style='font-family: Arial, Microsoft JhengHei, sans-serif; white-space: pre-line;'>{detail_html}</p>"
-                f"{fig.to_html(full_html=False, include_plotlyjs=include_js)}"
-                f"</section>"
-            )
-        if combined_sections:
-            combined_html = ("<!doctype html>\n<html lang=\"zh-Hant\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>訊號個股圖統整</title>\n</head>\n<body style=\"margin: 24px; font-family: Arial, Microsoft JhengHei, sans-serif;\">\n  <h1>訊號個股圖統整</h1>\n  <p>本檔案彙整本次掃描中所有命中訊號個股的K線圖與訊號說明。</p>\n" + "\n".join(combined_sections) + "\n</body>\n</html>")
-            zf.writestr("00_訊號個股圖統整.html", combined_html)
-    output.seek(0)
-    return output.getvalue()
-
 # ===== 輔助工具函式 =====
 def make_anchor_id(group_name: str) -> str:
     return f"group-{re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '-', group_name).strip('-')}"
 
 def yahoo_quote_url(symbol: str) -> str:
     return f"https://tw.stock.yahoo.com/quote/{str(symbol).split('.')[0]}"
-
-def normalize_symbols_from_text(text: str):
-    if not text: return []
-    text = text.replace("，", ",")
-    lines = []
-    for raw_line in text.splitlines():
-        if raw_line.strip():
-            lines.extend([p.strip().upper() for p in raw_line.split(",") if p.strip()])
-    seen, result = set(), []
-    for s in lines:
-        if s not in seen:
-            seen.add(s)
-            result.append(s)
-    return result
-
-def validate_and_normalize_group_json(data):
-    if not isinstance(data, dict) or not data: raise ValueError("JSON 格式錯誤：最外層必須是非空物件（dict）")
-    validated = {}
-    for group_name, symbols in data.items():
-        if not group_name.strip(): raise ValueError("JSON 格式錯誤：分類名稱不可為空")
-        if isinstance(symbols, list): raw_text = "\n".join(str(x) for x in symbols)
-        elif isinstance(symbols, str): raw_text = symbols
-        else: raise ValueError(f"JSON 格式錯誤：分類「{group_name}」的股票清單必須是 list 或 string")
-        validated[group_name.strip()] = normalize_symbols_from_text(raw_text)
-    if not validated: raise ValueError("JSON 內容為空")
-    return validated
-
-def normalize_symbol_quick(input_text: str):
-    s = str(input_text).strip().upper()
-    if not s: return None
-    if "." in s: return s
-    if s.isdigit(): return f"{s}.TWO" if s.startswith(("3", "6", "8")) else f"{s}.TW"
-    return s
-
-def set_next_selected_group(group_name: str):
-    st.session_state._next_selected_group = group_name
-
-def enter_edit_mode():
-    st.session_state.editing_mode = True
-
-def leave_edit_mode():
-    st.session_state.editing_mode = False
 
 def symbol_to_code(symbol: str) -> str:
     return str(symbol).split(".")[0]
@@ -408,38 +290,10 @@ if FORCE_SCAN_ALL_STOCKS_FROM_FILE:
 if "price_source_mode" not in st.session_state: st.session_state.price_source_mode = "自動"
 if "scan_enabled" not in st.session_state: st.session_state.scan_enabled = False
 if "scan_requested" not in st.session_state: st.session_state.scan_requested = False
-if "group_editor_unlocked" not in st.session_state: st.session_state.group_editor_unlocked = False
-if "editing_mode" not in st.session_state: st.session_state.editing_mode = False
 if "fubon_sdk" not in st.session_state: st.session_state.fubon_sdk = None
 if "fubon_logged_in" not in st.session_state: st.session_state.fubon_logged_in = False
-
-if "selected_group_editor" not in st.session_state:
-    group_names_init = list(st.session_state.stock_groups.keys())
-    st.session_state.selected_group_editor = group_names_init[0] if group_names_init else ""
-
-if "rename_group_input" not in st.session_state: st.session_state.rename_group_input = st.session_state.selected_group_editor
-if "symbols_text_area" not in st.session_state: st.session_state.symbols_text_area = "\n".join(st.session_state.stock_groups.get(st.session_state.selected_group_editor, []))
-if "quick_add_symbol_input" not in st.session_state: st.session_state.quick_add_symbol_input = ""
 if "notified_stocks" not in st.session_state: st.session_state.notified_stocks = set()
 if "tg_last_update_id" not in st.session_state: st.session_state.tg_last_update_id = None
-
-if "_next_selected_group" in st.session_state:
-    pending_group = st.session_state._next_selected_group
-    del st.session_state._next_selected_group
-    if pending_group in st.session_state.stock_groups:
-        st.session_state.selected_group_editor = pending_group
-        st.session_state.rename_group_input = pending_group
-        st.session_state.symbols_text_area = "\n".join(st.session_state.stock_groups.get(pending_group, []))
-
-def sync_editor_fields_from_selected_group():
-    groups = st.session_state.stock_groups
-    selected_group = st.session_state.selected_group_editor
-    if selected_group not in groups:
-        selected_group = list(groups.keys())[0] if groups else ""
-        st.session_state.selected_group_editor = selected_group
-    st.session_state.rename_group_input = selected_group
-    st.session_state.symbols_text_area = "\n".join(groups.get(selected_group, []))
-    st.session_state.editing_mode = False
 
 # ===== UI 元件 =====
 def render_auto_refresh_settings():
@@ -483,156 +337,6 @@ def render_fubon_login():
             except Exception as e:
                 st.sidebar.error(f"❌ 登入失敗: {e}")
 
-def render_group_editor_lock():
-    st.sidebar.markdown("## 🔐 分組編輯鎖")
-    if st.session_state.group_editor_unlocked:
-        st.sidebar.success("已解鎖，可編輯股票分組")
-        st.sidebar.info("為避免編輯中被重刷，分組編輯解鎖時會暫停自動更新")
-        if st.sidebar.button("鎖定編輯", key="lock_group_editor_btn", use_container_width=True):
-            st.session_state.group_editor_unlocked = False
-            leave_edit_mode()
-            st.rerun()
-        return
-    pin_input = st.sidebar.text_input("請輸入 PIN 碼以編輯分組", type="password", key="group_edit_pin_input")
-    if st.sidebar.button("解鎖編輯", key="unlock_group_editor_btn", use_container_width=True):
-        if pin_input == GROUP_EDIT_PIN:
-            st.session_state.group_editor_unlocked = True
-            enter_edit_mode()
-            st.sidebar.success("PIN 正確，已解鎖")
-            st.rerun()
-        else:
-            st.sidebar.error("PIN 錯誤")
-
-def render_stock_group_editor():
-    st.sidebar.markdown("## 🛠️ 股票分組編輯")
-    groups = st.session_state.stock_groups
-    group_names = list(groups.keys())
-    if not group_names:
-        st.session_state.stock_groups = copy.deepcopy(DEFAULT_STOCK_GROUPS)
-        groups = st.session_state.stock_groups
-        group_names = list(groups.keys())
-    if st.session_state.selected_group_editor not in group_names:
-        first_group = group_names[0]
-        st.session_state.selected_group_editor = first_group
-        st.session_state.rename_group_input = first_group
-        st.session_state.symbols_text_area = "\n".join(groups.get(first_group, []))
-
-    with st.sidebar.expander("➕ 新增分類", expanded=False):
-        new_group_name = st.text_input("分類名稱", key="new_group_name_input")
-        if st.button("新增分類", key="add_group_btn", use_container_width=True):
-            enter_edit_mode()
-            name = new_group_name.strip()
-            if not name: st.sidebar.warning("請輸入分類名稱")
-            elif name in groups: st.sidebar.warning("分類名稱已存在")
-            else:
-                groups[name] = []
-                st.session_state.stock_groups = groups
-                save_stock_groups(groups)
-                set_next_selected_group(name)
-                st.rerun()
-
-    with st.sidebar.expander("📝 編輯分類", expanded=True):
-        st.selectbox("選擇分類", options=group_names, key="selected_group_editor", on_change=sync_editor_fields_from_selected_group)
-        selected_group = st.session_state.selected_group_editor
-        new_group_name = st.text_input("分類名稱（可修改）", key="rename_group_input", on_change=enter_edit_mode)
-        symbols_text = st.text_area("股票清單（每行一檔，或逗號分隔）", height=220, key="symbols_text_area", on_change=enter_edit_mode)
-
-        st.markdown("### ⚡ 快速新增股票搜尋")
-        quick_col1, quick_col2 = st.columns([2, 1])
-        with quick_col1: quick_input = st.text_input("輸入股票代碼或 ticker", key="quick_add_symbol_input", on_change=enter_edit_mode)
-        normalized_quick_symbol = normalize_symbol_quick(quick_input)
-        if normalized_quick_symbol: st.caption(f"標準化代碼：{normalized_quick_symbol}")
-        with quick_col2:
-            if st.button("加入目前分類", key="quick_add_btn", use_container_width=True):
-                enter_edit_mode()
-                symbol = normalize_symbol_quick(quick_input)
-                if not symbol: st.warning("請輸入股票代碼")
-                else:
-                    current_list = groups.get(selected_group, [])
-                    if symbol in current_list: st.warning("此股票已存在於目前分類")
-                    else:
-                        current_list.append(symbol)
-                        groups[selected_group] = current_list
-                        st.session_state.stock_groups = groups
-                        save_stock_groups(groups)
-                        st.session_state.symbols_text_area = "\n".join(current_list)
-                        st.session_state.quick_add_symbol_input = ""
-                        st.success(f"已加入 {symbol}")
-                        st.rerun()
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 儲存分類", key="save_group_btn", use_container_width=True):
-                new_name = new_group_name.strip()
-                if not new_name: st.sidebar.warning("分類名稱不可為空")
-                elif new_name != selected_group and new_name in groups: st.sidebar.warning("分類名稱已存在，請使用其他名稱")
-                else:
-                    new_symbols = normalize_symbols_from_text(symbols_text)
-                    updated = {
-                        (new_name if k == selected_group else k): (new_symbols if k == selected_group else v)
-                        for k, v in groups.items()
-                    }
-                    st.session_state.stock_groups = updated
-                    save_stock_groups(updated)
-                    leave_edit_mode()
-                    set_next_selected_group(new_name)
-                    st.rerun()
-        with col2:
-            if st.button("🗑️ 刪除分類", key="delete_group_btn", use_container_width=True):
-                if len(groups) <= 1: st.sidebar.warning("至少保留一個分類")
-                else:
-                    groups.pop(selected_group, None)
-                    st.session_state.stock_groups = groups
-                    save_stock_groups(groups)
-                    leave_edit_mode()
-                    set_next_selected_group(list(groups.keys())[0])
-                    st.rerun()
-
-    with st.sidebar.expander("📦 備份 / 匯出 / 匯入 JSON", expanded=False):
-        export_json_str = json.dumps(st.session_state.stock_groups, ensure_ascii=False, indent=2)
-        st.download_button(label="⬇️ 匯出目前分組 JSON", data=export_json_str, file_name="stock_groups.json", mime="application/json", key="download_groups_json_btn", use_container_width=True)
-        if st.button("🗂️ 建立本地備份", key="create_local_backup_btn", use_container_width=True):
-            try: st.sidebar.success(f"已建立備份：{os.path.basename(save_backup_snapshot(st.session_state.stock_groups))}")
-            except Exception as e: st.sidebar.error(f"建立備份失敗：{e}")
-        uploaded_file = st.file_uploader("上傳股票分組 JSON", type=["json"], key="upload_groups_json_file")
-        if uploaded_file is not None:
-            st.caption("上傳後按下「匯入並覆蓋目前分組」才會生效")
-            if st.button("📥 匯入並覆蓋目前分組", key="import_groups_json_btn", use_container_width=True):
-                try:
-                    data = json.loads(uploaded_file.read().decode("utf-8"))
-                    validated = validate_and_normalize_group_json(data)
-                    save_backup_snapshot(st.session_state.stock_groups)
-                    st.session_state.stock_groups = validated
-                    save_stock_groups(validated)
-                    leave_edit_mode()
-                    set_next_selected_group(list(validated.keys())[0])
-                    st.sidebar.success("JSON 匯入成功，已覆蓋目前股票分組")
-                    st.rerun()
-                except Exception as e:
-                    st.sidebar.error(f"JSON 匯入失敗：{e}")
-
-        backups = list_backup_files()
-        if backups:
-            st.markdown("**最近備份檔**")
-            for name in backups[:5]: st.caption(name)
-        else:
-            st.caption("目前沒有本地備份檔")
-
-    with st.sidebar.expander("♻️ 重設", expanded=False):
-        if st.button("還原預設分組", key="reset_groups_btn", use_container_width=True):
-            try: save_backup_snapshot(st.session_state.stock_groups)
-            except Exception: pass
-            st.session_state.stock_groups = copy.deepcopy(DEFAULT_STOCK_GROUPS)
-            save_stock_groups(st.session_state.stock_groups)
-            leave_edit_mode()
-            set_next_selected_group(list(st.session_state.stock_groups.keys())[0])
-            st.rerun()
-
-    with st.sidebar.expander("👀 分組預覽", expanded=False):
-        for g, symbols in st.session_state.stock_groups.items():
-            st.markdown(f"**{g}**（{len(symbols)}檔）")
-            st.caption(", ".join(symbols) if symbols else "（空）")
-
 def format_color(val):
     if isinstance(val, (int, float)):
         return f"🔴 +{val:.2f}%" if val > 0 else f"🟢 {val:.2f}%" if val < 0 else f"{val:.2f}%"
@@ -652,64 +356,6 @@ def render_scan_progress_card(placeholder, pct: float, status_text: str = "掃�
         f'<div style="width: 120px; min-height: 78px; border: none; border-radius: 0; padding: 8px 10px; text-align: left; background: transparent; box-sizing: border-box;"><div style="font-size: 30px; line-height: 1; font-weight: 800;">{pct:.0f}%</div><div style="font-size: 13px; margin-top: 8px;">{status_text}</div></div>',
         unsafe_allow_html=True,
     )
-
-def render_summary_dashboard(group_up_summary, rise_threshold):
-    st.markdown("### 📌 漲幅儀表板")
-    st.caption(f"目前儀表板統計門檻：漲幅 ≥ {rise_threshold}%")
-    html_parts = ['<div class="dashboard-scroll"><div class="dashboard-grid">']
-    for item in group_up_summary:
-        group_name = escape(str(item["分類"]))
-        anchor_id = make_anchor_id(group_name)
-        hit_count = item["達標數"]
-        total_count = item["總數"]
-        up_count = item["上漲數"]
-        down_count = item["下跌數"]
-        hit_names_text = escape(str(item["達標股票名稱"]))
-        top3_html = item["前三名HTML"]
-        hit_ratio = (hit_count / total_count * 100) if total_count > 0 else 0
-        bg_color, border_color, accent_color = ("#fff1f0", "#ff7875", "#cf1322") if hit_ratio >= 60 else ("#fff7e6", "#ffa940", "#d46b08") if hit_ratio > 0 else ("#f6ffed", "#95de64", "#389e0d")
-        
-        html_parts.append(
-            f'<a href="#{anchor_id}" class="dashboard-link"><div class="dashboard-card" style="background-color:{bg_color}; border:1px solid {border_color}; cursor:pointer;">'
-            f'<div class="dashboard-title">{group_name}</div><div class="dashboard-main" style="color:{accent_color};">{hit_count} / {total_count}</div>'
-            f'<div class="dashboard-sub">漲幅達標比例（≥{rise_threshold}%）：{hit_ratio:.0f}%</div><div class="dashboard-detail">'
-            f'🎯 達標：<b>{hit_count}</b> 檔（{hit_names_text}）<br>🔴 一般上漲：<b>{up_count}</b><br>🟢 下跌：<b>{down_count}</b></div>'
-            f'<div class="dashboard-extra">▶ {top3_html}</div></div></a>'
-        )
-    html_parts.append("</div></div>")
-    st.markdown("".join(html_parts), unsafe_allow_html=True)
-
-def render_stock_detail_picker(bucket_key: str, bucket_rows: list, stock_detail_store: dict):
-    """
-    「股票名稱」詳情查看器：選擇股票後顯示訊號說明 + K線圖。
-    對應需求：訊號產生的列表「股票名稱」要能顯示訊號說明 & K線。
-    """
-    if not bucket_rows:
-        return
-    st.markdown("##### 🔍 個股訊號說明 + K線")
-    bucket_df = pd.DataFrame(bucket_rows).drop_duplicates(subset=["代碼"])
-    option_map = {}
-    for _, r in bucket_df.iterrows():
-        code_only = str(r["代碼網址"]).split("/")[-1]
-        option_map[f"{code_only} {r.get('股票名稱', '')}"] = code_only
-    if not option_map:
-        return
-    picked_label = st.selectbox(
-        "選擇股票查看訊號說明與K線圖",
-        options=list(option_map.keys()),
-        key=f"detail_picker_{bucket_key}",
-    )
-    picked_code = option_map[picked_label]
-    matched_symbol = next((s for s in stock_detail_store if s.split(".")[0] == picked_code), None)
-    if matched_symbol:
-        info = stock_detail_store[matched_symbol]
-        render_signal_detail_panel(
-            matched_symbol, info.get("name", ""), info.get("chart_df"),
-            info.get("signal_details", {}), info.get("signal_marks", {}),
-            key_suffix=bucket_key,
-        )
-    else:
-        st.caption("找不到此股票的詳細訊號資料（可能來自舊的掃描結果）。")
 
 # ==================== 主畫面開始 ====================
 st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
@@ -741,9 +387,7 @@ if FORCE_SCAN_ALL_STOCKS_FROM_FILE:
     st.sidebar.success(f"✅ 全市場掃描模式：已從 {STOCK_SCAN_FILE} 載入 {all_symbols_count} 檔股票")
     st.sidebar.caption("此模式會忽略 stock_groups.json 與手動分組，直接掃描 txt 內全部股票。")
 else:
-    render_group_editor_lock()
-    if st.session_state.group_editor_unlocked: render_stock_group_editor()
-    else: st.sidebar.info("目前為唯讀模式：輸入 PIN 後才能修改股票分組")
+    st.sidebar.caption(f"股票分組共 {len(st.session_state.stock_groups)} 組，請至「股票列表編輯器」頁面新增/編輯。")
 
 st.caption(f"更新時間：{tw_now.strftime('%Y-%m-%d %H:%M:%S')}｜價格來源：{active_price_source}")
 
@@ -842,7 +486,6 @@ if should_run_scan:
     signal_buckets = {"優先追蹤": []}
     for _cfg in signal_registry.values():
         signal_buckets.setdefault(_cfg["label"], [])
-    stock_detail_store = {}   # 存放每檔命中訊號股票的 K線資料 + 訊號說明，供「股票名稱」詳情查看器使用
     missing_stock_details = []
     fetch_errors = {}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
@@ -937,15 +580,6 @@ if should_run_scan:
                 }
                 if (not show_only_signal_rows or is_selected_signal) and passes_volume_filter: rows.append(row)
 
-                if signal_types:
-                    # 儲存個股訊號詳情(K線+訊號說明)，供表格下方的「股票名稱」詳情查看器使用
-                    stock_detail_store[symbol] = {
-                        "name": stock_name,
-                        "chart_df": data["chart_df"],
-                        "signal_details": data["signal_details"],
-                        "signal_marks": data["signal_marks"],
-                    }
-
                 # 「漲幅達標」分頁：獨立於 SIGNAL_SCORE_MIN 訊號分數門檻之外，
                 # 只要「漲幅達標」訊號有觸發（漲跌% >= 側邊欄設定的門檻）且成交量符合下限，就列入。
                 # 「訊號分數」欄位仍會照算、照顯示在表格中，只是不再拿來當作是否列入此分頁的篩選條件。
@@ -984,7 +618,7 @@ if should_run_scan:
 
     st.session_state.last_scan_result = {
         "group_tables": group_tables, "group_up_summary": group_up_summary, "all_signal_rows": all_signal_rows,
-        "signal_buckets": signal_buckets, "stock_detail_store": stock_detail_store, "missing_stock_details": missing_stock_details,
+        "signal_buckets": signal_buckets, "missing_stock_details": missing_stock_details,
         "fetch_errors": fetch_errors, "excel_filename": f"TWstock_signal_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
         "scan_completed_at": tw_now.strftime('%Y-%m-%d %H:%M:%S'), "progress_pct": 100, "min_volume_lots": min_volume_lots,
     }
@@ -1002,7 +636,6 @@ else:
     for _cfg in signal_registry.values():
         default_signal_buckets.setdefault(_cfg["label"], [])
     signal_buckets = last_scan_result.get("signal_buckets", default_signal_buckets)
-    stock_detail_store = last_scan_result.get("stock_detail_store", {})
     missing_stock_details = last_scan_result.get("missing_stock_details", [])
     fetch_errors = last_scan_result.get("fetch_errors", {})
     render_scan_progress_card(scan_progress_card_placeholder, last_scan_result.get("progress_pct", 100), "掃描進度")
@@ -1016,9 +649,6 @@ with scan_action_placeholder.container():
         with open_dropdown("📁 Download"):
             st.caption("下載 / 推播 / GitHub 上傳")
             st.download_button("下載 Excel", data=excel_bytes, file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-            if stock_detail_store:
-                chart_zip_bytes = build_signal_chart_zip_bytes(stock_detail_store)
-                st.download_button("下載全部訊號K線圖(ZIP)", data=chart_zip_bytes, file_name=f"signal_charts_{tw_now.strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", use_container_width=True)
             if st.button("推送到 Telegram", use_container_width=True):
                 if send_telegram_document(excel_bytes, excel_filename, caption=f"TWstock 訊號掃描結果｜成交量下限 {st.session_state.get('last_scan_result', {}).get('min_volume_lots', min_volume_lots)} 張｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}"):
                     st.success("已將 Excel 推送到 Telegram。")
@@ -1072,8 +702,6 @@ if all_signal_rows:
         "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
     })
 
-    render_stock_detail_picker("全部訊號", all_signal_rows, stock_detail_store)
-    
     st.markdown("### 📑 依訊號分頁查看")
     signal_tab_specs = [("優先追蹤", "優先追蹤")] + [(cfg["label"], cfg["label"]) for cfg in signal_registry.values()]
     signal_tabs = st.tabs([f"{name}（{len(pd.DataFrame(signal_buckets.get(key, [])).drop_duplicates(subset=['代碼'])) if signal_buckets.get(key) else 0}）" for name, key in signal_tab_specs])
@@ -1095,15 +723,11 @@ if all_signal_rows:
                     "股票名稱": st.column_config.TextColumn("股票名稱"),
                     "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
                 })
-
-                render_stock_detail_picker(bucket_key, bucket_rows, stock_detail_store)
             else:
                 st.caption(f"目前沒有符合「{display_name}」的股票。")
 else:
     st.info("目前沒有掃描到符合勾選條件的股票。")
 
-st.divider()
-render_summary_dashboard(group_up_summary, rise_threshold)
 st.divider()
 
 for group_name, info in group_tables.items():
@@ -1124,6 +748,6 @@ for group_name, info in group_tables.items():
     })
     st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
 
-if (st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode):
+if st.session_state.auto_refresh_enabled:
     time.sleep(max(1, int(st.session_state.get("refresh_sec", REFRESH_SEC))))
     st.rerun()
