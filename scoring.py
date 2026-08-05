@@ -2,8 +2,10 @@
 scoring.py
 =======
 二階段過濾：訊號品質評分 / 優先追蹤排序 / 訊號追蹤紀錄。
-獨立成模組方便日後單獨調整評分規則（例如新增/修改某個評分項目的權重），
-不需要動到 app.py 的主流程與 UI 程式碼。
+※ 改版重點：原本綁在日/週KD、MACD、趨勢突破上的評分邏輯，
+   已隨著這些訊號被移除而拿掉，改成依「本次觸發的訊號清單(含買/賣方向)」評分。
+   下面的 SIGNAL_BASE_WEIGHT 可依實際回測結果自行調整每個訊號的權重，
+   不影響其他評分邏輯，也不需要更動主程式。
 """
 
 import os
@@ -16,6 +18,28 @@ LOCAL_DATABASE_DIR = st.secrets.get("LOCAL_DATABASE_DIR", "Database")
 TRACKING_FILE = os.path.join(LOCAL_DATABASE_DIR, "signal_tracking.csv")
 SIGNAL_SCORE_MIN = float(st.secrets.get("SIGNAL_SCORE_MIN", 55))
 PRIORITY_SCORE_MIN = float(st.secrets.get("PRIORITY_SCORE_MIN", 65))
+
+# 各訊號基礎權重：買進型態給正分、賣出/風險型態給負分。
+# key 為 signal_module 訊號的「label」(顯示名稱)，可自行調整。
+SIGNAL_BASE_WEIGHT = {
+    "漲幅達標": 6,
+    "KD高腳": 12,
+    "周1K": 15,
+    "三白兵": 12,
+    "布林縮窄突破": 15,
+    "3K反轉": 12,
+    "巧妙點": 14,
+    "雙跳空": 10,
+    "單跳空": 6,
+    "漲停": 15,
+    "雙漲停": 18,
+    "廣義上升三法": 15,
+    "島狀反轉": 15,
+    "跌停": -20,
+    "移動停利": -15,
+    "廣義下降三法": -18,
+    "反向島狀": -18,
+}
 
 
 def ensure_local_database_dir():
@@ -42,7 +66,14 @@ def classify_signal_grade(score):
     return "D過濾"
 
 
-def calc_signal_quality_score(data, signal_types):
+def calc_signal_quality_score(data, signal_types, signal_kinds=None):
+    """
+    data: compute_indicators() 回傳的 dict
+          (需含 ma_range / ma_trend / rs_raw / volume_lots / pct / volatility_pct)
+    signal_types: 本次觸發的訊號「名稱」清單 (例如 ["KD高腳", "雙跳空"])
+    signal_kinds: {訊號名稱: "buy"/"sell"}，用於買賣方向修正 (可不傳，僅影響下方第6、7項)
+    """
+    signal_kinds = signal_kinds or {}
     score = 0
 
     # 1. 價格位置：避免接刀
@@ -65,7 +96,7 @@ def calc_signal_quality_score(data, signal_types):
     elif ma_trend == "空頭":
         score -= 10
 
-    # 2. 相對強度：優先抓比大盤 / 族群強的股票
+    # 2. 相對強度：優先抓比大盤/族群強的股票
     rs = safe_float(data.get("rs_raw", 0))
     if rs >= 5:
         score += 20
@@ -77,70 +108,13 @@ def calc_signal_quality_score(data, signal_types):
         score -= 10
 
     # 3. 量能確認
-    vol_ratio = safe_float(data.get("trend_vol_ratio", 0))
     volume_lots = safe_float(data.get("volume_lots", 0))
-
     if volume_lots >= 3000:
         score += 8
     elif volume_lots >= 1000:
         score += 4
 
-    if vol_ratio >= 2:
-        score += 12
-    elif vol_ratio >= 1.2:
-        score += 6
-
-    # 4. KD 位置：避免太高追價，也避免太弱接刀
-    k = safe_float(data.get("k", 0))
-    d = safe_float(data.get("d", 0))
-    if 35 <= k <= 75 and k > d:
-        score += 12
-    elif k > 85:
-        score -= 8
-    elif k < 15:
-        score -= 6
-
-    # 5. 日KD 交叉訊號：黃金交叉 / 即將黃金交叉 / 死亡交叉
-    # （與週KD邏輯對稱，用 signals 模組寫入 data["kd_signal"] 的字串判斷）
-    day_kd_signal = data.get("kd_signal", "")
-    if day_kd_signal == "黃金交叉":
-        score += 15
-    elif day_kd_signal == "即將黃金交叉":
-        score += 8
-    elif day_kd_signal == "死亡交叉":
-        score -= 5
-
-    # 6. 週KD：週線方向比日線更重要
-    week_signal = data.get("week_kd_signal", "")
-    if week_signal == "黃金交叉":
-        score += 15
-    elif week_signal == "即將黃金交叉":
-        score += 8
-    elif week_signal == "超賣":
-        score -= 5
-
-    # 7. MACD
-    macd_hist = safe_float(data.get("macd_hist", 0))
-    macd_signal = data.get("macd_signal", "")
-    if macd_signal == "MACD翻正":
-        score += 12
-    elif macd_hist > 0:
-        score += 6
-    elif macd_hist < 0:
-        score -= 5
-
-    # 8. 趨勢突破品質
-    if data.get("trend_signal") == "趨勢突破":
-        score += 20
-
-    touch_count = safe_float(data.get("trend_touch_count", 0))
-    violations = safe_float(data.get("trend_violations", 0))
-    if touch_count >= 2 and violations == 0:
-        score += 8
-    elif violations > 0:
-        score -= 10
-
-    # 9. 避免暴衝過熱
+    # 4. 避免暴衝過熱 / 波動過大
     pct = safe_float(data.get("pct", 0))
     volatility = safe_float(data.get("volatility_pct", 0))
     if pct >= 8:
@@ -153,23 +127,21 @@ def calc_signal_quality_score(data, signal_types):
     elif volatility <= 8:
         score += 4
 
-    # 10. 訊號共振：多個訊號同時出現，比單一訊號可靠
-    unique_signal_count = len(set(signal_types))
-    if unique_signal_count >= 3:
+    # 5. 訊號本身的基礎權重 (買進型態加分、賣出/風險型態扣分)
+    for sig in signal_types:
+        score += SIGNAL_BASE_WEIGHT.get(sig, 0)
+
+    # 6. 訊號共振：多個「買進型態」訊號同時出現，比單一訊號可靠
+    buy_signals = {s for s in signal_types if signal_kinds.get(s, "buy") == "buy"}
+    if len(buy_signals) >= 3:
         score += 12
-    elif unique_signal_count == 2:
+    elif len(buy_signals) == 2:
         score += 6
 
-    # 11. 特殊修正：避免空頭弱反彈被誤判成強訊號
-    if "即將黃金交叉" in signal_types:
-        if ma_trend == "空頭" and ma_range == "<MA20":
-            score -= 20
-
-    if "黃金交叉" in signal_types:
-        if ma_range in [">MA5", "MA5~10"]:
-            score += 10
-        elif ma_range == "<MA20":
-            score -= 10
+    # 7. 買賣訊號同時出現：代表當下同時有出場/風險警示，降低追蹤分數
+    sell_signals = {s for s in signal_types if signal_kinds.get(s) == "sell"}
+    if sell_signals and buy_signals:
+        score -= 10
 
     return max(0, min(100, round(score, 1)))
 
@@ -189,7 +161,7 @@ def build_priority_rows(all_signal_rows, min_score=None):
         key=lambda r: (
             safe_float(r.get("訊號分數", 0)),
             safe_float(r.get("RS加權報酬%", 0)),
-            safe_float(r.get("量能倍數", 0)),
+            safe_float(r.get("成交量(張)", 0)),
         ),
         reverse=True,
     )
@@ -199,10 +171,8 @@ def append_signal_tracking(row, scan_date, tracking_file=TRACKING_FILE):
     ensure_local_database_dir()
     base_cols = [
         "scan_date", "代碼", "股票名稱", "entry_price",
-        "訊號類型", "訊號分數", "追蹤等級",
-        "RS加權報酬%", "MA位置", "MA排列",
-        "K值", "D值", "週K值", "週D值",
-        "MACD柱", "趨勢突破", "量能倍數",
+        "訊號類型", "訊號方向", "訊號分數", "追蹤等級",
+        "RS加權報酬%", "MA位置", "MA排列", "成交量(張)",
         "status",
     ]
     new_record = {
@@ -211,18 +181,13 @@ def append_signal_tracking(row, scan_date, tracking_file=TRACKING_FILE):
         "股票名稱": row.get("股票名稱"),
         "entry_price": row.get("價格"),
         "訊號類型": row.get("訊號類型"),
+        "訊號方向": row.get("訊號方向"),
         "訊號分數": row.get("訊號分數"),
         "追蹤等級": row.get("追蹤等級"),
         "RS加權報酬%": row.get("RS加權報酬%"),
         "MA位置": row.get("MA位置"),
         "MA排列": row.get("MA排列"),
-        "K值": row.get("K值"),
-        "D值": row.get("D值"),
-        "週K值": row.get("週K值"),
-        "週D值": row.get("週D值"),
-        "MACD柱": row.get("MACD柱"),
-        "趨勢突破": row.get("趨勢突破"),
-        "量能倍數": row.get("量能倍數"),
+        "成交量(張)": row.get("成交量(張)"),
         "status": "tracking",
     }
 
