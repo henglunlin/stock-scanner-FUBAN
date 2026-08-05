@@ -41,13 +41,10 @@ from common_fubon import (
 )
 from signals import (
     compute_indicators,
-    plot_trend_breakout_chart,
-    TREND_VOL_RATIO_MIN,
+    get_signal_registry,
+    build_signal_chart_figure,
+    render_signal_detail_panel,
 )
-try:
-    from signals import build_trend_breakout_chart_figure
-except ImportError:
-    from signals.trend_breakout import build_trend_breakout_chart_figure
 
 from scoring import (
     LOCAL_DATABASE_DIR,
@@ -259,7 +256,7 @@ def upload_tracking_file_to_github(commit_suffix: str = "") -> bool:
 
 # ===== Excel 匯出工具 =====
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "MA位置", "MA排列", "訊號方向", "訊號類型", "訊號說明", "來源"]
     if not rows: return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
     if "代碼網址" in df.columns: df.drop(columns=["代碼網址"], inplace=True)
@@ -284,34 +281,41 @@ def apply_excel_fonts(workbook):
 def build_signal_excel_bytes(signal_buckets: dict) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for tab_name in ["優先追蹤", "漲幅達標", "跳空", "黃金交叉", "即將黃金交叉", "週黃金交叉", "週即將黃金交叉", "MACD翻正", "趨勢突破"]:
-            normalize_rows_for_excel(signal_buckets.get(tab_name, [])).to_excel(writer, sheet_name=tab_name, index=False)
+        for tab_name, rows in signal_buckets.items():
+            sheet_name = str(tab_name)[:31]  # Excel 分頁名稱長度限制為 31 字元
+            normalize_rows_for_excel(rows).to_excel(writer, sheet_name=sheet_name, index=False)
         apply_excel_fonts(writer.book)
     output.seek(0)
     return output.getvalue()
 
-def build_trend_chart_zip_bytes(trend_chart_store: dict) -> bytes:
+def build_signal_chart_zip_bytes(stock_detail_store: dict) -> bytes:
+    """把每檔命中訊號股票的 K線圖(含訊號標記) + 訊號說明打包成 ZIP，取代舊版僅限趨勢突破用的圖表下載。"""
     output = BytesIO()
     combined_sections = []
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for symbol, chart_info in sorted((trend_chart_store or {}).items()):
-            stock_name = str(chart_info.get("name", "") or "")
-            fig = build_trend_breakout_chart_figure(symbol, stock_name, chart_info)
+        for symbol, info in sorted((stock_detail_store or {}).items()):
+            stock_name = str(info.get("name", "") or "")
+            marks = sorted({d for m in (info.get("signal_marks") or {}).values() for d in m})
+            fig = build_signal_chart_figure(symbol, stock_name, info.get("chart_df"), marks=marks)
             if fig is None: continue
             safe_symbol = re.sub(r"[^0-9A-Za-z._-]+", "_", str(symbol)).strip("_") or "stock"
             safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", stock_name).strip("_")
-            filename = f"{safe_symbol}_{safe_name}_trend_breakout.html" if safe_name else f"{safe_symbol}_trend_breakout.html"
+            filename = f"{safe_symbol}_{safe_name}_signal.html" if safe_name else f"{safe_symbol}_signal.html"
             zf.writestr(filename, fig.to_html(full_html=True, include_plotlyjs=True))
             include_js = "cdn" if not combined_sections else False
+            detail_html = "<br>".join(
+                escape(f"{k}：{v}") for k, v in (info.get("signal_details") or {}).items()
+            )
             combined_sections.append(
                 f"<section style='margin: 0 0 36px 0; padding-bottom: 24px; border-bottom: 1px solid #e5e7eb;'>"
                 f"<h2 style='font-family: Arial, Microsoft JhengHei, sans-serif;'>{symbol} {stock_name}</h2>"
+                f"<p style='font-family: Arial, Microsoft JhengHei, sans-serif; white-space: pre-line;'>{detail_html}</p>"
                 f"{fig.to_html(full_html=False, include_plotlyjs=include_js)}"
                 f"</section>"
             )
         if combined_sections:
-            combined_html = ("<!doctype html>\n<html lang=\"zh-Hant\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>趨勢突破全部圖統整</title>\n</head>\n<body style=\"margin: 24px; font-family: Arial, Microsoft JhengHei, sans-serif;\">\n  <h1>趨勢突破全部圖統整</h1>\n  <p>本檔案彙整本次掃描中所有「趨勢突破」個股圖表。</p>\n" + "\n".join(combined_sections) + "\n</body>\n</html>")
-            zf.writestr("00_趨勢突破_全部圖統整.html", combined_html)
+            combined_html = ("<!doctype html>\n<html lang=\"zh-Hant\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>訊號個股圖統整</title>\n</head>\n<body style=\"margin: 24px; font-family: Arial, Microsoft JhengHei, sans-serif;\">\n  <h1>訊號個股圖統整</h1>\n  <p>本檔案彙整本次掃描中所有命中訊號個股的K線圖與訊號說明。</p>\n" + "\n".join(combined_sections) + "\n</body>\n</html>")
+            zf.writestr("00_訊號個股圖統整.html", combined_html)
     output.seek(0)
     return output.getvalue()
 
@@ -418,8 +422,6 @@ if "symbols_text_area" not in st.session_state: st.session_state.symbols_text_ar
 if "quick_add_symbol_input" not in st.session_state: st.session_state.quick_add_symbol_input = ""
 if "notified_stocks" not in st.session_state: st.session_state.notified_stocks = set()
 if "tg_last_update_id" not in st.session_state: st.session_state.tg_last_update_id = None
-if "trend_charts_collapsed" not in st.session_state: st.session_state.trend_charts_collapsed = True
-if "trend_charts_collapse_version" not in st.session_state: st.session_state.trend_charts_collapse_version = 0
 
 if "_next_selected_group" in st.session_state:
     pending_group = st.session_state._next_selected_group
@@ -566,7 +568,10 @@ def render_stock_group_editor():
                 elif new_name != selected_group and new_name in groups: st.sidebar.warning("分類名稱已存在，請使用其他名稱")
                 else:
                     new_symbols = normalize_symbols_from_text(symbols_text)
-                    updated = {new_name if k == selected_group else k: v for k, v in groups.items()}
+                    updated = {
+                        (new_name if k == selected_group else k): (new_symbols if k == selected_group else v)
+                        for k, v in groups.items()
+                    }
                     st.session_state.stock_groups = updated
                     save_stock_groups(updated)
                     leave_edit_mode()
@@ -633,20 +638,6 @@ def format_color(val):
         return f"🔴 +{val:.2f}%" if val > 0 else f"🟢 {val:.2f}%" if val < 0 else f"{val:.2f}%"
     return val
 
-def format_k(val):
-    if isinstance(val, (int, float)):
-        return f"🔴 {val:.1f}" if val >= 74 else f"🟡 {val:.1f}" if val >= 50 else f"🟢 {val:.1f}"
-    return val
-
-def format_gap(val): return "🔴 跳空" if val == "跳空" else "-"
-
-def format_trend(val): return "🔥 突破" if val == "趨勢突破" else "-"
-
-def format_vol_ratio(val):
-    try: v = float(val)
-    except (TypeError, ValueError): return "-"
-    return f"🔥 {v:.2f}x" if v >= TREND_VOL_RATIO_MIN else f"{v:.2f}x"
-
 def format_volume(val):
     try: return f"{float(val):,.1f}"
     except Exception: return val
@@ -688,6 +679,37 @@ def render_summary_dashboard(group_up_summary, rise_threshold):
     html_parts.append("</div></div>")
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
+def render_stock_detail_picker(bucket_key: str, bucket_rows: list, stock_detail_store: dict):
+    """
+    「股票名稱」詳情查看器：選擇股票後顯示訊號說明 + K線圖。
+    對應需求：訊號產生的列表「股票名稱」要能顯示訊號說明 & K線。
+    """
+    if not bucket_rows:
+        return
+    st.markdown("##### 🔍 個股訊號說明 + K線")
+    bucket_df = pd.DataFrame(bucket_rows).drop_duplicates(subset=["代碼"])
+    option_map = {}
+    for _, r in bucket_df.iterrows():
+        code_only = str(r["代碼網址"]).split("/")[-1]
+        option_map[f"{code_only} {r.get('股票名稱', '')}"] = code_only
+    if not option_map:
+        return
+    picked_label = st.selectbox(
+        "選擇股票查看訊號說明與K線圖",
+        options=list(option_map.keys()),
+        key=f"detail_picker_{bucket_key}",
+    )
+    picked_code = option_map[picked_label]
+    matched_symbol = next((s for s in stock_detail_store if s.split(".")[0] == picked_code), None)
+    if matched_symbol:
+        info = stock_detail_store[matched_symbol]
+        render_signal_detail_panel(
+            matched_symbol, info.get("name", ""), info.get("chart_df"),
+            info.get("signal_details", {}), info.get("signal_marks", {}),
+        )
+    else:
+        st.caption("找不到此股票的詳細訊號資料（可能來自舊的掃描結果）。")
+
 # ==================== 主畫面開始 ====================
 st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 
@@ -726,6 +748,9 @@ st.caption(f"更新時間：{tw_now.strftime('%Y-%m-%d %H:%M:%S')}｜價格來�
 
 rise_threshold = st.number_input("儀表板漲幅達標門檻 (%)", min_value=0.0, max_value=10.0, value=7.0, step=0.5, format="%.2f")
 
+# 訊號登記表：來自 signal_module/ 底下的可編輯訊號檔案 (可到「🛠️ 訊號編輯」分頁調整)
+signal_registry = get_signal_registry()
+
 st.markdown("### 🎯 掃描條件")
 scan_btn_col1, scan_btn_col2, scan_setting_col, scan_status_col = st.columns([0.9, 0.9, 1.25, 5.95])
 with scan_btn_col1:
@@ -741,14 +766,16 @@ with scan_btn_col2:
         st.rerun()
 with scan_setting_col:
     with open_dropdown("⚙️ Setting"):
-        st.caption("掃描條件設定")
+        st.caption("掃描條件設定（訊號清單可到「🛠️ 訊號編輯」分頁新增/修改/停用）")
         show_only_signal_rows = st.toggle("只顯示訊號股票", value=True, key="setting_show_only_signal_rows")
-        include_gain_threshold_filter = st.checkbox("漲幅達標", value=True, key="setting_include_gain_threshold_filter")
-        include_gap_signal_filter = st.checkbox("跳空", value=True, key="setting_include_gap_signal_filter")
-        include_kd_signal_filter = st.checkbox("黃金交叉 / 即將黃金交叉", value=True, key="setting_include_kd_signal_filter")
-        include_week_kd_signal_filter = st.checkbox("週KD 黃金交叉 / 即將黃金交叉", value=True, key="setting_include_week_kd_signal_filter")
-        include_macd_signal_filter = st.checkbox("MACD翻正", value=True, key="setting_include_macd_signal_filter")
-        include_trend_signal_filter = st.checkbox("趨勢突破", value=True, key="setting_include_trend_signal_filter")
+        for sig_key, cfg in signal_registry.items():
+            kind_tag = "🟢買" if cfg.get("kind", "buy") == "buy" else "🔴賣"
+            st.checkbox(
+                f"{kind_tag} {cfg['label']}",
+                value=True,
+                key=f"setting_include_signal_{sig_key}",
+                help=cfg.get("description", ""),
+            )
         min_volume_lots = st.number_input("成交量(張)下限", min_value=0, value=1000, step=100, key="setting_min_volume_lots")
 with scan_status_col:
     scan_action_placeholder = st.empty()
@@ -758,14 +785,12 @@ elif "last_scan_result" in st.session_state:
     st.caption(f"✅ 掃描狀態：已完成，上次完成時間：{st.session_state.last_scan_result.get('scan_completed_at', '-')}｜成交量下限：{st.session_state.last_scan_result.get('min_volume_lots', 1000)} 張")
 else: st.caption("⚪ 掃描狀態：已停止，按「開始掃描」才會抓取資料。")
 
-selected_signal_names = []
-if include_gain_threshold_filter: selected_signal_names.append("漲幅達標")
-if include_gap_signal_filter: selected_signal_names.append("跳空")
-if include_kd_signal_filter: selected_signal_names.extend(["黃金交叉", "即將黃金交叉"])
-if include_week_kd_signal_filter: selected_signal_names.extend(["週黃金交叉", "週即將黃金交叉"])
-if include_macd_signal_filter: selected_signal_names.append("MACD翻正")
-if include_trend_signal_filter: selected_signal_names.append("趨勢突破")
-    
+selected_signal_keys = [
+    sig_key for sig_key in signal_registry
+    if st.session_state.get(f"setting_include_signal_{sig_key}", True)
+]
+selected_signal_names = [signal_registry[k]["label"] for k in selected_signal_keys]
+
 if not selected_signal_names: st.warning("請至少勾選一種掃描訊號，否則不會列出訊號股票。")
 
 if active_price_source == "WebSocket" and not st.session_state.fubon_logged_in:
@@ -813,8 +838,10 @@ if should_run_scan:
     group_tables = {}
     group_up_summary = []
     all_signal_rows = []
-    signal_buckets = {"優先追蹤": [], "漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []}
-    trend_chart_store = {}
+    signal_buckets = {"優先追蹤": []}
+    for _cfg in signal_registry.values():
+        signal_buckets.setdefault(_cfg["label"], [])
+    stock_detail_store = {}   # 存放每檔命中訊號股票的 K線資料 + 訊號說明，供「股票名稱」詳情查看器使用
     missing_stock_details = []
     fetch_errors = {}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
@@ -863,13 +890,12 @@ if should_run_scan:
 
                 price = get_last_price_by_source(symbol, df, st.session_state.fubon_sdk, active_price_source)
                 stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
-                data = compute_indicators(df, price, symbol=symbol, rise_threshold=rise_threshold)
+                data = compute_indicators(df, price, symbol=symbol, name=stock_name, rise_threshold=rise_threshold)
 
-                signal_types = []
-                for _sig_name, _sig_result in data["signal_results"].items():
-                    signal_types.extend(_sig_result.get("labels", []))
+                signal_types = data["signal_types"]
+                signal_kinds = data["signal_kinds"]
 
-                signal_score = calc_signal_quality_score(data, signal_types)
+                signal_score = calc_signal_quality_score(data, signal_types, signal_kinds)
                 signal_grade = classify_signal_grade(signal_score)
                 passes_volume_filter = float(data.get("volume_lots", 0)) >= float(min_volume_lots)
                 is_selected_signal = any(sig in selected_signal_names for sig in signal_types) and passes_volume_filter and signal_score >= SIGNAL_SCORE_MIN
@@ -877,12 +903,11 @@ if should_run_scan:
                 if (data["pct"] >= 5 or is_selected_signal) and passes_volume_filter:
                     notify_key = f"{symbol}_{tw_now.strftime('%Y-%m-%d')}"
                     if can_push_now and (notify_key not in st.session_state.notified_stocks):
+                        signal_type_text = "、".join(signal_types) if signal_types else "-"
                         msg = (f"🔔 <b>全市場掃描訊號：{stock_name} (<a href='https://tw.stock.yahoo.com/quote/{symbol.split('.')[0]}'>{symbol}</a>)</b>\n\n"
                                f"📈 價格：{data['price']}\n🔥 漲幅：{data['pct']}%\n📦 成交量：{data['volume_lots']:,.1f} 張\n"
                                f"⭐ 訊號分數：{signal_score} / {signal_grade}\n🌊 波動率：{data['volatility_pct']}%\n"
-                               f"📊 KD訊號：{data['kd_signal']}\n📊 週KD訊號：{data['week_kd_signal']}\n"
-                               f"🧭 MACD訊號：{data['macd_signal']} / MACD柱：{data['macd_hist']}\n"
-                               f"🚀 跳空訊號：{data['gap_signal']}\n🔥 趨勢突破：{data['trend_signal']}\n🔌 來源：{active_price_source}")
+                               f"📊 訊號類型：{signal_type_text}\n🔌 來源：{active_price_source}")
                         send_telegram_message(msg)
                         st.session_state.notified_stocks.add(notify_key)
 
@@ -892,20 +917,33 @@ if should_run_scan:
                 else: flat_count += 1
 
                 valid_stock_stats.append({"symbol": symbol, "code": symbol_to_code(symbol), "name": stock_name, "pct": float(data["pct"])})
-                
+
+                signal_direction_labels = []
+                if any(signal_kinds.get(s) == "buy" for s in signal_types): signal_direction_labels.append("買")
+                if any(signal_kinds.get(s) == "sell" for s in signal_types): signal_direction_labels.append("賣")
+                signal_direction_text = "/".join(signal_direction_labels) if signal_direction_labels else "-"
+                signal_detail_text = "；".join(f"{k}：{v}" for k, v in data["signal_details"].items())
+
                 row = {
                     "代碼": symbol, "代碼網址": yahoo_quote_url(symbol), "股票名稱": stock_name,
                     "價格": f"{data['price']:.2f}", "漲跌%": data["pct"], "成交量(張)": data["volume_lots"],
                     "波動率%": data["volatility_pct"], "RS加權報酬%": data["rs_raw"], "訊號分數": signal_score,
-                    "追蹤等級": signal_grade, "P1日期": data["p1_date"], "區高P1": data["p1_val"],
-                    "P2日期": data["p2_date"], "近高P2": data["p2_val"], "坡度%": data["slope_pct"], "趨勢價": data["tl_val"], "趨勢突破": data["trend_signal"],
-                    "貼線數": data["trend_touch_count"], "穿線數": data["trend_violations"], "量能倍數": data["trend_vol_ratio"],
-                    "MA位置": data["ma_range"], "MA排列": data["ma_trend"], "K值": data["k"], "D值": f"{data['d']:.1f}", "KD訊號": data["kd_signal"],
-                    "週K值": data["week_k"], "週D值": data["week_d"] if data["week_d"] == "-" else f"{data['week_d']:.1f}", "週KD訊號": data["week_kd_signal"],
-                    "MACD柱": data["macd_hist"], "MACD訊號": data["macd_signal"], "跳空訊號": data["gap_signal"],
-                    "訊號類型": "、".join(signal_types) if signal_types else "-", "來源": active_price_source,
+                    "追蹤等級": signal_grade, "MA位置": data["ma_range"], "MA排列": data["ma_trend"],
+                    "訊號方向": signal_direction_text,
+                    "訊號類型": "、".join(signal_types) if signal_types else "-",
+                    "訊號說明": signal_detail_text if signal_detail_text else "-",
+                    "來源": active_price_source,
                 }
                 if (not show_only_signal_rows or is_selected_signal) and passes_volume_filter: rows.append(row)
+
+                if signal_types:
+                    # 儲存個股訊號詳情(K線+訊號說明)，供表格下方的「股票名稱」詳情查看器使用
+                    stock_detail_store[symbol] = {
+                        "name": stock_name,
+                        "chart_df": data["chart_df"],
+                        "signal_details": data["signal_details"],
+                        "signal_marks": data["signal_marks"],
+                    }
 
                 # 「漲幅達標」分頁：獨立於 SIGNAL_SCORE_MIN 訊號分數門檻之外，
                 # 只要「漲幅達標」訊號有觸發（漲跌% >= 側邊欄設定的門檻）且成交量符合下限，就列入。
@@ -922,17 +960,12 @@ if should_run_scan:
                             continue  # 已在上面獨立處理，這裡跳過避免重複加入同一筆資料
                         if sig in signal_buckets and sig in selected_signal_names: signal_buckets[sig].append(row.copy())
 
-                    if data["trend_signal"] == "趨勢突破" and data.get("trend_chart_df") is not None:
-                        trend_chart_store[symbol] = {
-                            "name": stock_name, "df": data["trend_chart_df"], "p1_pos": data["trend_p1_pos"], "p2_pos": data["trend_p2_pos"],
-                            "p1_val": float(data["p1_val"]) if data["p1_val"] != "-" else None, "slope": data["trend_slope"], "vol_ratio": data["trend_vol_ratio"],
-                        }
             except Exception as e:
                 error_count += 1
                 error_stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
                 record_missing_stock(missing_stock_details, fetch_errors, symbol, error_stock_name, f"{type(e).__name__}: {e}", group_name, active_price_source)
                 if not show_only_signal_rows:
-                    rows.append({"代碼": symbol, "代碼網址": "", "股票名稱": error_stock_name, "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-", "P1日期": "-", "區高P1": "-", "P2日期": "-", "近高P2": "-", "坡度%": "-", "趨勢價": "-", "趨勢突破": "-", "貼線數": "-", "穿線數": "-", "量能倍數": "-", "MA位置": "-", "MA排列": "-", "K值": "-", "D值": "-", "KD訊號": "-", "週K值": "-", "週D值": "-", "週KD訊號": "-", "MACD柱": "-", "MACD訊號": "-", "跳空訊號": str(e), "訊號類型": "錯誤", "來源": active_price_source})
+                    rows.append({"代碼": symbol, "代碼網址": "", "股票名稱": error_stock_name, "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-", "訊號分數": "-", "追蹤等級": "-", "MA位置": "-", "MA排列": "-", "訊號方向": "-", "訊號類型": "錯誤", "訊號說明": str(e), "來源": active_price_source})
 
         group_tables[group_name] = {"count": len(stocks), "table": pd.DataFrame(rows)}
         group_up_summary.append({
@@ -950,7 +983,7 @@ if should_run_scan:
 
     st.session_state.last_scan_result = {
         "group_tables": group_tables, "group_up_summary": group_up_summary, "all_signal_rows": all_signal_rows,
-        "signal_buckets": signal_buckets, "trend_chart_store": trend_chart_store, "missing_stock_details": missing_stock_details,
+        "signal_buckets": signal_buckets, "stock_detail_store": stock_detail_store, "missing_stock_details": missing_stock_details,
         "fetch_errors": fetch_errors, "excel_filename": f"TWstock_signal_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
         "scan_completed_at": tw_now.strftime('%Y-%m-%d %H:%M:%S'), "progress_pct": 100, "min_volume_lots": min_volume_lots,
     }
@@ -964,8 +997,11 @@ else:
     group_tables = last_scan_result.get("group_tables", {})
     group_up_summary = last_scan_result.get("group_up_summary", [])
     all_signal_rows = last_scan_result.get("all_signal_rows", [])
-    signal_buckets = last_scan_result.get("signal_buckets", {"漲幅達標": [], "跳空": [], "黃金交叉": [], "即將黃金交叉": [], "週黃金交叉": [], "週即將黃金交叉": [], "MACD翻正": [], "趨勢突破": []})
-    trend_chart_store = last_scan_result.get("trend_chart_store", {})
+    default_signal_buckets = {"優先追蹤": []}
+    for _cfg in signal_registry.values():
+        default_signal_buckets.setdefault(_cfg["label"], [])
+    signal_buckets = last_scan_result.get("signal_buckets", default_signal_buckets)
+    stock_detail_store = last_scan_result.get("stock_detail_store", {})
     missing_stock_details = last_scan_result.get("missing_stock_details", [])
     fetch_errors = last_scan_result.get("fetch_errors", {})
     render_scan_progress_card(scan_progress_card_placeholder, last_scan_result.get("progress_pct", 100), "掃描進度")
@@ -979,6 +1015,9 @@ with scan_action_placeholder.container():
         with open_dropdown("📁 Download"):
             st.caption("下載 / 推播 / GitHub 上傳")
             st.download_button("下載 Excel", data=excel_bytes, file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            if stock_detail_store:
+                chart_zip_bytes = build_signal_chart_zip_bytes(stock_detail_store)
+                st.download_button("下載全部訊號K線圖(ZIP)", data=chart_zip_bytes, file_name=f"signal_charts_{tw_now.strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", use_container_width=True)
             if st.button("推送到 Telegram", use_container_width=True):
                 if send_telegram_document(excel_bytes, excel_filename, caption=f"TWstock 訊號掃描結果｜成交量下限 {st.session_state.get('last_scan_result', {}).get('min_volume_lots', min_volume_lots)} 張｜{tw_now.strftime('%Y-%m-%d %H:%M:%S')}"):
                     st.success("已將 Excel 推送到 Telegram。")
@@ -1016,15 +1055,12 @@ if fetch_errors:
     with st.expander(f"🔧 抓取/處理失敗除錯資訊（{len(fetch_errors)} 檔）", expanded=False):
         st.json(dict(list(fetch_errors.items())[:100]))
 
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "P1日期", "區高P1", "P2日期", "近高P2", "坡度%", "趨勢價", "趨勢突破", "貼線數", "穿線數", "量能倍數", "MA位置", "MA排列", "K值", "D值", "KD訊號", "週K值", "週D值", "週KD訊號", "MACD柱", "MACD訊號", "跳空訊號", "訊號類型", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "訊號分數", "追蹤等級", "MA位置", "MA排列", "訊號方向", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_display_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"]).copy()
-    for col, func in [("漲跌%", format_color), ("K值", format_k), ("成交量(張)", format_volume), ("跳空訊號", format_gap)]: signal_display_df[col] = signal_display_df[col].apply(func)
-    if "週K值" in signal_display_df.columns: signal_display_df["週K值"] = signal_display_df["週K值"].apply(format_k)
+    for col, func in [("漲跌%", format_color), ("成交量(張)", format_volume)]: signal_display_df[col] = signal_display_df[col].apply(func)
     if "波動率%" in signal_display_df.columns: signal_display_df["波動率%"] = signal_display_df["波動率%"].apply(format_volatility)
-    signal_display_df["趨勢突破"] = signal_display_df["趨勢突破"].apply(format_trend) if "趨勢突破" in signal_display_df.columns else "-"
-    signal_display_df["量能倍數"] = signal_display_df["量能倍數"].apply(format_vol_ratio) if "量能倍數" in signal_display_df.columns else "-"
     signal_display_df["代碼"] = signal_display_df["代碼網址"]
     for col in display_columns:
         if col not in signal_display_df.columns: signal_display_df[col] = "-"
@@ -1034,9 +1070,11 @@ if all_signal_rows:
         "股票名稱": st.column_config.TextColumn("股票名稱"),
         "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
     })
+
+    render_stock_detail_picker("全部訊號", all_signal_rows, stock_detail_store)
     
     st.markdown("### 📑 依訊號分頁查看")
-    signal_tab_specs = [("優先追蹤", "優先追蹤"), ("漲幅達標", "漲幅達標"), ("跳空", "跳空"), ("黃金交叉", "黃金交叉"), ("即將黃金交叉", "即將黃金交叉"), ("週黃金交叉", "週黃金交叉"), ("週即將黃金交叉", "週即將黃金交叉"), ("MACD 訊號", "MACD翻正"), ("趨勢突破", "趨勢突破")]
+    signal_tab_specs = [("優先追蹤", "優先追蹤")] + [(cfg["label"], cfg["label"]) for cfg in signal_registry.values()]
     signal_tabs = st.tabs([f"{name}（{len(pd.DataFrame(signal_buckets.get(key, [])).drop_duplicates(subset=['代碼'])) if signal_buckets.get(key) else 0}）" for name, key in signal_tab_specs])
     
     for tab, (display_name, bucket_key) in zip(signal_tabs, signal_tab_specs):
@@ -1045,11 +1083,8 @@ if all_signal_rows:
             st.markdown(f"#### {display_name}（{len(pd.DataFrame(bucket_rows).drop_duplicates(subset=['代碼'])) if bucket_rows else 0} 檔）")
             if bucket_rows:
                 bucket_display_df = pd.DataFrame(bucket_rows).drop_duplicates(subset=["代碼"]).copy()
-                for col, func in [("漲跌%", format_color), ("K值", format_k), ("成交量(張)", format_volume), ("跳空訊號", format_gap)]: bucket_display_df[col] = bucket_display_df[col].apply(func)
-                if "週K值" in bucket_display_df.columns: bucket_display_df["週K值"] = bucket_display_df["週K值"].apply(format_k)
+                for col, func in [("漲跌%", format_color), ("成交量(張)", format_volume)]: bucket_display_df[col] = bucket_display_df[col].apply(func)
                 if "波動率%" in bucket_display_df.columns: bucket_display_df["波動率%"] = bucket_display_df["波動率%"].apply(format_volatility)
-                bucket_display_df["趨勢突破"] = bucket_display_df["趨勢突破"].apply(format_trend) if "趨勢突破" in bucket_display_df.columns else "-"
-                bucket_display_df["量能倍數"] = bucket_display_df["量能倍數"].apply(format_vol_ratio) if "量能倍數" in bucket_display_df.columns else "-"
                 bucket_display_df["代碼"] = bucket_display_df["代碼網址"]
                 for col in display_columns:
                     if col not in bucket_display_df.columns: bucket_display_df[col] = "-"
@@ -1060,25 +1095,7 @@ if all_signal_rows:
                     "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
                 })
 
-                if bucket_key == "趨勢突破" and trend_chart_store:
-                    chart_title_col, chart_download_col, chart_collapse_col = st.columns([3.8, 0.95, 0.95])
-                    with chart_title_col: st.markdown("##### 📈 個股圖表（K線 + 下降趨勢線）")
-                    with chart_download_col:
-                        trend_chart_zip_bytes = build_trend_chart_zip_bytes(trend_chart_store)
-                        st.download_button("📥 下載全部圖", data=trend_chart_zip_bytes, file_name=f"trend_breakout_charts_{tw_now.strftime('%Y%m%d_%H%M%S')}.zip", mime="application/zip", use_container_width=True)
-                    with chart_collapse_col:
-                        if st.button("📁 收折全部圖", use_container_width=True):
-                            st.session_state.trend_charts_collapsed = True
-                            st.session_state.trend_charts_collapse_version = st.session_state.get("trend_charts_collapse_version", 0) + 1
-                            st.rerun()
-
-                    invisible_version_suffix = "\u200b" * int(st.session_state.get("trend_charts_collapse_version", 0))
-                    for _, r in pd.DataFrame(bucket_rows).drop_duplicates(subset=["代碼"]).iterrows():
-                        sym = r["代碼網址"].split("/")[-1] + (".TWO" if str(r["代碼網址"].split("/")[-1]).startswith(("3","6","8")) else ".TW")
-                        chart_info = trend_chart_store.get(sym)
-                        if not chart_info: continue
-                        with st.expander(f"{sym} {r.get('股票名稱', '')} 量能倍數 {chart_info.get('vol_ratio', '-')}{invisible_version_suffix}", expanded=not st.session_state.get("trend_charts_collapsed", True)):
-                            plot_trend_breakout_chart(sym, r.get("股票名稱", ""), chart_info)
+                render_stock_detail_picker(bucket_key, bucket_rows, stock_detail_store)
             else:
                 st.caption(f"目前沒有符合「{display_name}」的股票。")
 else:
