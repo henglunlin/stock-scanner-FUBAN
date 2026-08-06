@@ -2,7 +2,7 @@ name: Auto Update TWSE OHLCV DB
 
 on:
   schedule:
-    - cron: '17 7,11 * * 1-5'
+    - cron: '17 9,13 * * 1-5'
   workflow_dispatch: 
 
 jobs:
@@ -53,11 +53,14 @@ jobs:
           git add twse_ohlcv.db
           git diff --quiet && git diff --staged --quiet || (git commit -m "Sync latest twse_ohlcv.db from scanner" && git push origin ${TARGET_BRANCH})
 
-      - name: Push DB to henglunlin-stock-monitor-FUBAN
+      - name: Push DB to henglunlin-stock-monitor-FUBAN + precompute trendline levels
         env:
           TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
           TARGET_REPO: "henglunlin/henglunlin-stock-monitor-FUBAN" 
           TARGET_BRANCH: "main" # 若該專案的預設分支是 master，請改成 master
+          # precompute_trendlines.py 需要這兩個才能推播 Telegram 通知，跟上面「Run update script」用同一組
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           mkdir -p target_repo_2
           git clone https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${TARGET_REPO}.git target_repo_2
@@ -65,5 +68,21 @@ jobs:
           cd target_repo_2
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # twse_ohlcv.db 已經是本次剛更新好的最新版本，緊接著用它 + 這個 repo 自己的
+          # stock_groups.json，預先算好「下一個交易日」各股票下降趨勢線的突破價位。
+          # precompute_trendlines.py 這支腳本本身就放在 henglunlin-stock-monitor-FUBAN
+          # repo 裡 (跟 signal_module/precomputed_trendline_breakout.py 配套)，
+          # 所以直接在 clone 下來的 target_repo_2 目錄裡執行即可，找不到就跳過、不擋主流程。
+          if [ -f "precompute_trendlines.py" ]; then
+            pip install --quiet pandas requests
+            python precompute_trendlines.py || echo "::warning::precompute_trendlines.py 執行失敗，本次略過 trendline_levels.json 更新"
+          else
+            echo "::warning::target_repo_2 找不到 precompute_trendlines.py，略過下降趨勢線預先計算"
+          fi
+
           git add twse_ohlcv.db
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Sync latest twse_ohlcv.db from scanner" && git push origin ${TARGET_BRANCH})
+          if [ -f trendline_levels.json ]; then
+            git add trendline_levels.json
+          fi
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Sync latest twse_ohlcv.db + trendline_levels.json from scanner" && git push origin ${TARGET_BRANCH})
