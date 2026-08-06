@@ -113,12 +113,32 @@ def build_base_context(df: pd.DataFrame, price) -> dict:
     if len(df) < 20:
         raise ValueError("歷史資料不足（至少需要 20 筆）")
 
-    close = pd.to_numeric(df["Close"].squeeze(), errors="coerce")
+    close_all = pd.to_numeric(df["Close"].squeeze(), errors="coerce")
     volume = pd.to_numeric(df["Volume"].squeeze(), errors="coerce") if "Volume" in df.columns else pd.Series(dtype="float64")
-    if close.isna().all():
+    if close_all.isna().all():
         raise ValueError("OHLC 資料格式異常")
 
-    yesterday_close = float(close.iloc[-2])
+    # 「昨收」改用日期比對，不要假設「df 最後一筆一定是今天、倒數第二筆一定是昨天」。
+    # 資料源(富邦/Yfinance/本地DB)偶爾會因為限流、非交易時段等原因，讓「今天」這一筆缺席，
+    # 此時如果單純用位置(iloc[-2])去抓「昨收」，實際上抓到的會是「前天」，
+    # 漲跌%就會被誤算成兩天的漲幅、卻被當成一天的漲幅顯示，造成誤導。
+    # 用日期明確篩出「今天以前最近一個交易日」的收盤價，不管 df 有沒有包含今天這一筆都能正確算出。
+    if "Date" in df.columns:
+        work = df.copy()
+        work["Date"] = pd.to_datetime(work["Date"], errors="coerce")
+        work = work.dropna(subset=["Date"]).sort_values("Date")
+        today = pd.Timestamp.now(tz="Asia/Taipei").normalize().tz_localize(None)
+        prior = work[work["Date"].dt.normalize() < today]
+        if prior.empty:
+            # 找不到「今天以前」的資料 (例如資料源整批都異常)，退回舊的位置假設當最後手段
+            yesterday_close = float(close_all.iloc[-2]) if len(close_all) >= 2 else float(close_all.iloc[-1])
+        else:
+            yesterday_close = float(pd.to_numeric(prior["Close"], errors="coerce").iloc[-1])
+        close = close_all
+    else:
+        yesterday_close = float(close_all.iloc[-2])
+        close = close_all
+
     if pd.isna(yesterday_close) or yesterday_close == 0:
         raise ValueError("昨收資料異常")
 
