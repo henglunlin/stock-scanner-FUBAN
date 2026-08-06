@@ -539,6 +539,11 @@ if should_run_scan:
 
                 signal_types = data["signal_types"]
                 signal_kinds = data["signal_kinds"]
+                signal_sublabels = data.get("signal_sublabels", {})
+
+                def _display_signal_type(s: str) -> str:
+                    """把 sub_label (例如下降趨勢線突破的短期/中短期/中長期) 動態接在訊號名稱後面顯示。"""
+                    return f"{s}{signal_sublabels.get(s, '')}"
 
                 signal_score = calc_signal_quality_score(data, signal_types, signal_kinds)
                 signal_grade = classify_signal_grade(signal_score)
@@ -548,7 +553,7 @@ if should_run_scan:
                 if (data["pct"] >= 5 or is_selected_signal) and passes_volume_filter:
                     notify_key = f"{symbol}_{tw_now.strftime('%Y-%m-%d')}"
                     if can_push_now and (notify_key not in st.session_state.notified_stocks):
-                        signal_type_text = "、".join(signal_types) if signal_types else "-"
+                        signal_type_text = "、".join(_display_signal_type(s) for s in signal_types) if signal_types else "-"
                         msg = (f"🔔 <b>全市場掃描訊號：{stock_name} (<a href='https://tw.stock.yahoo.com/quote/{symbol.split('.')[0]}'>{symbol}</a>)</b>\n\n"
                                f"📈 價格：{data['price']}\n🔥 漲幅：{data['pct']}%\n📦 成交量：{data['volume_lots']:,.1f} 張\n"
                                f"⭐ 訊號分數：{signal_score} / {signal_grade}\n🌊 波動率：{data['volatility_pct']}%\n"
@@ -575,7 +580,7 @@ if should_run_scan:
                     "波動率%": data["volatility_pct"], "RS加權報酬%": data["rs_raw"], "訊號分數": signal_score,
                     "追蹤等級": signal_grade, "MA位置": data["ma_range"], "MA排列": data["ma_trend"],
                     "訊號方向": signal_direction_text,
-                    "訊號類型": "、".join(signal_types) if signal_types else "-",
+                    "訊號類型": "、".join(_display_signal_type(s) for s in signal_types) if signal_types else "-",
                     "訊號說明": signal_detail_text if signal_detail_text else "-",
                     "來源": active_price_source,
                 }
