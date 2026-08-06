@@ -10,7 +10,10 @@ signals 套件（2026 改版）
 這個套件保留給主程式(app)呼叫的固定入口，讓主程式不用管訊號實作細節：
   - compute_indicators(df, price, symbol, name, rise_threshold) -> dict
   - get_signal_registry() -> 目前註冊的訊號清單 (可在「🛠️ 訊號編輯」頁面新增/修改後即時反映)
-  - build_signal_chart_figure / render_signal_detail_panel -> 個股 K線 + 訊號說明
+
+（2026 改版：拿掉了 K線圖繪製功能，因為對每檔命中訊號的股票即時畫 Plotly 圖
+CPU 負擔過大、拖慢掃描與畫面渲染速度。現在看K線請直接點主表格「代碼」欄位的
+Yahoo 股市連結，不再需要在 Streamlit 裡自己畫圖。）
 """
 import pandas as pd
 
@@ -19,7 +22,6 @@ from signal_module.base import SIGNAL_REGISTRY, SignalContext as ModuleSignalCon
 from signal_module.indicators import add_indicators
 
 from .context import build_base_context
-from .chart import build_signal_chart_figure, render_signal_detail_panel  # noqa: F401  (re-export)
 
 # 啟動時（本 process 第一次 import 這個套件時）載入一次預設訊號模組。
 # 之後若在「🛠️ 訊號編輯」頁面存檔，會直接呼叫 module_loader.load_default_signal_modules()
@@ -86,8 +88,15 @@ def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0):
     signal_kinds = {SIGNAL_REGISTRY[key]["label"]: SIGNAL_REGISTRY[key].get("kind", "buy") for key in hit_keys}
     signal_details = {SIGNAL_REGISTRY[key]["label"]: signal_results[key].detail for key in hit_keys}
     signal_marks = {SIGNAL_REGISTRY[key]["label"]: signal_results[key].marks for key in hit_keys}
-
-    chart_df = df_ind.reset_index()  # 欄位: Date, Open, High, Low, Close, Volume, MA5.../K/D/BB_... 等
+    # sub_label: 選用欄位，讓「同一個訊號、但這次觸發的細分類會變動」的訊號
+    # (例如下降趨勢線突破依觸發當下區分短期/中短期/中長期) 能動態附加顯示文字，
+    # 不用為了顯示細分類而拆成好幾個獨立註冊的訊號。
+    # 這裡刻意跟 signal_types(比對用的固定 label) 分開存放，
+    # 只用來組「訊號類型」的顯示文字，不影響 Setting 勾選/分頁分類等既有比對邏輯。
+    signal_sublabels = {
+        SIGNAL_REGISTRY[key]["label"]: (signal_results[key].sub_label or "")
+        for key in hit_keys
+    }
 
     return {
         "price": round(base["price"], 2),
@@ -102,7 +111,7 @@ def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0):
         "signal_kinds": signal_kinds,
         "signal_details": signal_details,
         "signal_marks": signal_marks,
+        "signal_sublabels": signal_sublabels,
         "signal_results": signal_results,
-        "chart_df": chart_df,
         "scan_date": scan_date,
     }
