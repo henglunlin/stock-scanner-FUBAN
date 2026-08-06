@@ -32,6 +32,12 @@ except ImportError:
 
 # ===== 資料源相關常數 =====
 REFRESH_SEC = 3
+# 90天歷史K線在盤中根本不會變，之前用 REFRESH_SEC(3秒)當快取時間，
+# 等於每 3 秒就把幾百檔股票的 90 天歷史資料全部重抓一次，
+# 對富邦 API 造成不必要的巨量請求、很容易被限流(429)。
+# 改成獨立的、長很多的快取時間，只有「今日」相關的資料才需要用短快取。
+HISTORY_CACHE_TTL_SEC = 5 * 60  # 歷史K線：5分鐘內不重抓
+QUOTE_CACHE_TTL_SEC = 5         # 即時報價：5秒內不重抓 (原本完全沒快取)
 YFINANCE_HISTORY_CACHE_TTL_SEC = 60 * 60
 STOCK_NAME_FILE = "TWstocklistname2.txt"
 STOCK_SCAN_FILE = "TWstocklistname2.txt"
@@ -87,13 +93,13 @@ def _fetch_fubon_candles(symbol: str, _sdk, start_date, end_date) -> pd.DataFram
 
     return pd.DataFrame()
 
-@st.cache_data(ttl=REFRESH_SEC)
+@st.cache_data(ttl=HISTORY_CACHE_TTL_SEC)
 def download_stock_data(symbol: str, _sdk):
     end_date = date.today()
     start_date = end_date - timedelta(days=90)
     return _fetch_fubon_candles(symbol, _sdk, start_date, end_date)
 
-@st.cache_data(ttl=REFRESH_SEC)
+@st.cache_data(ttl=QUOTE_CACHE_TTL_SEC)
 def download_stock_data_fubon_today(symbol: str, _sdk, today_str: str):
     if _sdk is None:
         return pd.DataFrame()
@@ -119,22 +125,68 @@ def normalize_ohlc(df):
         return out.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
     return pd.DataFrame()
 
-def get_last_price(symbol, df, _sdk):
+@st.cache_data(ttl=QUOTE_CACHE_TTL_SEC)
+def _fetch_fubon_snapshot_price(symbol: str, _sdk):
+    """
+    單獨把「打富邦即時報價 API」這個動作抽出來獨立快取。
+    原本 get_last_price() 完全沒有快取，等於每次刷新、每一檔股票都重打一次 API，
+    全市場掃描時很容易把富邦 API 打到 429 限流，一旦限流就會靜默地退回歷史資料，
+    把「昨天的收盤價」誤當成「今天的價格」使用，漲跌%也就跟著算錯。
+    這裡加上短秒數快取，大幅降低請求量、降低被限流的機率。
+    回傳 (price, is_today) tuple；is_today 用來讓呼叫端知道這筆報價是否真的是「今天」的資料。
+    """
     fubon_symbol = str(symbol).split(".")[0]
-    if _sdk is not None:
-        try:
-            res = _sdk.marketdata.rest_client.stock.snapshot.quotes(symbol=fubon_symbol)
-            if res and "data" in res and len(res["data"]) > 0:
-                quote = res["data"][0]
-                price = quote.get("closePrice") or quote.get("tradePrice") or quote.get("close")
-                if price is not None and pd.notna(price):
-                    return float(price)
-        except Exception:
-            pass
+    if _sdk is None:
+        return None, False
+    try:
+        res = _sdk.marketdata.rest_client.stock.snapshot.quotes(symbol=fubon_symbol)
+        if res and "data" in res and len(res["data"]) > 0:
+            quote = res["data"][0]
+            # 防呆: 有些情況下 snapshot.quotes 在只帶 symbol 參數時仍可能回傳非預期的資料，
+            # 如果回傳的 symbol 對不上，直接視為抓取失敗，不要誤用到別檔股票的報價。
+            if str(quote.get("symbol", fubon_symbol)).strip() != fubon_symbol:
+                return None, False
+            price = quote.get("closePrice")
+            if price is not None and pd.notna(price):
+                quote_date = res.get("date") or quote.get("date")
+                is_today = True
+                if quote_date:
+                    try:
+                        is_today = pd.to_datetime(quote_date).date() == date.today()
+                    except Exception:
+                        is_today = True
+                return float(price), is_today
+    except Exception:
+        pass
+    return None, False
+
+
+def get_last_price(symbol, df, _sdk):
+    """
+    取得「目前」股價。
+    優先使用富邦即時報價 (snapshot.quotes 的 closePrice 欄位，經查證官方文件，
+    這個欄位在盤中代表的就是最新成交價，不是昨收，欄位本身沒有問題)。
+    只有在即時報價真的抓不到（例如被限流、非交易時段）時，才退回歷史資料的最後一筆，
+    並且會盡量選「日期確實是今天」的那一筆，避免誤用到昨天的收盤價當今天的即時價。
+    """
+    price, is_today = _fetch_fubon_snapshot_price(symbol, _sdk)
+    if price is not None and is_today:
+        return price
 
     if not df.empty and "Close" in df.columns:
+        if "Date" in df.columns:
+            today = date.today()
+            today_rows = df[pd.to_datetime(df["Date"], errors="coerce").dt.date == today]
+            if not today_rows.empty:
+                return float(today_rows["Close"].iloc[-1])
+        # 找不到「今天」這一筆，退回最後一筆 (可能是昨天的收盤價，僅作為最後手段)
+        if price is not None:
+            return price  # 即時報價抓到了，只是日期對不上，仍優先信任它
         return float(df["Close"].iloc[-1])
-        
+
+    if price is not None:
+        return price
+
     raise ValueError("無法取得即時價格")
 
 @st.cache_data(ttl=86400)
@@ -394,6 +446,15 @@ def download_stock_data_by_source(
     symbol: str, _sdk, source: str, today_str: str,
     history_map: dict = None, yf_today_map: dict = None,
 ):
+    """
+    2026 效能改版：
+    「今天以前」的歷史資料一律固定改用本地 twse_ohlcv.db 讀取——
+    這份資料庫本來就有 GitHub Actions 每天自動同步最新收盤價，免費、不佔用
+    富邦/Yfinance 的 API 額度，也不會被限流(429)。
+    程式只需要額外抓「今天」這一筆即時資料，大幅減少對外部 API 的呼叫次數。
+    不管使用者選的是哪一種「今日價格來源」，歷史區段都一律走本地資料庫；
+    只有「今天」這筆資料的來源會依照 source 參數決定要打富邦還是 Yfinance。
+    """
     history_map = history_map or {}
     yf_today_map = yf_today_map or {}
 
@@ -406,46 +467,33 @@ def download_stock_data_by_source(
             combined = combined.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
         return combined
 
-    if source == "本地資料庫(twse_ohlcv.db)":
-        history_df = history_map.get(symbol)
-        if history_df is None:
-            history_df = download_stock_data_db_history(symbol, today_str)
-            
-        # 今日資料優先使用富邦 (若有登入)，否則用 Yfinance 補齊
-        if _sdk is not None:
-            today_df = download_stock_data_fubon_today(symbol, _sdk, today_str)
-        else:
-            today_df = yf_today_map.get(symbol)
-            if today_df is None:
-                today_df = download_stock_data_yfinance_today(symbol, today_str)
-                
-        df = _combine(history_df, today_df)
-        if not df.empty:
-            return df
-        return pd.DataFrame()
+    # 歷史資料(今天以前)一律用本地資料庫，不再打富邦/Yfinance 的歷史K線 API
+    history_df = history_map.get(symbol)
+    if history_df is None:
+        history_df = download_stock_data_db_history(symbol, today_str)
 
+    # 只有「今天」這一筆需要即時抓，依 source 決定要用哪個即時來源
     if source == "Yfinance":
-        history_df = history_map.get(symbol)
-        if history_df is None:
-            history_df = download_stock_data_yfinance_history(symbol, today_str)
         today_df = yf_today_map.get(symbol)
         if today_df is None:
             today_df = download_stock_data_yfinance_today(symbol, today_str)
-        df = _combine(history_df, today_df)
-        if not df.empty:
-            return df
-        if _sdk is not None:
-            return download_stock_data(symbol, _sdk)
-        return pd.DataFrame()
+    else:
+        # "WebSocket" / "本地資料庫(twse_ohlcv.db)" / 其他：優先用富邦即時K線，
+        # 沒登入富邦或抓不到才退回 Yfinance 補today。
+        today_df = download_stock_data_fubon_today(symbol, _sdk, today_str) if _sdk is not None else pd.DataFrame()
+        if today_df is None or today_df.empty:
+            today_df = yf_today_map.get(symbol)
+            if today_df is None:
+                today_df = download_stock_data_yfinance_today(symbol, today_str)
 
-    history_df = history_map.get(symbol)
-    if history_df is None:
-        history_df = download_stock_data_yfinance_history(symbol, today_str)
-    today_df = download_stock_data_fubon_today(symbol, _sdk, today_str) if _sdk is not None else pd.DataFrame()
     df = _combine(history_df, today_df)
     if not df.empty:
         return df
-    return download_stock_data(symbol, _sdk)
+
+    # 最終備援 (理論上很少走到): 本地資料庫也抓不到時，才退回直接打富邦抓90天。
+    if _sdk is not None:
+        return download_stock_data(symbol, _sdk)
+    return pd.DataFrame()
 
 def get_last_price_by_source(symbol: str, df, _sdk, source: str):
     if source == "Yfinance":
