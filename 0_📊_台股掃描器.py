@@ -29,8 +29,7 @@ from common_fubon import (
     yf,
     load_all_stock_group_from_file,
     render_price_source_selector,
-    bulk_download_yfinance_history,
-    bulk_download_db_history,          # <== 新增引入 DB 批次讀取
+    bulk_download_db_history,          # 歷史資料一律走本地資料庫批次讀取
     bulk_download_yfinance_today,
     download_stock_data_by_source,
     normalize_ohlc,
@@ -490,16 +489,18 @@ if should_run_scan:
     fetch_errors = {}
     scan_total_count = sum(len(stocks) for stocks in st.session_state.stock_groups.values())
 
-    # 🚀 批次預先抓取 (判斷如果是本地資料庫，就去 SQLite 取；否則去 YFinance 取)
+    # 🚀 批次預先抓取
+    # 2026 效能改版：歷史資料(今天以前)一律固定從本地 twse_ohlcv.db 批次讀取，
+    # 不再依照「今日價格來源」切換去打 Yfinance/富邦 的歷史K線 API，
+    # 大幅減少 API 呼叫次數、降低被限流(429)進而誤用到「昨天價格」的風險。
+    # 只有選 Yfinance 當「今日價格來源」時，才需要額外批次抓 Yfinance 的今日資料；
+    # 其他來源(WebSocket/本地資料庫)的「今日」資料改成逐檔即時抓
+    # (在 download_stock_data_by_source 內部處理，非常輕量)。
     scan_today_str = tw_now.strftime("%Y-%m-%d")
     all_unique_symbols = tuple(sorted({s for stocks in st.session_state.stock_groups.values() for s in stocks}))
-    
-    if active_price_source == "本地資料庫(twse_ohlcv.db)":
-        history_map = bulk_download_db_history(all_unique_symbols, scan_today_str)
-        yf_today_map = bulk_download_yfinance_today(all_unique_symbols, scan_today_str) if yf is not None else {}
-    else:
-        history_map = bulk_download_yfinance_history(all_unique_symbols, scan_today_str) if yf is not None else {}
-        yf_today_map = bulk_download_yfinance_today(all_unique_symbols, scan_today_str) if (yf is not None and active_price_source == "Yfinance") else {}
+
+    history_map = bulk_download_db_history(all_unique_symbols, scan_today_str)
+    yf_today_map = bulk_download_yfinance_today(all_unique_symbols, scan_today_str) if (yf is not None and active_price_source == "Yfinance") else {}
 
     render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
     progress_bar = st.progress(0, text=f"掃描進度：0.0%（準備掃描 {scan_total_count} 檔股票）")
