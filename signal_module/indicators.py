@@ -1,5 +1,6 @@
 """
-技術指標計算工具: KD(9,3,3)、各天期均線(MA5/10/20/60)、成交量10日均量、乖離率(Bias)、布林通道(BBand)
+技術指標計算工具: KD(9,3,3)、各天期均線(MA5/10/20/60)、成交量10日均量、
+成交量/昨量比例、乖離率(Bias)、布林通道(BBand)
 """
 import numpy as np
 import pandas as pd
@@ -55,6 +56,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     bias60 = (close - ma60) / ma60 * 100
 
     vol_ma10 = df["Volume"].rolling(10, min_periods=1).mean()
+    # 成交量/昨量：今日成交量相對前一交易日的倍數，漲停訊號的濾網會用到
+    # (2026-08-10 依回測新增：10MA>20MA 且 此比例<=0.95 時勝率46.5%→56.8%，見 scoring.py)
+    vol_ratio_yesterday = df["Volume"] / df["Volume"].shift(1)
+
     K, D = compute_kd(df)
 
     # 布林通道 (20MA, 2 std) 及帶寬
@@ -66,7 +71,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = pd.DataFrame({
         "MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60,
         "Bias20": bias20, "Bias60": bias60,
-        "VolMA10": vol_ma10,
+        "VolMA10": vol_ma10, "VolRatioYesterday": vol_ratio_yesterday,
         "K": K, "D": D,
         "BB_std": bb_std, "BB_UB": bb_ub, "BB_LB": bb_lb, "BB_BW": bb_bw,
     }, index=df.index)
