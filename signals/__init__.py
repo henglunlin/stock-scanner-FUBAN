@@ -14,6 +14,13 @@ signals 套件（2026 改版）
 （2026 改版：拿掉了 K線圖繪製功能，因為對每檔命中訊號的股票即時畫 Plotly 圖
 CPU 負擔過大、拖慢掃描與畫面渲染速度。現在看K線請直接點主表格「代碼」欄位的
 Yahoo 股市連結，不再需要在 Streamlit 裡自己畫圖。）
+
+（2026-08-11 修補：compute_indicators() 回傳的 data dict 原本缺少
+MA10 / MA20 / VolRatioYesterday 三個欄位，導致 scoring.py 5.5節
+「漲停」專屬濾網加分（MA10>MA20 且 VolRatioYesterday<=0.95 時 +15分）
+data.get(...) 永遠拿到 None，這段加分從未真正生效過。
+這裡從 df_ind 最後一列補上這三個欄位，直接對應 indicators.py
+add_indicators() 的原始輸出欄位，不做任何分類轉換。）
 """
 import pandas as pd
 
@@ -55,6 +62,13 @@ def _prepare_indicator_df(df: pd.DataFrame, price: float) -> pd.DataFrame:
     return work
 
 
+def _safe_round_or_none(value, ndigits):
+    """value 是 NaN/None 時回傳 None，否則回傳四捨五入後的 float。"""
+    if value is None or pd.isna(value):
+        return None
+    return round(float(value), ndigits)
+
+
 def run_signal_registry(symbol: str, name: str, df_ind: pd.DataFrame, scan_date: str, rise_threshold: float = 5.0) -> dict:
     """對單一股票已含指標的 df 跑過全部已註冊訊號，回傳 {key: SignalResult}"""
     ctx = ModuleSignalContext(
@@ -80,6 +94,7 @@ def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0):
     base = build_base_context(df, price)
     df_ind = _prepare_indicator_df(df, price)
     scan_date = df_ind.index[-1]
+    latest_row = df_ind.iloc[-1]
 
     signal_results = run_signal_registry(symbol, name, df_ind, scan_date, rise_threshold)
 
@@ -107,6 +122,14 @@ def compute_indicators(df, price, symbol="", name="", rise_threshold=5.0):
         "volume_lots": round(base["volume_lots"], 1),
         "volatility_pct": round(base["volatility_pct"], 2) if base["volatility_pct"] is not None else "-",
         "rs_raw": round(base["rs_raw"], 2) if base["rs_raw"] is not None else "-",
+        # --- 2026-08-11 新增：對應 scoring.py 5.5節「漲停」專屬濾網加分 ---
+        # 直接取 df_ind 最後一列 (今日/掃描日) 的原始數值，不做分類轉換。
+        # 資料筆數不足(例如第一天 VolRatioYesterday 會是 NaN)時回傳 None，
+        # scoring.py 端已用 is not None 判斷會自動跳過這段加分，不影響其他邏輯。
+        "MA10": _safe_round_or_none(latest_row.get("MA10"), 2),
+        "MA20": _safe_round_or_none(latest_row.get("MA20"), 2),
+        "VolRatioYesterday": _safe_round_or_none(latest_row.get("VolRatioYesterday"), 4),
+        # ------------------------------------------------------------------
         "signal_types": signal_types,
         "signal_kinds": signal_kinds,
         "signal_details": signal_details,
