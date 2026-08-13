@@ -2,58 +2,48 @@
 雙跳空 (Double Gap)
 
 條件:
-- 掃描日(今日)當天出現「向上跳空」：今日最低點 (Low) > 昨日最高點 (High)
-- 且昨日相對前日「也」出現向上跳空：昨日最低點 (Low) > 前日最高點 (High)
-  (代表連續兩個交易日都跳空向上，動能比單跳空更強)
+- 最近 3 根K線 (含今日/掃描日) 之中，有 2 根出現「向上跳空」
+  (該日最低點 Low > 前一交易日最高點 High)
 
-(改版: 原本是「最近3個交易日內有2天跳空即可、不要求連續、也不要求含今日」，
- 現在改成必須是「今日」跳空、且緊接著昨日也跳空的「連續兩日」型態，
- 避免今天股價已經回落、卻因為抓到過去不連續的兩次舊跳空而誤判成立。)
+效能備註 (2026-08-12)：改用 df.index 直接查找 (in / get_loc)，
+取代原本每次呼叫都重新 df.index.tolist() + list.index() 的線性掃描。
 """
 from .base import SignalContext, SignalResult, register_signal
+
+WINDOW = 3            # 檢查跳空向上的觀察視窗天數 (含掃描日)
+REQUIRED_GAPS = 2      # 視窗內至少需出現幾根跳空向上K線，才算雙跳空
 
 
 @register_signal(
     key="double_gap",
     label="雙跳空",
-    description="今日與昨日連續兩個交易日皆向上跳空(今日最低>昨日最高，且昨日最低>前日最高)",
+    description="最近3根K線中有2根出現向上跳空",
 )
 def check_double_gap(ctx: SignalContext) -> SignalResult:
     df = ctx.df
-    dates = df.index.tolist()
+    dates = df.index
 
     if ctx.scan_date not in dates:
         return SignalResult(hit=False, detail="掃描日不在資料範圍內")
 
-    idx = dates.index(ctx.scan_date)
-    if idx < 2:
-        return SignalResult(hit=False, detail="資料不足，無法取得前兩個交易日資料")
+    idx = df.index.get_loc(ctx.scan_date)
+    window_start = max(1, idx - (WINDOW - 1))
 
-    today_low = df.loc[dates[idx], "Low"]
-    yest_high = df.loc[dates[idx - 1], "High"]
-    yest_low = df.loc[dates[idx - 1], "Low"]
-    prev2_high = df.loc[dates[idx - 2], "High"]
+    gap_dates = []
+    for i in range(window_start, idx + 1):
+        cur = df.loc[dates[i]]
+        prev = df.loc[dates[i - 1]]
+        if cur["Low"] > prev["High"]:
+            gap_dates.append(dates[i])
 
-    gap_today = today_low > yest_high
-    gap_yesterday = yest_low > prev2_high
-
-    if gap_today and gap_yesterday:
+    if len(gap_dates) >= REQUIRED_GAPS:
         return SignalResult(
             hit=True,
-            detail=(
-                f"{ctx.scan_date} 今日最低 {today_low:.2f} > 昨日最高 {yest_high:.2f}，"
-                f"且昨日({dates[idx-1]})最低 {yest_low:.2f} > 前日最高 {prev2_high:.2f} "
-                f"=> 雙跳空成立(連續兩日跳空)"
-            ),
-            marks=[dates[idx - 1], ctx.scan_date],
+            detail=f"近{WINDOW}根K線中共 {len(gap_dates)} 根跳空向上: {', '.join(gap_dates)} => 雙跳空成立",
+            marks=gap_dates,
         )
 
-    if not gap_today:
-        reason = f"{ctx.scan_date} 今日最低 {today_low:.2f} 未高於昨日最高 {yest_high:.2f}"
-    else:
-        reason = (
-            f"今日雖跳空，但昨日({dates[idx-1]})最低 {yest_low:.2f} "
-            f"未高於前日最高 {prev2_high:.2f}，非連續兩日跳空"
-        )
-
-    return SignalResult(hit=False, detail=f"{reason}，雙跳空不成立")
+    return SignalResult(
+        hit=False,
+        detail=f"近{WINDOW}根K線中僅 {len(gap_dates)} 根跳空向上 (需要{REQUIRED_GAPS}根)",
+    )

@@ -13,6 +13,11 @@
 => 代表突破後量縮整理、且掃描日當天正站穩均線之上且乖離不過大的整理甜蜜點，巧妙點成立
 
 需要 SignalContext.df 已包含 MA60 / VolMA10 / Bias20 / BB_BW 欄位 (見 indicators.add_indicators)
+
+效能備註 (2026-08-12)：改用 df.index 直接查找 (in / get_loc)，
+取代原本每次呼叫都重新 df.index.tolist() + list.index() 的線性掃描。
+本函式內部迴圈還會呼叫 5 個子訊號 (雙漲停/漲停/雙跳空/單跳空/三白兵)，
+那些子訊號同樣套用了相同的效能修正，因此這裡的效益是疊加的。
 """
 import pandas as pd
 from .base import SignalContext, SignalResult, register_signal
@@ -22,8 +27,11 @@ from .single_gap import check_single_gap
 from .double_limit_up import check_double_limit_up
 from .limit_up import check_limit_up
 
-LOOKBACK_DAYS = 22
-BODY_RATIO_MAX = 30.0
+LOOKBACK_DAYS = 22            # 往前搜尋「訊號線型」突破事件(雙漲停/漲停/雙跳空/單跳空/三白兵)的交易日數上限
+BODY_RATIO_MAX = 30.0         # K線實體佔當日振幅比例上限 (%)，用來判定是否為窄幅整理K線
+VOLUME_SHRINK_RATIO = 0.8     # 量縮比例：需低於前10日均量的此倍數
+BIAS20_MAX_PCT = 26.5         # 20日乖離率上限 (%)
+BB_BW_MIN_PCT = 30.0          # 布林通道帶寬下限 (%)
 
 
 def _is_narrow_candle(df, i) -> bool:
@@ -46,16 +54,16 @@ def _is_narrow_candle(df, i) -> bool:
 )
 def check_clever_point(ctx: SignalContext) -> SignalResult:
     df = ctx.df
-    dates = df.index.tolist()
+    dates = df.index
 
     if ctx.scan_date not in dates:
         return SignalResult(hit=False, detail="掃描日不在資料範圍內")
-        
+
     # 確認所需欄位皆存在 (包含 BB_BW)
     if "MA60" not in df.columns or "VolMA10" not in df.columns or "Bias20" not in df.columns or "BB_BW" not in df.columns:
         return SignalResult(hit=False, detail="資料缺少 MA60 / VolMA10 / Bias20 / BB_BW 指標欄位")
 
-    idx = dates.index(ctx.scan_date)
+    idx = df.index.get_loc(ctx.scan_date)
     if idx == 0:
         return SignalResult(hit=False, detail="資料不足，無法計算前10日均量")
 
@@ -65,8 +73,8 @@ def check_clever_point(ctx: SignalContext) -> SignalResult:
         return SignalResult(hit=False, detail=f"{ctx.scan_date} 收盤未站上60MA，不成立")
 
     prior_vol_avg = df["Volume"].iloc[max(0, idx - 10):idx].mean()
-    threshold_vol = prior_vol_avg * 0.8
-    
+    threshold_vol = prior_vol_avg * VOLUME_SHRINK_RATIO
+
     if today["Volume"] >= threshold_vol:
         return SignalResult(
             hit=False,
@@ -76,14 +84,14 @@ def check_clever_point(ctx: SignalContext) -> SignalResult:
     if not _is_narrow_candle(df, idx):
         return SignalResult(hit=False, detail=f"{ctx.scan_date} 不屬於窄幅整理K線 (實體比例過大或無上下影線)，不成立")
 
-    if today["Bias20"] >= 26.5:
+    if today["Bias20"] >= BIAS20_MAX_PCT:
         return SignalResult(
-            hit=False, 
-            detail=f"{ctx.scan_date} 20MA乖離率({today['Bias20']:.2f}%) >= 26.5%，乖離過大不成立"
+            hit=False,
+            detail=f"{ctx.scan_date} 20MA乖離率({today['Bias20']:.2f}%) >= {BIAS20_MAX_PCT}%，乖離過大不成立"
         )
 
-    # 檢查布林通道帶寬是否大於等於 30% (直接讀取 indicators.py 計算好的結果)
-    if pd.isna(today["BB_BW"]) or today["BB_BW"] < 30.0:
+    # 檢查布林通道帶寬是否大於等於門檻 (直接讀取 indicators.py 計算好的結果)
+    if pd.isna(today["BB_BW"]) or today["BB_BW"] < BB_BW_MIN_PCT:
         return SignalResult(
             hit=False,
             detail=f"{ctx.scan_date} 布林帶寬({today['BB_BW']:.2f}%) < 30%，波動壓縮過度不觸發"
@@ -95,7 +103,7 @@ def check_clever_point(ctx: SignalContext) -> SignalResult:
     for i in range(idx, lookback_start - 1, -1):
         d = dates[i]
         sub_ctx = SignalContext(code=ctx.code, name=ctx.name, df=df, scan_date=d)
-        
+
         if check_double_limit_up(sub_ctx).hit:
             breakout_date, breakout_label = d, "雙漲停"
             break

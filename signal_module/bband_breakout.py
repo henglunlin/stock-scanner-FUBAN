@@ -8,6 +8,9 @@
 4. 依據是否留有跳空缺口，顯示 "Band 跳空突破" 或 "Band 突破"。
 
 需要 SignalContext.df 已包含 BB_UB / BB_BW 欄位 (見 indicators.add_indicators)
+
+效能備註 (2026-08-12)：改用 df.index 直接查找 (in / get_loc)，
+取代原本每次呼叫都重新 df.index.tolist() + list.index() 的線性掃描。
 """
 import pandas as pd
 from .base import SignalContext, SignalResult, register_signal
@@ -24,17 +27,17 @@ VOL_MA_PERIOD = 5     # 均量天數改為 5 日
 )
 def check_bband_breakout(ctx: SignalContext) -> SignalResult:
     df = ctx.df
-    dates = df.index.tolist()
+    dates = df.index
 
     if ctx.scan_date not in dates:
         return SignalResult(hit=False, detail="掃描日不在資料範圍內")
-        
+
     # 確保所需指標欄位已由 indicators.py 產生
     if "BB_UB" not in df.columns or "BB_BW" not in df.columns:
         return SignalResult(hit=False, detail="資料缺少 BB_UB / BB_BW 指標欄位")
 
-    idx = dates.index(ctx.scan_date)
-    
+    idx = df.index.get_loc(ctx.scan_date)
+
     # 確保有前兩日的資料可以觀察帶寬收斂狀況
     if idx < 2:
         return SignalResult(hit=False, detail="資料不足，無法取得前兩日狀態")
@@ -47,37 +50,37 @@ def check_bband_breakout(ctx: SignalContext) -> SignalResult:
     today_open = df.iloc[idx]["Open"]
     today_vol = df.iloc[idx]["Volume"]
     today_low = df.iloc[idx]["Low"]
-    
+
     # 若計算出的帶寬為空值(例如前幾筆資料)，防呆跳出
     if pd.isna(prev_bw) or pd.isna(prev2_bw) or pd.isna(today_ub):
         return SignalResult(hit=False, detail="布林通道資料不足(含空值)，無法判定")
-    
+
     # 取得前一日的最高價與收盤價，用於判斷跳空
     prev_high = df.iloc[idx - 1]["High"]
     prev_close = df.iloc[idx - 1]["Close"]
-    
+
     # 計算前 5 日均量 (不含今日)
     prev_vol_avg = df["Volume"].iloc[max(0, idx - VOL_MA_PERIOD):idx].mean()
 
     # 條件 1: 前兩日是否有任一日帶寬縮窄至 12% 內
     if prev_bw > MAX_BANDWIDTH and prev2_bw > MAX_BANDWIDTH:
         return SignalResult(
-            hit=False, 
+            hit=False,
             detail=f"{ctx.scan_date} 前兩日帶寬(昨:{prev_bw:.2f}%, 前:{prev2_bw:.2f}%)皆未達收斂標準(<= {MAX_BANDWIDTH}%)"
         )
-        
+
     # 條件 2: 是否紅K且突破上軌
     if today_close <= today_open or today_close <= today_ub:
         return SignalResult(
-            hit=False, 
+            hit=False,
             detail=f"{ctx.scan_date} 收盤價({today_close})未能以紅K突破上軌({today_ub:.2f})"
         )
-        
+
     # 條件 3: 是否帶量 (5日均量 1.5倍)
     threshold_vol = prev_vol_avg * VOL_MULTIPLIER
     if today_vol < threshold_vol:
         return SignalResult(
-            hit=False, 
+            hit=False,
             detail=f"{ctx.scan_date} 成交量({today_vol:.0f})未達前5日均量1.5倍({threshold_vol:.0f})"
         )
 

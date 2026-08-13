@@ -6,7 +6,7 @@
    最高價都不能超過(穿越)這條線 (可貼線/觸線，但不可突破)。
    => 以「上緣凸包 (Upper Convex Hull)」演算法找出所有合法的、未被穿越的高點連線，
       確保任兩根K棒之間絕不會有K棒的High超過線的內插值。
-   => 兩個高點之間至少要間隔 MIN_ANCHOR_GAP_DAYS(預設2)個交易日，避免兩點太靠近
+   => 兩個高點之間至少要間隔 MIN_ANCHOR_GAP_DAYS(預設3)個交易日，避免兩點太靠近
       導致斜率被少數幾根K棒放大、外推後線型失真(過陡)。
    => 較新的高點(anchor2)距離掃描日至少要間隔 MIN_BREAKOUT_GAP_DAYS(預設2)個交易日，
       避免高點才剛形成、線根本還沒被價格「測試」過一天，隔天隨便反彈一根就被誤判成突破
@@ -22,21 +22,32 @@
     中短期 : 6  < day_back1 <= 23
     中長期 : 23 < day_back1 <= 66  (66個交易日約為一季，也是最常用的長期掃描區間)
 
-只註冊「單一」訊號 key="trendline_breakout"，內部同時檢查三個等級，只要任一等級在掃描日
-「收盤」突破，該訊號即 hit=True。
-觸發時會把「哪個/哪些等級突破」寫進 SignalResult.sub_label (例如 "(中短期)"、
-"(短期、中短期)")，主程式的「訊號類型」欄位會自動把這個字串接在訊號名稱後面顯示，
-不需要為了顯示等級而拆成好幾個獨立註冊的訊號。detail 裡也會列出三個等級各自的評估細節。
+只註冊「單一」訊號 key="trendline_breakout"，內部會同時檢查三個等級。
+只要任一等級在掃描日「收盤」突破，該訊號即 hit=True，detail 會列出是哪個/哪些等級突破。
+不論當日是否突破，只要該區間內找得到合法的下降趨勢線，皆會透過 marks 回傳三個等級各自的
+錨點資訊，方便外部(如 app_simulator.py)把三條線都畫在圖上 (呈現「貼線觀察中」的效果)，
+真正觸發突破的那個等級，才會在圖上額外標示突破箭頭。
 
-marks: 若有任一等級成立，回傳「該等級」的 [anchor1_date, anchor2_date, scan_date]；
-若多個等級同時成立，取其中 anchor1 距今最近的那個等級的錨點(最新鮮、最值得標示的一組)。
+marks 資料結構 (list):
+    [
+        ("short", anchor1_date_or_None, anchor2_date_or_None, tier_hit_bool),
+        ("mid",   anchor1_date_or_None, anchor2_date_or_None, tier_hit_bool),
+        ("long",  anchor1_date_or_None, anchor2_date_or_None, tier_hit_bool),
+        ("scan", scan_date),
+    ]
+    找不到合法線的等級，anchor1/anchor2 會是 None。
 
 需要 df 至少包含 High / Close 欄位。
+
+效能備註 (2026-08-12)：改用 df.index 直接查找 (in / get_loc)，
+取代原本每次呼叫都重新 df.index.tolist() + list.index() 的線性掃描。
+這個訊號本身內部還要做上緣凸包運算，是眾訊號中單次呼叫成本較高的一個，
+在回測逐日呼叫時，省下的日期定位開銷佔比也更明顯。
 """
 from .base import SignalContext, SignalResult, register_signal
 
-SHORT_MAX_DAYS = 6
-MID_MAX_DAYS = 23
+SHORT_MAX_DAYS = 6   # 短期下降趨勢線分類的錨點1距離掃描日交易日數上限
+MID_MAX_DAYS = 23    # 中短期分類的錨點1距離掃描日交易日數上限
 LONG_MAX_DAYS = 66  # 一季，最常用的長期掃描區間
 MIN_ANCHOR_GAP_DAYS = 2  # 兩個高點錨點之間，中間至少要夾幾根K棒
 MIN_BREAKOUT_GAP_DAYS = 2  # 錨點2(較新的高點)距離掃描日至少要幾個交易日，避免高點剛形成隔天就被判定「突破」
@@ -142,65 +153,58 @@ def _evaluate_tier(df, end_idx, min_days, max_days):
     label="下降趨勢線突破",
     description=(
         "同時檢查短期(≤6日)/中短期(6~23日)/中長期(23~66日)三種下降趨勢線(高點間隔至少"
-        f"{MIN_ANCHOR_GAP_DAYS}個交易日、中間未被K棒穿越)，任一等級收盤價向上突破即成立，"
-        "訊號名稱後面會自動標示是哪個等級"
+        f"{MIN_ANCHOR_GAP_DAYS}個交易日、中間未被K棒穿越)，任一等級收盤價向上突破即成立"
     ),
 )
 def check_trendline_breakout(ctx: SignalContext) -> SignalResult:
     df = ctx.df
-    dates = df.index.tolist()
+    dates = df.index
 
     if ctx.scan_date not in dates:
         return SignalResult(hit=False, detail="掃描日不在資料範圍內")
 
-    end_idx = dates.index(ctx.scan_date)
+    end_idx = df.index.get_loc(ctx.scan_date)
     if end_idx < 2:
         return SignalResult(hit=False, detail="資料筆數不足，無法建立趨勢線")
 
+    marks = []
     detail_lines = []
     hit_labels = []
-    hit_tier_infos = []  # [(day_back1, tier_label, info), ...]，只收有成立的
+    any_hit = False
 
     for tier_key, min_days, max_days, tier_label in TIER_DEFS:
         info = _evaluate_tier(df, end_idx, min_days, max_days)
 
         if info is None:
+            marks.append((tier_key, None, None, False))
             detail_lines.append(
                 f"【{tier_label}】往前{min_days}~{max_days}個交易日內，找不到符合條件的下降趨勢線"
                 f"(需兩個依序遞減、間隔至少{MIN_ANCHOR_GAP_DAYS}個交易日的高點，且中間K棒未穿越)"
             )
             continue
 
+        a1_date, a2_date = dates[info["x1"]], dates[info["x2"]]
+        marks.append((tier_key, a1_date, a2_date, info["hit"]))
+
         if info["hit"]:
+            any_hit = True
             hit_labels.append(tier_label)
-            hit_tier_infos.append((end_idx - info["x1"], tier_label, info))
             detail_lines.append(
-                f"【{tier_label}】✅收盤突破 {dates[info['x1']]}(高{info['y1']:.2f})→{dates[info['x2']]}(高{info['y2']:.2f})，"
+                f"【{tier_label}】✅收盤突破 {a1_date}(高{info['y1']:.2f})→{a2_date}(高{info['y2']:.2f})，"
                 f"{ctx.scan_date}收盤{info['today_close']:.2f} > 延伸線{info['today_val']:.2f}"
             )
         else:
             detail_lines.append(
-                f"【{tier_label}】{dates[info['x1']]}(高{info['y1']:.2f})→{dates[info['x2']]}(高{info['y2']:.2f})，"
+                f"【{tier_label}】{a1_date}(高{info['y1']:.2f})→{a2_date}(高{info['y2']:.2f})，"
                 f"延伸至{ctx.scan_date}約{info['today_val']:.2f}，收盤{info['today_close']:.2f} 尚未(或非本日新)突破"
             )
 
-    any_hit = bool(hit_labels)
+    marks.append(("scan", ctx.scan_date))
 
-    if not any_hit:
+    if any_hit:
+        summary = "、".join(hit_labels)
+        detail = f"{ctx.scan_date} 突破：{summary}\n" + "\n".join(detail_lines)
+    else:
         detail = f"{ctx.scan_date} 尚無任何等級之下降趨勢線突破\n" + "\n".join(detail_lines)
-        return SignalResult(hit=False, detail=detail)
 
-    summary = "、".join(hit_labels)
-    detail = f"{ctx.scan_date} 突破：{summary}\n" + "\n".join(detail_lines)
-
-    # 取「較舊錨點距今最近」的那個成立等級，其錨點資訊拿來當 marks (最貼近當下、最有參考價值)
-    hit_tier_infos.sort(key=lambda t: t[0])
-    _, _, best_info = hit_tier_infos[0]
-    marks = [dates[best_info["x1"]], dates[best_info["x2"]], ctx.scan_date]
-
-    return SignalResult(
-        hit=True,
-        detail=detail,
-        marks=marks,
-        sub_label=f"({summary})",  # 顯示成 "下降趨勢線突破(短期)" 或 "下降趨勢線突破(短期、中短期)" 等
-    )
+    return SignalResult(hit=any_hit, detail=detail, marks=marks)

@@ -10,11 +10,15 @@
 => 兩次跳空之間夾住的區間形成孤島，構成島狀反轉
 
 回傳的 marks 包含: [最近一次跳空向下的日期, 掃描日期]
+
+效能備註 (2026-08-12)：改用 df.index 直接查找 (in / get_loc)，
+取代原本每次呼叫都重新 df.index.tolist() + list.index() 的線性掃描，
+在回測逐日呼叫大量訊號函式時可大幅減少重複的 O(n) 開銷。
 """
 from .base import SignalContext, SignalResult, register_signal
 
-LOOKBACK_DAYS = 15
-EXCLUDE_GAP_UP_DAYS = 5
+LOOKBACK_DAYS = 15            # 往前搜尋「跳空向下」的交易日數上限
+EXCLUDE_GAP_UP_DAYS = 5        # 排除條件：往前幾個交易日內若曾出現向上跳空，就不算成立(確保孤島完整性)
 
 
 @register_signal(
@@ -24,12 +28,12 @@ EXCLUDE_GAP_UP_DAYS = 5
 )
 def check_island_reversal(ctx: SignalContext) -> SignalResult:
     df = ctx.df
-    dates = df.index.tolist()
+    dates = df.index
 
     if ctx.scan_date not in dates:
         return SignalResult(hit=False, detail="掃描日不在資料範圍內")
 
-    idx = dates.index(ctx.scan_date)
+    idx = df.index.get_loc(ctx.scan_date)
     if idx == 0:
         return SignalResult(hit=False, detail="掃描日為資料首日，無前一日可比較")
 
@@ -50,11 +54,11 @@ def check_island_reversal(ctx: SignalContext) -> SignalResult:
         if cur["Low"] > prv["High"]:
             recent_gap_up_date = dates[i]
             break
-            
+
     # 如果前 5 天內已經有過向上跳空，則直接判定失敗，並說明原因
     if recent_gap_up_date is not None:
         return SignalResult(
-            hit=False, 
+            hit=False,
             detail=f"今日雖跳空向上，但前 {EXCLUDE_GAP_UP_DAYS} 日內({recent_gap_up_date})也曾出現向上跳空，排除島狀反轉"
         )
 

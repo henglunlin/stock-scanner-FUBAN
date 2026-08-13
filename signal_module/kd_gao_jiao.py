@@ -8,11 +8,14 @@ KD高腳
   (代表低檔越墊越高，動能增強)
 
 需要 SignalContext.df 已包含 K / D 欄位 (見 indicators.add_indicators)
+
+效能備註 (2026-08-12)：改用 df.index 直接查找 (in / get_loc)，
+取代原本每次呼叫都重新 df.index.tolist() + list.index() 的線性掃描。
 """
 from .base import SignalContext, SignalResult, register_signal
 
-LOOKBACK_DAYS = 30
-LOW_K_THRESHOLD = 50.0
+LOOKBACK_DAYS = 30            # 往前搜尋前一次「低檔黃金交叉」的交易日數上限
+LOW_K_THRESHOLD = 50.0        # 判定「低檔」的K值上限，K值需低於此值才算低檔
 
 
 def _is_golden_cross(df, i) -> bool:
@@ -30,14 +33,14 @@ def _is_golden_cross(df, i) -> bool:
 )
 def check_kd_gao_jiao(ctx: SignalContext) -> SignalResult:
     df = ctx.df
-    dates = df.index.tolist()
+    dates = df.index
 
     if ctx.scan_date not in dates:
         return SignalResult(hit=False, detail="掃描日不在資料範圍內")
     if "K" not in df.columns or "D" not in df.columns:
         return SignalResult(hit=False, detail="資料缺少 K/D 指標欄位")
 
-    idx = dates.index(ctx.scan_date)
+    idx = df.index.get_loc(ctx.scan_date)
     if not _is_golden_cross(df, idx):
         return SignalResult(hit=False, detail="掃描日未出現KD黃金交叉，不成立")
 
