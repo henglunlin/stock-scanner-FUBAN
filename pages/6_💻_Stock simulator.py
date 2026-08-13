@@ -187,11 +187,7 @@ def journal_editor_dialog():
     for _col in ["股票代碼", "股票名稱", "進出手法", "Note"]:
         edit_source[_col] = edit_source[_col].astype("string")
     edit_source["買賣張數"] = pd.to_numeric(edit_source["買賣張數"], errors="coerce")
-    # 這裡刻意 .astype(float)：如果目前紀錄裡的價格剛好都是整數 (例如 100、250)，
-    # pd.to_numeric() 會把整欄自動推斷成 int64，Streamlit 的 data_editor 會依照
-    # 欄位的 pandas dtype 決定編輯格子能不能輸入小數，即使 NumberColumn 有設定
-    # format="%.2f" 也一樣會被 int64 擋掉小數點，只能整數。強制轉成 float 避免這個問題。
-    edit_source["進出場價格"] = pd.to_numeric(edit_source["進出場價格"], errors="coerce").astype(float)
+    edit_source["進出場價格"] = pd.to_numeric(edit_source["進出場價格"], errors="coerce")
 
     edited_df = st.data_editor(
         edit_source,
@@ -202,7 +198,7 @@ def journal_editor_dialog():
             "交易日期": st.column_config.DateColumn("交易日期", format="YYYY-MM-DD"),
             "股票代碼": st.column_config.SelectboxColumn("股票代碼 (可搜尋)", options=stock_code_options, required=True),
             "股票名稱": st.column_config.TextColumn("股票名稱 (依代碼自動帶入)", disabled=True),
-            "進出場價格": st.column_config.NumberColumn("進出場價格", format="%.2f", step=0.01),
+            "進出場價格": st.column_config.NumberColumn("進出場價格", format="%.2f"),
             "進出手法": st.column_config.SelectboxColumn("進出手法 (清單選擇，上方可新增自訂選項)", options=method_options),
             "買賣張數": st.column_config.NumberColumn("買賣張數", format="%d", min_value=0, step=1),
             "Note": st.column_config.TextColumn("Note"),
