@@ -1089,9 +1089,9 @@ def _default_browse_scan_date():
     return datetime.today().date()
 
 
-st.markdown("### 📋 掃描結果瀏覽（讀取台股掃描器的掃描結果）")
+st.markdown("### 📋 Sotck Simulator")
 
-with st.expander("展開瀏覽掃描結果", expanded=True):
+with st.expander("展開瀏覽掃描結果", expanded=Fales):
     sel_col1, sel_col3, sel_col4, btn_col1, btn_col2 = st.columns([1, 1.6, 1.8, 0.9, 0.9])
 
     # --- 欄位1：掃描資料日期 ---
