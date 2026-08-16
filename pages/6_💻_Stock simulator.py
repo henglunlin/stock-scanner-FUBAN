@@ -869,17 +869,10 @@ with st.sidebar:
             for e in st.session_state.signal_errors: st.error(f"載入失敗: {e}")
 
     st.subheader("日期設定")
-    # 「📋 掃描結果瀏覽」的「K線日期」欄位若有帶新值過來，要在這個 key 對應的
-    # st.date_input 建立"之前"套用，不能在按鈕的 callback 裡直接寫
-    # st.session_state["chart_scan_end_date"]——因為這個 widget 在腳本裡的位置
-    # (側邊欄) 比「📋 掃描結果瀏覽」區塊還早執行，同一輪內對已建立過的 widget key
-    # 賦值會被 Streamlit 擋下 (StreamlitAPIException: cannot be modified after the
-    # widget is instantiated)。改成先把新值放進一個獨立的暫存 key
-    # (_pending_kline_date)，rerun 後、在這個 widget 建立之前先套用進去，
-    # 跟下面 RUN 按鈕沿用的 `_pending_chart_run` 是同一種寫法。
-    if "_pending_kline_date" in st.session_state:
-        st.session_state["chart_scan_end_date"] = st.session_state.pop("_pending_kline_date")
     scan_start_date = st.date_input("掃描起始日期", value=pd.to_datetime("2026-04-27"), key="chart_scan_start_date")
+    # 「結束日期」= 圖表要畫到哪一天為止。原本「📋 掃描結果瀏覽」有一個獨立的「K線日期」
+    # 欄位可以覆寫這個值，但因為使用者要展開側邊欄才看得到有沒有生效、效果又不明顯
+    # (常常只差一兩根K棒)，2026-08-16 依需求移除該欄位，圖表結束日期統一只由這裡控制。
     scan_end_date = st.date_input("結束日期", value=datetime.today().date(), key="chart_scan_end_date")
 
 
@@ -898,11 +891,11 @@ with st.sidebar:
 # 這份 CSV 是累積寫入的 (不會每天重置)，抓回來後還要再依 scan_date 欄位篩選一次，
 # 不能直接假設整份檔案內容都等於檔名那天的資料。
 #
-# 排版邏輯 (2026-08-16 依使用者需求重新設計)：
-#   單行 4 個欄位 + 2 個按鈕，取代原本的卡片網格瀏覽：
+# 排版邏輯 (2026-08-16 依使用者需求重新設計，同日移除「K線日期」欄位)：
+#   單行 3 個欄位 + 2 個按鈕，取代原本的卡片網格瀏覽：
 #     掃描資料日期 → 訊號類型 (多選) → 股票代碼/名稱 (單選)　三者階層連動篩選，
-#     K線日期 (獨立欄位，決定K線圖要畫到哪一天，預設今天/遇假日退回上個週五)，
 #     ✅ 查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN)、🔄 重新整理 (清快取重抓 GitHub)。
+#   圖表要畫到哪一天，統一交給側邊欄「日期設定」的「結束日期」控制 (不在這裡重複)。
 GITHUB_TRACKING_OWNER = st.secrets.get("GITHUB_OWNER", "henglunlin")
 GITHUB_TRACKING_REPO = st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN")
 GITHUB_TRACKING_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
@@ -975,20 +968,10 @@ def _default_browse_scan_date():
     return datetime.today().date()
 
 
-def _default_kline_date():
-    """K線日期預設值：預設今天，但今天是週六日時自動退回上一個交易日 (週五)。"""
-    today = datetime.today().date()
-    if today.weekday() == 5:  # 週六
-        return today - timedelta(days=1)
-    if today.weekday() == 6:  # 週日
-        return today - timedelta(days=2)
-    return today
-
-
 st.markdown("### 📋 掃描結果瀏覽（讀取台股掃描器的掃描結果）")
 
 with st.expander("展開瀏覽掃描結果", expanded=True):
-    sel_col1, sel_col2, sel_col3, sel_col4, btn_col1, btn_col2 = st.columns([1, 1, 1.6, 1.8, 0.9, 0.9])
+    sel_col1, sel_col3, sel_col4, btn_col1, btn_col2 = st.columns([1, 1.6, 1.8, 0.9, 0.9])
 
     # --- 欄位1：掃描資料日期 ---
     if "browse_scan_date" not in st.session_state:
@@ -1069,17 +1052,6 @@ with st.expander("展開瀏覽掃描結果", expanded=True):
             "股票代碼/名稱", options=select_options, disabled=not stock_pick_options, key="browse_stock_pick",
         )
 
-    # --- 欄位2：K線日期 (自由日期，決定K線圖畫到哪一天，不參與上面三者的階層連動) ---
-    # 完全自由選擇，不限制一定要晚於/等於「掃描資料日期」(例如想只看訊號當天之前的走勢
-    # 也可以)，只提供一個合理的預設值方便快速使用。
-    if "browse_kline_date" not in st.session_state:
-        st.session_state["browse_kline_date"] = _default_kline_date()
-    with sel_col2:
-        kline_date = st.date_input(
-            "K線日期", key="browse_kline_date",
-            help="K線圖要顯示到哪一天為止（可自由選擇，不限於掃描資料日期之後）",
-        )
-
     # --- 按鈕1：查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN) ---
     with btn_col1:
         st.write("")
@@ -1104,11 +1076,9 @@ with st.expander("展開瀏覽掃描結果", expanded=True):
         if matched_option:
             st.session_state["main_stock_choice"] = matched_option
             st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
-            # 不能在這裡直接寫 st.session_state["chart_scan_end_date"]：那個 widget
-            # (側邊欄「結束日期」) 在本輪腳本裡已經先跑過了，Streamlit 會擋下這種賦值。
-            # 改寫進 _pending_kline_date，留給側邊欄那段程式碼在下一輪、建立該 widget
-            # 之前套用 (見「日期設定」上方的套用邏輯)。
-            st.session_state["_pending_kline_date"] = pd.to_datetime(kline_date).date()
+            # 圖表結束日期不在這裡覆寫，維持使用者在側邊欄「日期設定」設定的「結束日期」
+            # (K線日期欄位已於 2026-08-16 移除，避免兩個地方都能改同一個效果、卻只有
+            # 側邊欄那個看得到目前的值)。
             st.session_state["_pending_chart_run"] = True
             st.rerun()
         else:
@@ -1155,9 +1125,9 @@ with col4:
     st.write("")
     st.write("")
     # `_pending_chart_run` 由上方「📋 掃描結果瀏覽」的「✅ 查看K線圖」按鈕設定：
-    # 按下該按鈕時會先把 main_stock_choice / chart_scan_target_date / chart_scan_end_date
-    # 帶入 session_state 再 st.rerun()，這裡讀到旗標後視同使用者按下了 RUN，沿用下面完整的
-    # 既有 RUN 邏輯 (指標計算＋模擬回測＋K線＋B/S/停利標記)，不用另外重寫一套圖表繪製流程。
+    # 按下該按鈕時會先把 main_stock_choice / chart_scan_target_date 帶入 session_state
+    # 再 st.rerun()，這裡讀到旗標後視同使用者按下了 RUN，沿用下面完整的既有 RUN 邏輯
+    # (指標計算＋模擬回測＋K線＋B/S/停利標記)，不用另外重寫一套圖表繪製流程。
     run_clicked = st.button("RUN", use_container_width=True, type="primary", key="chart_run_btn") \
         or st.session_state.pop("_pending_chart_run", False)
 
@@ -1211,16 +1181,29 @@ if run_clicked:
             # 不會因為單日驗證掃描日期(scan_target_date)超出此範圍而被意外撐大
             display_df = full_df[(full_df.index >= scan_start_str) & (full_df.index <= chart_end_str)]
         
-            # 2. 執行區間模擬回測邏輯 
+            # 2. 執行區間模擬回測邏輯
             trades = []
             active_positions = []
-            last_buy_idx = {}  
-            max_capital_used = 0  
-        
+            last_buy_idx = {}
+            max_capital_used = 0
+            # 收集回測迴圈裡「訊號模組執行失敗」的紀錄 (訊號名稱/日期/錯誤訊息)，
+            # 之前是 except: pass 整個吞掉、使用者完全看不到；現在改成不中斷回測，
+            # 但把每一筆失敗都記下來，跑完後在「模擬回測績效」上方集中顯示一段警告。
+            signal_error_log = []
+
+            # 效能最佳化 (2026-08-16)：原本迴圈裡「每一天」都對 full_df 做 .loc[d, col]
+            # 標籤查找 (Close、Bias60)，label-based .loc 在迴圈內重複呼叫的開銷不小；
+            # 這裡改成迴圈開始前先把需要的欄位一次性轉成 {日期: 值} 的 dict、以及
+            # {日期: 在full_df裡的位置} 的 dict，迴圈內全部改用 dict 查找。純粹是查找方式
+            # 改變，不影響任何計算邏輯或回測結果 (不動訊號模組本身的執行方式)。
+            full_df_close = full_df["Close"].to_dict()
+            full_df_bias60 = full_df["Bias60"].to_dict() if "Bias60" in full_df.columns else {}
+            full_df_pos = {date: pos for pos, date in enumerate(full_df.index)}
+
             if enable_backtest:
                 for i, d in enumerate(display_df.index):
-                    current_price = full_df.loc[d, "Close"]
-                
+                    current_price = full_df_close[d]
+
                     # --- 賣出檢查 ---
                     if len(active_positions) > 0:
                         triggered_sell_signals = []
@@ -1230,27 +1213,28 @@ if run_clicked:
                                 try:
                                     if st.session_state.signal_registry[sig]["func"](ctx_sell).hit:
                                         triggered_sell_signals.append(sig)
-                                except Exception:
-                                    pass
-                            
+                                except Exception as e:
+                                    signal_error_log.append({
+                                        "訊號": signal_labels.get(sig, sig), "日期": d,
+                                        "動作": "賣出檢查", "錯誤": str(e),
+                                    })
+
                         remaining_positions = []
-                        sold_any = False
-                    
+
                         for pos in active_positions:
                             profit_pct = (current_price - pos["buy_price"]) / pos["buy_price"] * 100
                             sell_reason = None
 
                             eligible_signal = next((sig for sig in triggered_sell_signals if sig != REVERSE_3K_SIGNAL_KEY or profit_pct > REVERSE_3K_MIN_PROFIT_PCT), None)
-                        
+
                             if profit_pct <= -stop_loss_pct:
                                 sell_reason = f"停損出場 ({profit_pct:.1f}%)"
                             elif enable_take_profit and profit_pct >= take_profit_pct:
                                 sell_reason = f"停利達標 ({profit_pct:.1f}%)"
                             elif eligible_signal is not None:
                                 sell_reason = f"訊號出場 ({signal_labels.get(eligible_signal, eligible_signal)})"
-                            
+
                             if sell_reason:
-                                sold_any = True
                                 pnl = (current_price - pos["buy_price"]) * pos["shares"] * 1000
                                 trades.append({
                                     "買入日期": pos["buy_date"], "買入理由": pos["signal_label"],
@@ -1262,13 +1246,17 @@ if run_clicked:
                                 })
                             else:
                                 remaining_positions.append(pos)
-                            
+
                         active_positions = remaining_positions
-                        if sold_any: continue
+                        # 2026-08-16 修正：原本「當天只要有賣出就直接 continue」，導致同一天
+                        # 停損/停利/訊號出場後，即使當天另有買入訊號觸發，也結構性地不可能同日
+                        # 再進場。改成賣出檢查結束後照常往下走買入檢查，讓同日再進場成為可能；
+                        # 「同訊號再次買入冷卻期」(last_buy_idx/buy_cooldown) 不受影響，仍會正常
+                        # 擋下同一個訊號在冷卻期內的重複買入 (含當天賣出、當天又觸發同訊號的情況)。
 
                     # --- 買入檢查 ---
                     if buy_signals:
-                        current_bias60 = full_df.loc[d, "Bias60"] if "Bias60" in full_df.columns else 0
+                        current_bias60 = full_df_bias60.get(d, 0)
                         if enable_bias60_filter and pd.notna(current_bias60) and current_bias60 > max_bias60_buy_pct:
                             pass
                         else:
@@ -1281,12 +1269,23 @@ if run_clicked:
                                 try:
                                     if st.session_state.signal_registry[sig]["func"](ctx_buy).hit:
                                         hit_today.append(sig)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    signal_error_log.append({
+                                        "訊號": signal_labels.get(sig, sig), "日期": d,
+                                        "動作": "買入檢查", "錯誤": str(e),
+                                    })
 
                             entry_score, entry_grade, entry_signals_text = None, None, ""
                             if hit_today:
-                                score_data = build_score_input(full_df, d, i)
+                                # 2026-08-16 修正：build_score_input() 內部用第三個參數當「在
+                                # full_df 裡的位置」去抓前1天/前20天的收盤價算漲跌幅%與波動率，
+                                # 但這裡原本傳的是 i (在 display_df 裡的位置)。full_df 為了讓
+                                # 指標(MA/KD等)在區間起點就有值，會比 display_df 往前多抓90天
+                                # 緩衝資料，兩邊位置對不上，導致算出來的評分其實是抓到緩衝期
+                                # (跟掃描區間無關的更早日期)的資料，評分本身是錯的，連帶「訊號
+                                # 評分低於門檻不買」這個過濾器也是用錯的數字在判斷。改用
+                                # full_df_pos[d] 取得 d 在 full_df 裡的正確位置。
+                                score_data = build_score_input(full_df, d, full_df_pos[d])
                                 score_labels = [signal_labels.get(s, s) for s in hit_today]
                                 score_kinds = {lbl: "buy" for lbl in score_labels}
                                 entry_score = calc_signal_quality_score(score_data, score_labels, score_kinds)
@@ -1307,7 +1306,10 @@ if run_clicked:
                                 current_invested = sum(p["buy_price"] * p["shares"] * 1000 for p in active_positions)
                                 max_capital_used = max(max_capital_used, current_invested)
 
-            st.session_state.run_results = (display_df, results, stock_code, stock_name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used)
+            st.session_state.run_results = (
+                display_df, results, stock_code, stock_name, scan_target_str,
+                trades, active_positions, enable_backtest, max_capital_used, signal_error_log,
+            )
     except Exception as e:
         st.exception(e)
 
@@ -1318,7 +1320,7 @@ if run_clicked:
 chart_placeholder = st.container()
 with chart_placeholder:
     if st.session_state.run_results is not None:
-        display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used = st.session_state.run_results
+        display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log = st.session_state.run_results
 
         _cur_target_str = pd.to_datetime(scan_target_date).strftime("%Y-%m-%d")
         if code != stock_code or scan_target_str != _cur_target_str:
@@ -1575,7 +1577,7 @@ with chart_placeholder:
 # 下方顯示區塊: 訊號結果 & 回測績效
 # --------------------------------------------------------------------------
 if st.session_state.run_results is not None:
-    display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used = st.session_state.run_results
+    display_df, results, code, name, scan_target_str, trades, active_positions, enable_backtest, max_capital_used, signal_error_log = st.session_state.run_results
 
     _cur_target_str2 = pd.to_datetime(scan_target_date).strftime("%Y-%m-%d")
     if code != stock_code or scan_target_str != _cur_target_str2:
@@ -1596,7 +1598,16 @@ if st.session_state.run_results is not None:
     if enable_backtest and col_backtest is not None:
         with col_backtest:
             st.markdown("**模擬回測績效 (清單顯示)**")
-            
+
+            # 回測迴圈裡訊號模組執行失敗的警告 (2026-08-16 新增)：原本是 except: pass
+            # 整個吞掉，使用者完全不知道某個訊號模組在回測期間偶爾/持續執行失敗。
+            # 現在集中列在交易明細上方，不中斷回測本身，但讓使用者知道哪些訊號、
+            # 哪些日期發生了錯誤，自行判斷該結果是否可信。
+            if signal_error_log:
+                st.warning(f"⚠️ 回測期間有 {len(signal_error_log)} 次訊號執行失敗，以下交易結果可能不完整：")
+                with st.expander(f"查看訊號執行失敗明細 ({len(signal_error_log)} 筆)"):
+                    st.dataframe(pd.DataFrame(signal_error_log), use_container_width=True, hide_index=True)
+
             if trades:
                 df_trades = pd.DataFrame(trades)
                 total_pnl = df_trades["損益(元)"].sum()
