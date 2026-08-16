@@ -43,7 +43,6 @@ from signals import (
     get_signal_registry,
     build_base_context,
 )
-from signals.context import classify_relative_strength
 
 from scoring import (
     LOCAL_DATABASE_DIR,
@@ -217,7 +216,7 @@ def upload_tracking_file_to_github(commit_suffix: str = "") -> bool:
 
 # ===== Excel 匯出工具 =====
 def normalize_rows_for_excel(rows):
-    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "訊號方向", "訊號類型", "大盤相比(強/弱)", "波動率%", "RS創新高", "RS Rating", "MA位置", "MA排列", "RS加權報酬%", "RS超額報酬%", "訊號分數", "追蹤等級", "大盤MA位置", "大盤MA排列", "訊號說明", "來源"]
+    columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "RS超額報酬%", "RS Rating", "RS創新高", "訊號分數", "追蹤等級", "MA位置", "MA排列", "大盤MA位置", "大盤MA排列", "訊號方向", "訊號類型", "訊號說明", "來源"]
     if not rows: return pd.DataFrame(columns=columns)
     df = pd.DataFrame(rows).drop_duplicates(subset=["代碼"]).copy()
     if "代碼網址" in df.columns: df.drop(columns=["代碼網址"], inplace=True)
@@ -534,9 +533,6 @@ if should_run_scan:
 
     # RS Rating 用：收集本次掃描「所有成功抓到資料」股票的 RS超額報酬%，全市場跑完後統一算百分位排名
     rs_universe_map = {}
-    # 2026-08-16 新增：「大盤相比(強/弱)」判斷用，記錄每一檔股票的 MA排列 與 RS創新高（原始布林值），
-    # 全市場掃描跑完、算出 RS Rating 後，再跟 RS Rating 一起丟進 classify_relative_strength() 統一判斷。
-    relative_strength_inputs = {}
 
     render_scan_progress_card(scan_progress_card_placeholder, 0, "掃描進度")
     progress_bar = st.progress(0, text=f"掃描進度：0.0%（準備掃描 {scan_total_count} 檔股票）")
@@ -611,11 +607,6 @@ if should_run_scan:
                 # 不受「只顯示訊號股票」等篩選條件影響，全市場掃描完後才統一算百分位排名。
                 if data.get("rs_excess") not in (None, "-"):
                     rs_universe_map[symbol] = float(data["rs_excess"])
-                    relative_strength_inputs[symbol] = {
-                        "rs_excess": float(data["rs_excess"]),
-                        "ma_trend": data.get("ma_trend"),
-                        "rs_line_new_high": data.get("rs_line_new_high"),
-                    }
 
                 signal_direction_labels = []
                 if any(signal_kinds.get(s) == "buy" for s in signal_types): signal_direction_labels.append("買")
@@ -635,7 +626,6 @@ if should_run_scan:
                     "RS超額報酬%": data.get("rs_excess", "-"),
                     "RS Rating": "-",  # 全市場掃描跑完後才統一補上百分位排名 (見主迴圈結束後的 patch 區塊)
                     "RS創新高": rs_line_new_high_text,
-                    "大盤相比(強/弱)": "-",  # 同上，需等 RS Rating 算完才能一起判斷 (見主迴圈結束後的 patch 區塊)
                     # ------------------------------------------
                     "訊號方向": signal_direction_text,
                     "訊號類型": "、".join(_display_signal_type(s) for s in signal_types) if signal_types else "-",
@@ -664,7 +654,7 @@ if should_run_scan:
                 error_stock_name = get_stock_name(symbol, st.session_state.fubon_sdk)
                 record_missing_stock(missing_stock_details, fetch_errors, symbol, error_stock_name, f"{type(e).__name__}: {e}", group_name, active_price_source)
                 if not show_only_signal_rows:
-                    rows.append({"代碼": symbol, "代碼網址": "", "股票名稱": error_stock_name, "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-", "訊號分數": "-", "追蹤等級": "-", "MA位置": "-", "MA排列": "-", "大盤MA位置": "-", "大盤MA排列": "-", "RS超額報酬%": "-", "RS Rating": "-", "RS創新高": "-", "大盤相比(強/弱)": "-", "訊號方向": "-", "訊號類型": "錯誤", "訊號說明": str(e), "來源": active_price_source})
+                    rows.append({"代碼": symbol, "代碼網址": "", "股票名稱": error_stock_name, "價格": "錯誤", "漲跌%": "-", "成交量(張)": "-", "波動率%": "-", "RS加權報酬%": "-", "訊號分數": "-", "追蹤等級": "-", "MA位置": "-", "MA排列": "-", "大盤MA位置": "-", "大盤MA排列": "-", "RS超額報酬%": "-", "RS Rating": "-", "RS創新高": "-", "訊號方向": "-", "訊號類型": "錯誤", "訊號說明": str(e), "來源": active_price_source})
 
         group_tables[group_name] = {"count": len(stocks), "table": pd.DataFrame(rows)}
         group_up_summary.append({
@@ -683,35 +673,16 @@ if should_run_scan:
     else:
         rs_rating_map = {}
 
-    # ===== 大盤相比(強/弱)：同樣要等 RS Rating 算完才能綜合判斷，跟上面 RS Rating 一起回填 =====
-    # 大盤自己的 MA排列（benchmark_ma_trend）整次掃描只有一個值，直接從 benchmark_ctx 取，
-    # 不需要跟 rs_excess/ma_trend 一樣逐檔記錄。
-    _benchmark_ma_trend = benchmark_ctx.get("ma_trend") if benchmark_ctx else None
-    relative_strength_map = {}
-    for _symbol, _inputs in relative_strength_inputs.items():
-        relative_strength_map[_symbol] = classify_relative_strength(
-            rs_excess=_inputs["rs_excess"],
-            rs_rating=rs_rating_map.get(_symbol),
-            ma_trend=_inputs["ma_trend"],
-            benchmark_ma_trend=_benchmark_ma_trend,
-            rs_line_new_high=_inputs["rs_line_new_high"],
-        )
-
     def _apply_rs_rating_to_rows(rows_list):
         for r in rows_list:
             val = rs_rating_map.get(r.get("代碼"))
             r["RS Rating"] = val if val is not None else "-"
-            r["大盤相比(強/弱)"] = relative_strength_map.get(r.get("代碼"), "-")
 
     for _info in group_tables.values():
         _df = _info.get("table")
         if _df is not None and not _df.empty and "代碼" in _df.columns:
-            _info["table"] = _df.assign(**{
-                "RS Rating": _df["代碼"].map(rs_rating_map),
-                "大盤相比(強/弱)": _df["代碼"].map(relative_strength_map),
-            })
+            _info["table"] = _df.assign(**{"RS Rating": _df["代碼"].map(rs_rating_map)})
             _info["table"]["RS Rating"] = _info["table"]["RS Rating"].apply(lambda v: v if pd.notna(v) else "-")
-            _info["table"]["大盤相比(強/弱)"] = _info["table"]["大盤相比(強/弱)"].apply(lambda v: v if pd.notna(v) else "-")
     _apply_rs_rating_to_rows(all_signal_rows)
     for _bucket_rows in signal_buckets.values():
         _apply_rs_rating_to_rows(_bucket_rows)
@@ -804,7 +775,7 @@ if fetch_errors:
     with st.expander(f"🔧 抓取/處理失敗除錯資訊（{len(fetch_errors)} 檔）", expanded=False):
         st.json(dict(list(fetch_errors.items())[:100]))
 
-display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "訊號方向", "訊號類型", "大盤相比(強/弱)", "波動率%", "RS創新高", "RS Rating", "MA位置", "MA排列", "RS加權報酬%", "RS超額報酬%", "訊號分數", "追蹤等級", "大盤MA位置", "大盤MA排列", "來源"]
+display_columns = ["代碼", "股票名稱", "價格", "漲跌%", "成交量(張)", "波動率%", "RS加權報酬%", "RS超額報酬%", "RS Rating", "RS創新高", "訊號分數", "追蹤等級", "MA位置", "MA排列", "大盤MA位置", "大盤MA排列", "訊號方向", "訊號類型", "來源"]
 
 if all_signal_rows:
     signal_display_df = pd.DataFrame(all_signal_rows).drop_duplicates(subset=["代碼"]).copy()
@@ -819,7 +790,6 @@ if all_signal_rows:
         "股票名稱": st.column_config.TextColumn("股票名稱"),
         "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
         "RS Rating": st.column_config.NumberColumn("RS Rating", format="%.1f", help="本次掃描全市場 RS超額報酬% 的百分位排名 (0~100，100=本次掃描最強)"),
-        "大盤相比(強/弱)": st.column_config.TextColumn("大盤相比(強/弱)", help="綜合 RS超額報酬%／RS Rating／MA排列(個股vs大盤)／RS創新高 四項訊號的簡化判斷：強／持平／弱"),
     })
 
     st.markdown("### 📑 依訊號分頁查看")
@@ -867,7 +837,6 @@ for group_name, info in group_tables.items():
         "股票名稱": st.column_config.TextColumn("股票名稱"),
         "訊號分數": st.column_config.NumberColumn("訊號分數", format="%.1f"),
         "RS Rating": st.column_config.NumberColumn("RS Rating", format="%.1f", help="本次掃描全市場 RS超額報酬% 的百分位排名 (0~100，100=本次掃描最強)"),
-        "大盤相比(強/弱)": st.column_config.TextColumn("大盤相比(強/弱)", help="綜合 RS超額報酬%／RS Rating／MA排列(個股vs大盤)／RS創新高 四項訊號的簡化判斷：強／持平／弱"),
     })
     st.markdown('<div style="margin-bottom: 10px;"></div>', unsafe_allow_html=True)
 
