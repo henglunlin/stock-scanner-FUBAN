@@ -860,6 +860,77 @@ with st.sidebar:
 
 
 # --------------------------------------------------------------------------
+# 📋 掃描結果瀏覽：讀取「台股掃描器」寫入 twse_ohlcv.db 的當日訊號清單
+# --------------------------------------------------------------------------
+# 掃描器跟這個頁面本來就共用同一份 twse_ohlcv.db，掃描器每次掃描完成後會把
+# all_signal_rows 寫進 signal_scan_results 表，這裡直接查表讀出來，不需要
+# 額外的檔案匯出/匯入或跨部署同步機制。
+st.markdown("### 📋 掃描結果瀏覽（讀取台股掃描器的掃描結果）")
+
+with st.expander("展開瀏覽掃描結果", expanded=False):
+    browse_col1, browse_col2 = st.columns([1, 2])
+    with browse_col1:
+        browse_scan_date = st.date_input("掃描日期", value=datetime.today().date(), key="browse_scan_date")
+    browse_date_str = pd.to_datetime(browse_scan_date).strftime("%Y-%m-%d")
+
+    try:
+        scan_results_df = db_utils.get_scan_results(conn, browse_date_str)
+    except Exception as e:
+        scan_results_df = pd.DataFrame()
+        st.error(f"讀取掃描結果失敗：{e}")
+
+    if scan_results_df.empty:
+        st.info(f"{browse_date_str} 目前沒有掃描器寫入的訊號股票清單（請先到「台股掃描器」頁面完成一次掃描）。")
+    else:
+        # 依 bucket 欄位 (以「、」串接的分頁名稱，例如「優先追蹤、3K反轉」) 彙整出可篩選的分頁清單
+        all_buckets = sorted({
+            b for buckets in scan_results_df["bucket"].fillna("").tolist()
+            for b in buckets.split("、") if b
+        })
+        with browse_col2:
+            selected_buckets = st.multiselect(
+                "依分頁篩選（不選=全部）", options=all_buckets, key="browse_bucket_filter"
+            )
+
+        filtered_df = scan_results_df
+        if selected_buckets:
+            filtered_df = filtered_df[
+                filtered_df["bucket"].fillna("").apply(lambda b: any(sb in b for sb in selected_buckets))
+            ]
+
+        st.caption(f"共 {len(filtered_df)} 檔（{browse_date_str}，依訊號分數排序）")
+
+        CARDS_PER_ROW = 4
+        rows_data = filtered_df.to_dict("records")
+        for row_start in range(0, len(rows_data), CARDS_PER_ROW):
+            card_cols = st.columns(CARDS_PER_ROW)
+            for col, item in zip(card_cols, rows_data[row_start:row_start + CARDS_PER_ROW]):
+                with col:
+                    with st.container(border=True):
+                        pct_val = item.get("pct")
+                        pct_val = pct_val if pct_val is not None else 0.0
+                        pct_color = "#cf1322" if pct_val > 0 else "#389e0d" if pct_val < 0 else "#333333"
+                        item_code = str(item.get("code", ""))
+                        st.markdown(f"**{item_code} {item.get('name', '')}**")
+                        st.markdown(
+                            f"<span style='color:{pct_color};font-weight:600;'>{pct_val:+.2f}%</span>　"
+                            f"價格 {item.get('price', '-')}　"
+                            f"分數 {item.get('signal_score', '-')} / {item.get('signal_grade', '-')}",
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(item.get("signal_types") or "-")
+                        if st.button("📈 查看K線圖", key=f"browse_view_{item_code}_{row_start}", use_container_width=True):
+                            matched_option = next(
+                                (opt for opt in stock_options if opt.startswith(f"{item_code} ")), None
+                            )
+                            if matched_option:
+                                st.session_state["main_stock_choice"] = matched_option
+                            st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
+                            st.session_state["_pending_chart_run"] = True
+                            st.rerun()
+
+
+# --------------------------------------------------------------------------
 # Main: 控制列
 # --------------------------------------------------------------------------
 col1, col2, col3, col4 = st.columns([1, 1.4, 1, 0.6])
@@ -889,7 +960,12 @@ with col3:
 with col4:
     st.write("")
     st.write("")
-    run_clicked = st.button("RUN", use_container_width=True, type="primary", key="chart_run_btn")
+    # `_pending_chart_run` 由上方「📋 掃描結果瀏覽」卡片的「查看K線圖」按鈕設定：
+    # 按下卡片按鈕時會先把 main_stock_choice / chart_scan_target_date 帶入 session_state
+    # 再 st.rerun()，這裡讀到旗標後視同使用者按下了 RUN，沿用下面完整的既有 RUN 邏輯
+    # (指標計算＋模擬回測＋K線＋B/S/停利標記)，不用另外重寫一套圖表繪製流程。
+    run_clicked = st.button("RUN", use_container_width=True, type="primary", key="chart_run_btn") \
+        or st.session_state.pop("_pending_chart_run", False)
 
 
 # --------------------------------------------------------------------------
