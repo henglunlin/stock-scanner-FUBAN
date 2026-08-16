@@ -1022,8 +1022,9 @@ with st.expander("展開瀏覽掃描結果", expanded=True):
 
     # --- 欄位3：訊號類型 (多選)，選項來自「掃描資料日期」當天實際出現過的類型 ---
     # signal_types 欄位是掃描器用「、」把單一股票當天觸發的多個訊號類型串成一個字串
-    # (例如「3K反轉、島狀反轉」)，這裡拆開取聯集，並用「是否命中任一已選類型」做篩選，
-    # 不會把同一檔股票拆成多列 (股票代碼/名稱清單本來就已經是一檔股票一列)。
+    # (例如「3K反轉、島狀反轉」)，這裡拆開取聯集。篩選邏輯是 AND：選了多個訊號類型時，
+    # 該股票當天要「同時」命中所有已選類型才會留下 (單純訊號濾波器邏輯)，不是命中任一個
+    # 就算數。不會把同一檔股票拆成多列 (股票代碼/名稱清單本來就已經是一檔股票一列)。
     all_signal_types = sorted({
         t for types_str in (scan_results_df["signal_types"].fillna("").tolist() if has_data else [])
         for t in types_str.split("、") if t and t != "-"
@@ -1036,7 +1037,7 @@ with st.expander("展開瀏覽掃描結果", expanded=True):
     if has_data and selected_types:
         type_filtered_df = scan_results_df[
             scan_results_df["signal_types"].fillna("").apply(
-                lambda s: any(t in s.split("、") for t in selected_types)
+                lambda s: all(t in s.split("、") for t in selected_types)
             )
         ]
     else:
@@ -1070,7 +1071,7 @@ with st.expander("展開瀏覽掃描結果", expanded=True):
     with btn_col1:
         st.write("")
         view_clicked = st.button(
-            "✅ 查看K線圖", use_container_width=True, type="primary",
+            "✅ 查看K線圖", use_container_width=True,
             key="browse_view_btn", disabled=not stock_pick_options,
         )
 
