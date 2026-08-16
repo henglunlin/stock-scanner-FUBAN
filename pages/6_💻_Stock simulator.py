@@ -8,12 +8,14 @@
 """
 import os
 import io
+import base64
 import tempfile
 import sqlite3
 import time
 import random
 import requests
 import urllib3
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -78,6 +80,84 @@ JOURNAL_LOG_SHEET = "log"
 JOURNAL_COLUMNS = ["交易日期", "股票代碼", "股票名稱", "進出場價格", "進出手法", "買賣張數", "Note"]
 JOURNAL_FONT_NAME = "微軟正黑體"
 JOURNAL_FONT_SIZE = 11
+JOURNAL_GITHUB_PATH = "Trading Journal.xlsx"  # 對應 GitHub repo 根目錄下的檔名
+
+
+# --------------------------------------------------------------------------
+# GitHub 同步工具 (交易紀錄 Trading Journal.xlsx)
+# --------------------------------------------------------------------------
+# 2026-08-16 新增：交易紀錄編輯器原本只讀寫這個部署容器本機磁碟的 Trading Journal.xlsx
+# (DEFAULT_JOURNAL_PATH)，跟 GitHub repo 根目錄裡的同名檔案完全沒有同步——使用者在
+# 編輯器按「儲存並關閉」只會寫到本機，而本機磁碟不是永久保存的：Streamlit Cloud
+# 重新部署/重啟這個 app 時會用 GitHub 上的版本重新複製一份蓋過去，等於編輯器存的
+# 內容隨時可能被悄悄蓋掉、遺失，使用者也完全看不到任何提示。
+# 這裡比照 0_📊_台股掃描器.py 的 upload_file_to_github()/github_repo_config() 寫法
+# (同一組 GITHUB_TOKEN/OWNER/REPO/BRANCH secrets)，讓交易紀錄編輯器：
+#   1. 開啟時 (只在讀取的是預設路徑、也就是對應 repo 檔案時) 先嘗試從 GitHub 抓最新
+#      版本蓋過本機那份，確保一定是從最新版本開始編輯，不會編輯到舊資料又存回去、
+#      覆蓋掉别人(或自己在別台裝置上)較新的紀錄。抓不到就靜默退回本機現有版本，
+#      使用者仍可正常編輯，不會比原本行為更差。
+#   2. 儲存時本機寫入成功後，自動再推一版回 GitHub repo，這樣 GitHub 上的檔案才是
+#      真正的資料來源；若 GITHUB_TOKEN 未設定或推送失敗，會另外顯示明確的警告，
+#      而不是靜默失敗讓使用者誤以為已經同步。
+#   3. 若使用者是從側邊欄「讀取 交易紀錄」自行上傳了檔案在編輯 (journal_path 不是
+#      DEFAULT_JOURNAL_PATH)，代表這份本來就不是 repo 檔案，不會嘗試抓取/推送 GitHub，
+#      避免誤用上傳的內容覆蓋掉 repo 裡真正的 Trading Journal.xlsx。
+def journal_github_config():
+    return {
+        "token": st.secrets.get("GITHUB_TOKEN", ""),
+        "owner": st.secrets.get("GITHUB_OWNER", "henglunlin"),
+        "repo": st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN"),
+        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+    }
+
+
+def fetch_journal_bytes_from_github():
+    """從 GitHub repo 根目錄抓最新的 Trading Journal.xlsx 內容 (bytes)，抓不到回傳 None。"""
+    cfg = journal_github_config()
+    encoded_path = urllib.parse.quote(JOURNAL_GITHUB_PATH, safe="/")
+    url = f"https://raw.githubusercontent.com/{cfg['owner']}/{cfg['repo']}/{cfg['branch']}/{encoded_path}"
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            return resp.content
+    except Exception:
+        pass
+    return None
+
+
+def upload_journal_to_github(file_bytes: bytes, commit_message: str) -> bool:
+    """把交易紀錄 Excel 內容推回 GitHub repo 根目錄的 Trading Journal.xlsx (需要 GITHUB_TOKEN)。"""
+    cfg = journal_github_config()
+    token, owner, repo, branch = cfg["token"], cfg["owner"], cfg["repo"], cfg["branch"]
+    if not token or not owner or not repo:
+        return False
+
+    encoded_path = urllib.parse.quote(JOURNAL_GITHUB_PATH, safe="/")
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    sha = None
+    try:
+        get_res = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
+        if get_res.status_code == 200:
+            sha = get_res.json().get("sha")
+
+        payload = {
+            "message": commit_message,
+            "content": base64.b64encode(file_bytes).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_res = requests.put(url, headers=headers, json=payload, timeout=30)
+        return put_res.status_code in (200, 201)
+    except Exception:
+        return False
 
 
 def _stable_upload_path(uploaded_file, cache_key: str, tmp_prefix: str, tmp_filename: str) -> str:
@@ -226,8 +306,32 @@ def journal_editor_dialog():
             try:
                 save_journal_log(save_target_path, save_df)
                 st.session_state.journal_log_df = load_journal_log(save_target_path)
-                st.success("已儲存交易紀錄！")
-                st.rerun()
+
+                # 只有存的是預設路徑 (對應 GitHub repo 根目錄的 Trading Journal.xlsx) 時，
+                # 才需要同步回 GitHub；若目前編輯的是側邊欄上傳的自訂檔案，那份本來就不是
+                # repo 檔案，不會推送 (見上方 journal_github_config 區塊的說明)。
+                if save_target_path == DEFAULT_JOURNAL_PATH:
+                    with open(save_target_path, "rb") as f:
+                        journal_bytes = f.read()
+                    commit_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                    synced = upload_journal_to_github(journal_bytes, f"Update Trading Journal.xlsx {commit_time}")
+                    if synced:
+                        st.success("已儲存交易紀錄，並同步回 GitHub repo！")
+                        st.rerun()
+                    else:
+                        # 故意不在這裡呼叫 st.rerun()：如果馬上 rerun，這則警告訊息會在
+                        # 使用者還沒看清楚之前就被清掉，變成「同步失敗了但完全沒人發現」。
+                        # 保留對話框開著、警告留在畫面上，使用者可以確認 secrets 設定後
+                        # 再按一次「儲存並關閉」重試，或自行按「取消」關閉。
+                        st.warning(
+                            "⚠️ 已儲存到本機，但同步回 GitHub 失敗（可能是 GITHUB_TOKEN 未設定、權限不足，"
+                            "或網路問題）。這次的編輯目前只存在本機，app 之後若重新部署/重啟，可能會被 "
+                            "GitHub 上的舊版覆蓋而遺失，請確認 Streamlit 部署的 secrets 裡有設定 "
+                            "GITHUB_TOKEN 後再試一次。"
+                        )
+                else:
+                    st.success("已儲存交易紀錄！（目前編輯的是側邊欄上傳的自訂檔案，不會同步回 GitHub repo）")
+                    st.rerun()
             except PermissionError:
                 st.error(f"儲存失敗：檔案可能正被 Excel 或其他程式開啟中，請先關閉「{save_target_path}」後再試一次。")
             except Exception as e:
@@ -705,6 +809,23 @@ if current_code and not stock_list_df.empty:
 with st.sidebar:
     with st.expander("交易紀錄編輯", expanded=False):
         if st.button("📝 開啟交易紀錄編輯器", use_container_width=True, key="open_journal_editor_btn"):
+            # 只有目前讀取的是預設路徑 (對應 GitHub repo 的 Trading Journal.xlsx) 時，
+            # 才嘗試先拉 GitHub 最新版蓋過本機那份，確保編輯器一開就是最新內容，
+            # 不會編輯到本機殘留的舊版又存回去、覆蓋掉別處已經更新過的紀錄。
+            # 若使用者是讀取自己上傳的檔案，維持原樣不動 (不覆寫使用者上傳的內容)。
+            active_journal_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
+            if active_journal_path == DEFAULT_JOURNAL_PATH:
+                with st.spinner("正在從 GitHub 抓取最新的交易紀錄..."):
+                    github_bytes = fetch_journal_bytes_from_github()
+                if github_bytes:
+                    try:
+                        with open(DEFAULT_JOURNAL_PATH, "wb") as f:
+                            f.write(github_bytes)
+                        st.session_state.journal_log_df = load_journal_log(DEFAULT_JOURNAL_PATH)
+                    except Exception:
+                        pass  # 抓到了但寫入本機失敗，靜默退回使用本機現有版本
+                # 抓不到 (github_bytes 為 None，例如 repo 裡還沒有這個檔案、或網路問題)
+                # 就靜默退回目前本機已載入的版本，使用者仍可正常編輯，不會比原本行為更差。
             journal_editor_dialog()
 
     st.subheader("🔄 更新資料庫")
@@ -968,9 +1089,9 @@ def _default_browse_scan_date():
     return datetime.today().date()
 
 
-st.markdown("### 📋 Stock simulator")
+st.markdown("### 📋 掃描結果瀏覽（讀取台股掃描器的掃描結果）")
 
-with st.expander("展開瀏覽掃描結果", expanded=False):
+with st.expander("展開瀏覽掃描結果", expanded=True):
     sel_col1, sel_col3, sel_col4, btn_col1, btn_col2 = st.columns([1, 1.6, 1.8, 0.9, 0.9])
 
     # --- 欄位1：掃描資料日期 ---
