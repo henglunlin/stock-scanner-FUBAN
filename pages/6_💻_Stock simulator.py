@@ -33,7 +33,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(page_title="台股訊號模擬器", layout="wide")
 
 # ====== 定義賣出訊號與自訂樣式 ======
-SELL_LABELS = ["反向島狀", "廣義下降三法", "跌停", "移動停利"]
+# 「上升趨勢線跌破」(signal_module/trendline_breakout_sell.py) 歸類為賣出型訊號，
+# 加進 SELL_LABELS 後，下面的 _sell_tag_css 會自動把多選框(圖表標記訊號勾選/賣出條件1)
+# 裡這個標籤的底色變成綠色，跟其他賣出訊號一致，不用再另外寫一次 CSS 規則。
+SELL_LABELS = ["反向島狀", "廣義下降三法", "跌停", "移動停利", "上升趨勢線跌破"]
 
 # 針對多選框中的賣出訊號標籤變更為綠色。
 # 透過瀏覽器 DevTools 實際檢查過完整 DOM 結構後發現一個關鍵細節：
@@ -255,6 +258,16 @@ TREND_TIER_STYLE = {
     "short": {"color": "#111111", "label": "短期下降趨勢線", "hit_label": "短期突破"},
     "mid": {"color": "#c0392b", "label": "中短期下降趨勢線", "hit_label": "中短期突破"},
     "long": {"color": "#1f4fd6", "label": "中長期下降趨勢線", "hit_label": "中長期突破"},
+}
+
+# 「上升趨勢線跌破」(signal_module/trendline_breakout_sell.py, key="asc_trendline_breakdown")：
+# 屬於賣出型訊號 (SELL_LABELS)，畫在圖上的支撐線/跌破標籤統一用「綠色」系列 (三個等級用不同
+# 深淺的綠區分短/中短/中長期，而不是像下降趨勢線那樣三個等級各用不同色系)。
+ASC_TREND_SIGNAL_KEY = "asc_trendline_breakdown"
+ASC_TREND_TIER_STYLE = {
+    "short": {"color": "#27ae60", "label": "短期上升趨勢線", "hit_label": "短期跌破"},
+    "mid": {"color": "#1e8449", "label": "中短期上升趨勢線", "hit_label": "中短期跌破"},
+    "long": {"color": "#145a32", "label": "中長期上升趨勢線", "hit_label": "中長期跌破"},
 }
 
 # --------------------------------------------------------------------------
@@ -1375,7 +1388,11 @@ with chart_placeholder:
 
         color_idx = 0
         for key, res in results.items():
-            if key == TREND_SIGNAL_KEY: continue
+            # trendline_breakout / asc_trendline_breakdown 的 marks 是
+            # (tier_key, anchor1_date, anchor2_date, tier_hit) + ("scan", date) 的特殊結構，
+            # 不是單純日期列表，下面通用的「單日訊號標記」邏輯無法處理，改用各自專屬的
+            # 繪圖區塊 (見下方)，這裡先跳過避免跑進通用邏輯出錯。
+            if key in (TREND_SIGNAL_KEY, ASC_TREND_SIGNAL_KEY): continue
             if not res.hit or not res.marks: continue
             
             label = st.session_state.signal_registry[key]["label"]
@@ -1433,6 +1450,43 @@ with chart_placeholder:
                         text=style["hit_label"], showarrow=True, arrowhead=2,
                         arrowcolor=style["color"], font=dict(color=style["color"], size=12),
                         ax=0, ay=30, row=1, col=1,
+                    )
+
+        # ===== 上升趨勢線跌破 (asc_trendline_breakdown)：畫出支撐線 + 跌破標籤 =====
+        # 邏輯跟上面「下降趨勢線突破」完全對稱，差異只在於：
+        #   1. 連的是「低點(Low)」而不是「高點(High)」(上升趨勢線 = 低點與低點的連線)。
+        #   2. 三個等級統一用綠色系 (ASC_TREND_TIER_STYLE)，呼應這是賣出型訊號。
+        #   3. 線用虛線 (dash="dash") 表示「支撐線」，跟下降趨勢線的實線做視覺區分。
+        #   4. 跌破標籤文字放在K線上方、箭頭往下指 (ay 負值)，因為是賣出訊號觸發點。
+        asc_tres = results.get(ASC_TREND_SIGNAL_KEY)
+        if asc_tres is not None and asc_tres.marks:
+            scan_d = None
+            for item in asc_tres.marks:
+                if item[0] == "scan":
+                    scan_d = item[1]
+                    continue
+                tier_key, a1, a2, tier_hit = item
+                style = ASC_TREND_TIER_STYLE.get(tier_key)
+                if style is None or a1 is None or a2 is None: continue
+                if a1 not in display_dates or a2 not in display_dates: continue
+                x1p, x2p = display_dates.index(a1), display_dates.index(a2)
+                if x2p == x1p: continue
+                y1, y2 = display_df.loc[a1, "Low"], display_df.loc[a2, "Low"]
+                slope = (y2 - y1) / (x2p - x1p)
+                end_pos = len(display_dates) - 1
+                end_date = display_dates[end_pos]
+                end_val = y1 + slope * (end_pos - x1p)
+                fig.add_trace(go.Scatter(
+                    x=[a1, end_date], y=[y1, end_val], mode="lines",
+                    line=dict(color=style["color"], width=2, dash="dash"),
+                    name=style["label"], hoverinfo="skip",
+                ), row=1, col=1)
+                if tier_hit and scan_d is not None and scan_d in display_df.index:
+                    fig.add_annotation(
+                        x=scan_d, y=display_df.loc[scan_d, "Close"],
+                        text=style["hit_label"], showarrow=True, arrowhead=2,
+                        arrowcolor=style["color"], font=dict(color=style["color"], size=12),
+                        ax=0, ay=-30, row=1, col=1,
                     )
 
         if enable_backtest:
