@@ -145,11 +145,18 @@ def save_scan_results(db_path: str, all_signal_rows: list, signal_buckets: dict,
     """
     import datetime as _dt
 
+    # 掃描器的股票代碼帶 .TW/.TWO 後綴 (例如 "1303.TW")，但 twse_ohlcv.db 的
+    # SecurityCode 欄位、db_utils.get_stock_list() 回傳的代碼都是不帶後綴的純數字
+    # (例如 "1303")。這裡先把後綴去掉再存，才能跟 Stock simulator 既有的股票清單
+    # (stock_options / SecurityCode) 對得上，「查看K線圖」按鈕才找得到對應股票。
+    def _bare_code(raw_code: str) -> str:
+        return str(raw_code).strip().split(".")[0]
+
     # 依代碼算出每檔股票屬於哪些 bucket (分頁)，例如 "優先追蹤、3K反轉"
     code_to_buckets = {}
     for bucket_name, rows in (signal_buckets or {}).items():
         for row in rows or []:
-            code = str(row.get("代碼", "")).strip()
+            code = _bare_code(row.get("代碼", ""))
             if not code:
                 continue
             code_to_buckets.setdefault(code, [])
@@ -159,7 +166,7 @@ def save_scan_results(db_path: str, all_signal_rows: list, signal_buckets: dict,
     now_str = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     records = []
     for row in all_signal_rows or []:
-        code = str(row.get("代碼", "")).strip()
+        code = _bare_code(row.get("代碼", ""))
         if not code:
             continue
         records.append((
