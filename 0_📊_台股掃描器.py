@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
+import db_utils
 from common_fubon import (
     REFRESH_SEC,
     FORCE_SCAN_ALL_STOCKS_FROM_FILE,
@@ -60,6 +61,9 @@ st.set_page_config(layout="wide")
 # ===== 常數設定 =====
 GROUPS_FILE = "stock_groups.json"
 APP_LOGO = "dog.jpg"
+# twse_ohlcv.db 跟這個檔案放在同一層 (repo 根目錄)，Stock simulator 也是讀寫同一份檔案，
+# 所以掃描結果寫入資料庫後，模擬器那邊的「掃描結果瀏覽」不需要另外做同步。
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "twse_ohlcv.db")
 
 GITHUB_DATABASE_DIR = st.secrets.get("GITHUB_DATABASE_DIR", "Database")
 AUTO_UPLOAD_GITHUB = bool(st.secrets.get("AUTO_UPLOAD_GITHUB", False))
@@ -426,7 +430,9 @@ with scan_status_col:
 
 if st.session_state.scan_enabled: st.caption("🟢 掃描狀態：執行中")
 elif "last_scan_result" in st.session_state:
-    st.caption(f"✅ 掃描狀態：已完成，上次完成時間：{st.session_state.last_scan_result.get('scan_completed_at', '-')}｜成交量下限：{st.session_state.last_scan_result.get('min_volume_lots', 1000)} 張")
+    _db_saved = st.session_state.get("last_scan_db_saved")
+    _db_saved_text = f"｜已寫入資料庫供 Stock simulator 讀取：{_db_saved} 檔" if _db_saved is not None else ""
+    st.caption(f"✅ 掃描狀態：已完成，上次完成時間：{st.session_state.last_scan_result.get('scan_completed_at', '-')}｜成交量下限：{st.session_state.last_scan_result.get('min_volume_lots', 1000)} 張{_db_saved_text}")
 else: st.caption("⚪ 掃描狀態：已停止，按「開始掃描」才會抓取資料。")
 
 selected_signal_keys = [
@@ -628,6 +634,17 @@ if should_run_scan:
         "fetch_errors": fetch_errors, "excel_filename": f"TWstock_signal_scan_{tw_now.strftime('%Y%m%d_%H%M%S')}.xlsx",
         "scan_completed_at": tw_now.strftime('%Y-%m-%d %H:%M:%S'), "progress_pct": 100, "min_volume_lots": min_volume_lots,
     }
+
+    # 把本次掃描命中的訊號股票清單寫進 twse_ohlcv.db 的 signal_scan_results 表，
+    # 讓 Stock simulator 的「📋 掃描結果瀏覽」可以直接讀取，不用另外匯出/匯入檔案。
+    # 寫入失敗（例如資料庫被其他程式鎖住）不影響掃描本身已完成的結果，只顯示警告。
+    try:
+        saved_count = db_utils.save_scan_results(DB_PATH, all_signal_rows, signal_buckets, scan_today_str)
+        st.session_state["last_scan_db_saved"] = saved_count
+    except Exception as e:
+        st.session_state["last_scan_db_saved"] = None
+        st.warning(f"⚠️ 掃描結果寫入資料庫失敗（不影響本次掃描結果本身）：{e}")
+
     if AUTO_UPLOAD_GITHUB:
         upload_file_to_github(build_signal_excel_bytes(signal_buckets), f"{GITHUB_DATABASE_DIR}/{st.session_state.last_scan_result['excel_filename']}", f"Auto upload TW stock scan result {tw_now.strftime('%Y-%m-%d %H:%M:%S')}")
         if os.path.exists(TRACKING_FILE): upload_tracking_file_to_github(tw_now.strftime('%Y-%m-%d %H:%M:%S'))
