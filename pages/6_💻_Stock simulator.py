@@ -7,6 +7,7 @@
     streamlit run app.py
 """
 import os
+import io
 import tempfile
 import sqlite3
 import time
@@ -860,11 +861,47 @@ with st.sidebar:
 
 
 # --------------------------------------------------------------------------
-# 📋 掃描結果瀏覽：讀取「台股掃描器」寫入 twse_ohlcv.db 的當日訊號清單
+# 📋 掃描結果瀏覽
 # --------------------------------------------------------------------------
-# 掃描器跟這個頁面本來就共用同一份 twse_ohlcv.db，掃描器每次掃描完成後會把
-# all_signal_rows 寫進 signal_scan_results 表，這裡直接查表讀出來，不需要
-# 額外的檔案匯出/匯入或跨部署同步機制。
+# 原本設計是掃描器跟這個頁面共用同一份 twse_ohlcv.db，掃描完直接寫表、這裡直接讀表。
+# 但實測發現兩邊其實是分開部署、各自獨立的磁碟 (不是同一個容器)，掃描器寫進自己那份
+# db 的 signal_scan_results 表，這個頁面讀到的是自己那份 db，兩者對不上，一直是空的。
+#
+# 兩邊真正共用、有實際同步的地方只有 GitHub repo：掃描器每次掃描完成後，會把
+# Database/signal_tracking.csv 上傳成 Database/signal_tracking_{YYYYMMDD}.csv
+# (詳見 0_📊_台股掃描器.py 的 upload_tracking_file_to_github)。所以這裡改成：
+#   1. 先試本地 signal_scan_results 表 (萬一以後兩邊真的合併成同一個部署，優先讀這個，不用打網路)
+#   2. 讀不到才改成從 GitHub 抓當天上傳的 signal_tracking_{date}.csv 當備援資料來源
+# 這份 CSV 是累積寫入的 (不會每天重置)，抓回來後還要再依 scan_date 欄位篩選一次，
+# 不能直接假設整份檔案內容都等於檔名那天的資料。
+GITHUB_TRACKING_OWNER = st.secrets.get("GITHUB_OWNER", "henglunlin")
+GITHUB_TRACKING_REPO = st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN")
+GITHUB_TRACKING_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
+GITHUB_TRACKING_DIR = st.secrets.get("GITHUB_DATABASE_DIR", "Database")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_tracking_csv_from_github(date_str: str) -> pd.DataFrame:
+    """抓 GitHub 上 Database/signal_tracking_{date}.csv，抓不到 (例如那天沒掃描/沒上傳) 回傳空表。"""
+    filename = f"signal_tracking_{date_str.replace('-', '')}.csv"
+    url = (
+        f"https://raw.githubusercontent.com/{GITHUB_TRACKING_OWNER}/{GITHUB_TRACKING_REPO}"
+        f"/{GITHUB_TRACKING_BRANCH}/{GITHUB_TRACKING_DIR}/{filename}"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        return pd.read_csv(io.BytesIO(resp.content), encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame()
+
+
+def _bare_stock_code(raw_code) -> str:
+    """去掉 .TW/.TWO 後綴，統一成跟 stock_options / SecurityCode 一致的純數字代碼。"""
+    return str(raw_code).strip().split(".")[0]
+
+
 st.markdown("### 📋 掃描結果瀏覽（讀取台股掃描器的掃描結果）")
 
 with st.expander("展開瀏覽掃描結果", expanded=False):
@@ -874,23 +911,46 @@ with st.expander("展開瀏覽掃描結果", expanded=False):
     with browse_col3:
         st.write("")
         if st.button("🔄 重新整理", use_container_width=True, key="browse_refresh_btn"):
+            _fetch_tracking_csv_from_github.clear()
             st.rerun()
     browse_date_str = pd.to_datetime(browse_scan_date).strftime("%Y-%m-%d")
 
+    data_source_note = ""
     try:
-        # 這裡刻意不用上面 `conn`（由 st.cache_resource 依 mtime 快取），改用一個
-        # 短命的新連線直接查詢：掃描器寫入 signal_scan_results 是用 WAL 模式的獨立連線，
-        # 提交後主要的 .db 檔案 mtime 不一定會立刻變動，導致 `_get_conn` 的快取 key
-        # (path, mtime) 沒偵測到變化、繼續回傳掃描前就已經開啟的舊連線物件，讀不到
-        # 剛寫入的新資料。每次都開一個新連線可以確保一定讀到最新已提交的內容。
         with sqlite3.connect(db_path) as _scan_conn:
             scan_results_df = db_utils.get_scan_results(_scan_conn, browse_date_str)
+        if not scan_results_df.empty:
+            data_source_note = "（來源：本機資料庫）"
     except Exception as e:
         scan_results_df = pd.DataFrame()
-        st.error(f"讀取掃描結果失敗：{e}")
+        st.caption(f"（本機資料庫查詢失敗，改嘗試 GitHub 備援：{e}）")
 
     if scan_results_df.empty:
-        st.info(f"{browse_date_str} 目前沒有掃描器寫入的訊號股票清單（請先到「台股掃描器」頁面完成一次掃描）。")
+        github_df = _fetch_tracking_csv_from_github(browse_date_str)
+        if not github_df.empty and "scan_date" in github_df.columns:
+            day_df = github_df[github_df["scan_date"].astype(str) == browse_date_str].copy()
+            if not day_df.empty:
+                scan_results_df = pd.DataFrame({
+                    "code": day_df["代碼"].apply(_bare_stock_code),
+                    "name": day_df.get("股票名稱", ""),
+                    "signal_types": day_df.get("訊號類型", ""),
+                    "signal_score": pd.to_numeric(day_df.get("訊號分數"), errors="coerce"),
+                    "signal_grade": day_df.get("追蹤等級", ""),
+                    "price": pd.to_numeric(day_df.get("entry_price"), errors="coerce"),
+                    "pct": pd.NA,  # signal_tracking.csv 沒有存漲跌%，卡片上這欄留空不顯示
+                    "volume_lots": pd.to_numeric(day_df.get("成交量(張)"), errors="coerce"),
+                    "bucket": "",
+                }).sort_values("signal_score", ascending=False).reset_index(drop=True)
+                data_source_note = "（來源：GitHub Database/signal_tracking，兩邊部署分開、非即時同步，可能落後於最新一次掃描）"
+        else:
+            scan_results_df = pd.DataFrame()
+
+    if scan_results_df.empty:
+        st.info(
+            f"{browse_date_str} 目前沒有掃描結果（本機資料庫跟 GitHub 上的 "
+            f"Database/signal_tracking_{browse_date_str.replace('-', '')}.csv 都讀不到資料）。"
+            f"請確認當天有跑過「台股掃描器」的掃描，且該次掃描已自動上傳到 GitHub。"
+        )
     else:
         # 依 bucket 欄位 (以「、」串接的分頁名稱，例如「優先追蹤、3K反轉」) 彙整出可篩選的分頁清單
         all_buckets = sorted({
@@ -908,7 +968,7 @@ with st.expander("展開瀏覽掃描結果", expanded=False):
                 filtered_df["bucket"].fillna("").apply(lambda b: any(sb in b for sb in selected_buckets))
             ]
 
-        st.caption(f"共 {len(filtered_df)} 檔（{browse_date_str}，依訊號分數排序）")
+        st.caption(f"共 {len(filtered_df)} 檔（{browse_date_str}，依訊號分數排序）{data_source_note}")
 
         CARDS_PER_ROW = 4
         rows_data = filtered_df.to_dict("records")
@@ -917,13 +977,15 @@ with st.expander("展開瀏覽掃描結果", expanded=False):
             for col, item in zip(card_cols, rows_data[row_start:row_start + CARDS_PER_ROW]):
                 with col:
                     with st.container(border=True):
-                        pct_val = item.get("pct")
-                        pct_val = pct_val if pct_val is not None else 0.0
+                        pct_raw = item.get("pct")
+                        has_pct = pct_raw is not None and pd.notna(pct_raw)
+                        pct_val = float(pct_raw) if has_pct else 0.0
                         pct_color = "#cf1322" if pct_val > 0 else "#389e0d" if pct_val < 0 else "#333333"
-                        item_code = str(item.get("code", ""))
+                        pct_text = f"<span style='color:{pct_color};font-weight:600;'>{pct_val:+.2f}%</span>　" if has_pct else ""
+                        item_code = _bare_stock_code(item.get("code", ""))
                         st.markdown(f"**{item_code} {item.get('name', '')}**")
                         st.markdown(
-                            f"<span style='color:{pct_color};font-weight:600;'>{pct_val:+.2f}%</span>　"
+                            f"{pct_text}"
                             f"價格 {item.get('price', '-')}　"
                             f"分數 {item.get('signal_score', '-')} / {item.get('signal_grade', '-')}",
                             unsafe_allow_html=True,
@@ -935,9 +997,11 @@ with st.expander("展開瀏覽掃描結果", expanded=False):
                             )
                             if matched_option:
                                 st.session_state["main_stock_choice"] = matched_option
-                            st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
-                            st.session_state["_pending_chart_run"] = True
-                            st.rerun()
+                                st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
+                                st.session_state["_pending_chart_run"] = True
+                                st.rerun()
+                            else:
+                                st.warning(f"twse_ohlcv.db 裡找不到股票代碼 {item_code}，可能尚未更新這檔的價格資料。")
 
 
 # --------------------------------------------------------------------------
