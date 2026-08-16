@@ -22,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas requests urllib3 openpyxl
+          pip install pandas requests urllib3 openpyxl yfinance
 
       - name: Run update script
         env:
