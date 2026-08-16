@@ -44,7 +44,7 @@ import pandas as pd
 from .base import SignalContext, SignalResult, register_signal
 
 BASE_WINDOW_DAYS = 60          # 底部區間天數
-BOX_AMPLITUDE_MAX = 50.0       # 底部箱型盤整振幅上限 (%)
+BOX_AMPLITUDE_MAX = 35.0       # 底部箱型盤整振幅上限 (%)
 BREAKOUT_BUFFER = 1.0          # 突破頸線所需緩衝比例 (%)
 RETEST_TOLERANCE = 6.0         # 回測長均線(MA20/MA60)的容忍度 (%)
 BREAKOUT_SEARCH_DAYS = 250     # 往前搜尋突破底部頸線事件的最大交易日範圍
