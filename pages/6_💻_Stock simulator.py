@@ -874,6 +874,12 @@ with st.sidebar:
 #   2. 讀不到才改成從 GitHub 抓當天上傳的 signal_tracking_{date}.csv 當備援資料來源
 # 這份 CSV 是累積寫入的 (不會每天重置)，抓回來後還要再依 scan_date 欄位篩選一次，
 # 不能直接假設整份檔案內容都等於檔名那天的資料。
+#
+# 排版邏輯 (2026-08-16 依使用者需求重新設計)：
+#   單行 4 個欄位 + 2 個按鈕，取代原本的卡片網格瀏覽：
+#     掃描資料日期 → 訊號類型 (多選) → 股票代碼/名稱 (單選)　三者階層連動篩選，
+#     K線日期 (獨立欄位，決定K線圖要畫到哪一天，預設今天/遇假日退回上個週五)，
+#     ✅ 查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN)、🔄 重新整理 (清快取重抓 GitHub)。
 GITHUB_TRACKING_OWNER = st.secrets.get("GITHUB_OWNER", "henglunlin")
 GITHUB_TRACKING_REPO = st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN")
 GITHUB_TRACKING_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
@@ -897,33 +903,93 @@ def _fetch_tracking_csv_from_github(date_str: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _find_latest_github_tracking_date(probe_days: int = 10) -> str:
+    """
+    從今天開始往回試探最近 `probe_days` 天，找出第一個「GitHub 上確實存在
+    signal_tracking_{date}.csv」的日期 (掃描器每次掃描都會用當天日期上傳這個檔名，
+    所以檔案存在 = 那天有掃描紀錄)。找到第一個存在的就停止，不會把每一天都打一輪。
+
+    這裡刻意不用 GitHub Contents API 列目錄 (api.github.com)，改成沿用已經驗證過
+    可正常運作的 raw.githubusercontent.com 逐日探測方式：
+      1. 兩者行為等價，但 api.github.com 對未認證請求有每小時 60 次的速率限制，
+         Streamlit Cloud 上多個 app 常共用對外 IP，容易被其他服務排擠而超過額度。
+      2. `_fetch_tracking_csv_from_github` 已經是本頁面既有、已被使用者實測成功的
+         抓檔路徑，這裡直接重用同一個函式 (且共用同一份 5 分鐘快取)，不用再多維護
+         一條獨立的網路呼叫邏輯。
+    找不到 (例如最近 probe_days 天內都沒掃描/沒上傳) 則回傳空字串，由呼叫端退回今天。
+    """
+    today = datetime.today().date()
+    for i in range(probe_days):
+        candidate = today - timedelta(days=i)
+        candidate_str = candidate.strftime("%Y-%m-%d")
+        if not _fetch_tracking_csv_from_github(candidate_str).empty:
+            return candidate_str
+    return ""
+
+
 def _bare_stock_code(raw_code) -> str:
     """去掉 .TW/.TWO 後綴，統一成跟 stock_options / SecurityCode 一致的純數字代碼。"""
     return str(raw_code).strip().split(".")[0]
 
 
+def _default_browse_scan_date():
+    """
+    「掃描資料日期」預設值：優先抓本機資料庫最新的掃描日期；抓不到再看 GitHub 上
+    實際存在的最新 signal_tracking 檔案日期；兩邊都沒有才退回今天。
+    （日期選擇器本身仍是自由選擇，使用者可隨時手動改選任何一天。）
+    """
+    try:
+        with sqlite3.connect(db_path) as _c:
+            local_dates = db_utils.get_scan_result_dates(_c, limit=1)
+        if local_dates:
+            return pd.to_datetime(local_dates[0]).date()
+    except Exception:
+        pass
+    latest_github_date = _find_latest_github_tracking_date()
+    if latest_github_date:
+        return pd.to_datetime(latest_github_date).date()
+    return datetime.today().date()
+
+
+def _default_kline_date():
+    """K線日期預設值：預設今天，但今天是週六日時自動退回上一個交易日 (週五)。"""
+    today = datetime.today().date()
+    if today.weekday() == 5:  # 週六
+        return today - timedelta(days=1)
+    if today.weekday() == 6:  # 週日
+        return today - timedelta(days=2)
+    return today
+
+
 st.markdown("### 📋 掃描結果瀏覽（讀取台股掃描器的掃描結果）")
 
-with st.expander("展開瀏覽掃描結果", expanded=False):
-    browse_col1, browse_col2, browse_col3 = st.columns([1, 2, 0.6])
-    with browse_col1:
-        browse_scan_date = st.date_input("掃描日期", value=datetime.today().date(), key="browse_scan_date")
-    with browse_col3:
-        st.write("")
-        if st.button("🔄 重新整理", use_container_width=True, key="browse_refresh_btn"):
-            _fetch_tracking_csv_from_github.clear()
-            st.rerun()
+with st.expander("展開瀏覽掃描結果", expanded=True):
+    sel_col1, sel_col2, sel_col3, sel_col4, btn_col1, btn_col2 = st.columns([1, 1, 1.6, 1.8, 0.9, 0.9])
+
+    # --- 欄位1：掃描資料日期 ---
+    if "browse_scan_date" not in st.session_state:
+        st.session_state["browse_scan_date"] = _default_browse_scan_date()
+    with sel_col1:
+        browse_scan_date = st.date_input("掃描資料日期", key="browse_scan_date")
     browse_date_str = pd.to_datetime(browse_scan_date).strftime("%Y-%m-%d")
 
+    # 掃描資料日期一改變，底下依賴它的「訊號類型」「股票代碼/名稱」選擇就失去意義，
+    # 直接清掉讓使用者在新的日期重新選，避免殘留舊日期的選項造成 widget 選項不合法的錯誤。
+    if st.session_state.get("_browse_last_scan_date") != browse_date_str:
+        st.session_state["_browse_last_scan_date"] = browse_date_str
+        st.session_state.pop("browse_signal_type_filter", None)
+        st.session_state.pop("browse_stock_pick", None)
+
+    # --- 依「掃描資料日期」抓當天掃描結果：本機資料庫優先，讀不到才用 GitHub CSV 備援 ---
     data_source_note = ""
     try:
         with sqlite3.connect(db_path) as _scan_conn:
             scan_results_df = db_utils.get_scan_results(_scan_conn, browse_date_str)
         if not scan_results_df.empty:
             data_source_note = "（來源：本機資料庫）"
-    except Exception as e:
+    except Exception:
         scan_results_df = pd.DataFrame()
-        st.caption(f"（本機資料庫查詢失敗，改嘗試 GitHub 備援：{e}）")
 
     if scan_results_df.empty:
         github_df = _fetch_tracking_csv_from_github(browse_date_str)
@@ -937,71 +1003,98 @@ with st.expander("展開瀏覽掃描結果", expanded=False):
                     "signal_score": pd.to_numeric(day_df.get("訊號分數"), errors="coerce"),
                     "signal_grade": day_df.get("追蹤等級", ""),
                     "price": pd.to_numeric(day_df.get("entry_price"), errors="coerce"),
-                    "pct": pd.NA,  # signal_tracking.csv 沒有存漲跌%，卡片上這欄留空不顯示
+                    "pct": pd.NA,  # signal_tracking.csv 沒有存漲跌%，這裡留空不顯示
                     "volume_lots": pd.to_numeric(day_df.get("成交量(張)"), errors="coerce"),
-                    "bucket": "",
                 }).sort_values("signal_score", ascending=False).reset_index(drop=True)
                 data_source_note = "（來源：GitHub Database/signal_tracking，兩邊部署分開、非即時同步，可能落後於最新一次掃描）"
-        else:
-            scan_results_df = pd.DataFrame()
 
-    if scan_results_df.empty:
+    has_data = not scan_results_df.empty
+
+    # --- 欄位3：訊號類型 (多選)，選項來自「掃描資料日期」當天實際出現過的類型 ---
+    # signal_types 欄位是掃描器用「、」把單一股票當天觸發的多個訊號類型串成一個字串
+    # (例如「3K反轉、島狀反轉」)，這裡拆開取聯集，並用「是否命中任一已選類型」做篩選，
+    # 不會把同一檔股票拆成多列 (股票代碼/名稱清單本來就已經是一檔股票一列)。
+    all_signal_types = sorted({
+        t for types_str in (scan_results_df["signal_types"].fillna("").tolist() if has_data else [])
+        for t in types_str.split("、") if t and t != "-"
+    })
+    with sel_col3:
+        selected_types = st.multiselect(
+            "訊號類型", options=all_signal_types, key="browse_signal_type_filter", disabled=not has_data,
+        )
+
+    if has_data and selected_types:
+        type_filtered_df = scan_results_df[
+            scan_results_df["signal_types"].fillna("").apply(
+                lambda s: any(t in s.split("、") for t in selected_types)
+            )
+        ]
+    else:
+        type_filtered_df = scan_results_df
+
+    # --- 欄位4：股票代碼/名稱 (單選)，同一檔股票只顯示一次 ---
+    stock_pick_options = [
+        f"{_bare_stock_code(r['code'])} {r.get('name', '')}"
+        for r in type_filtered_df.drop_duplicates(subset=["code"]).to_dict("records")
+    ] if has_data else []
+    select_options = stock_pick_options if stock_pick_options else ["(無符合股票)"]
+    if st.session_state.get("browse_stock_pick") not in select_options:
+        st.session_state.pop("browse_stock_pick", None)
+    with sel_col4:
+        picked_stock = st.selectbox(
+            "股票代碼/名稱", options=select_options, disabled=not stock_pick_options, key="browse_stock_pick",
+        )
+
+    # --- 欄位2：K線日期 (獨立欄位，決定K線圖畫到哪一天，不參與上面三者的階層連動) ---
+    kline_min = browse_scan_date
+    if "browse_kline_date" not in st.session_state:
+        st.session_state["browse_kline_date"] = max(_default_kline_date(), kline_min)
+    elif st.session_state["browse_kline_date"] < kline_min:
+        st.session_state["browse_kline_date"] = kline_min
+    with sel_col2:
+        kline_date = st.date_input(
+            "K線日期", min_value=kline_min, key="browse_kline_date",
+            help="K線圖要顯示到哪一天為止（可晚於掃描資料日期，用來看訊號發生後的走勢）",
+        )
+
+    # --- 按鈕1：查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN) ---
+    with btn_col1:
+        st.write("")
+        view_clicked = st.button(
+            "✅ 查看K線圖", use_container_width=True, type="primary",
+            key="browse_view_btn", disabled=not stock_pick_options,
+        )
+
+    # --- 按鈕2：重新整理 (清快取重抓 GitHub) ---
+    with btn_col2:
+        st.write("")
+        if st.button("🔄 重新整理", use_container_width=True, key="browse_refresh_btn"):
+            _fetch_tracking_csv_from_github.clear()
+            _find_latest_github_tracking_date.clear()
+            st.rerun()
+
+    if view_clicked and stock_pick_options:
+        picked_code = picked_stock.split(" ")[0]
+        matched_option = next(
+            (opt for opt in stock_options if opt.startswith(f"{picked_code} ")), None
+        )
+        if matched_option:
+            st.session_state["main_stock_choice"] = matched_option
+            st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
+            st.session_state["chart_scan_end_date"] = pd.to_datetime(kline_date).date()
+            st.session_state["_pending_chart_run"] = True
+            st.rerun()
+        else:
+            st.warning(f"twse_ohlcv.db 裡找不到股票代碼 {picked_code}，可能尚未更新這檔的價格資料。")
+
+    if not has_data:
         st.info(
             f"{browse_date_str} 目前沒有掃描結果（本機資料庫跟 GitHub 上的 "
             f"Database/signal_tracking_{browse_date_str.replace('-', '')}.csv 都讀不到資料）。"
             f"請確認當天有跑過「台股掃描器」的掃描，且該次掃描已自動上傳到 GitHub。"
         )
     else:
-        # 依 bucket 欄位 (以「、」串接的分頁名稱，例如「優先追蹤、3K反轉」) 彙整出可篩選的分頁清單
-        all_buckets = sorted({
-            b for buckets in scan_results_df["bucket"].fillna("").tolist()
-            for b in buckets.split("、") if b
-        })
-        with browse_col2:
-            selected_buckets = st.multiselect(
-                "依分頁篩選（不選=全部）", options=all_buckets, key="browse_bucket_filter"
-            )
-
-        filtered_df = scan_results_df
-        if selected_buckets:
-            filtered_df = filtered_df[
-                filtered_df["bucket"].fillna("").apply(lambda b: any(sb in b for sb in selected_buckets))
-            ]
-
-        st.caption(f"共 {len(filtered_df)} 檔（{browse_date_str}，依訊號分數排序）{data_source_note}")
-
-        CARDS_PER_ROW = 4
-        rows_data = filtered_df.to_dict("records")
-        for row_start in range(0, len(rows_data), CARDS_PER_ROW):
-            card_cols = st.columns(CARDS_PER_ROW)
-            for col, item in zip(card_cols, rows_data[row_start:row_start + CARDS_PER_ROW]):
-                with col:
-                    with st.container(border=True):
-                        pct_raw = item.get("pct")
-                        has_pct = pct_raw is not None and pd.notna(pct_raw)
-                        pct_val = float(pct_raw) if has_pct else 0.0
-                        pct_color = "#cf1322" if pct_val > 0 else "#389e0d" if pct_val < 0 else "#333333"
-                        pct_text = f"<span style='color:{pct_color};font-weight:600;'>{pct_val:+.2f}%</span>　" if has_pct else ""
-                        item_code = _bare_stock_code(item.get("code", ""))
-                        st.markdown(f"**{item_code} {item.get('name', '')}**")
-                        st.markdown(
-                            f"{pct_text}"
-                            f"價格 {item.get('price', '-')}　"
-                            f"分數 {item.get('signal_score', '-')} / {item.get('signal_grade', '-')}",
-                            unsafe_allow_html=True,
-                        )
-                        st.caption(item.get("signal_types") or "-")
-                        if st.button("📈 查看K線圖", key=f"browse_view_{item_code}_{row_start}", use_container_width=True):
-                            matched_option = next(
-                                (opt for opt in stock_options if opt.startswith(f"{item_code} ")), None
-                            )
-                            if matched_option:
-                                st.session_state["main_stock_choice"] = matched_option
-                                st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
-                                st.session_state["_pending_chart_run"] = True
-                                st.rerun()
-                            else:
-                                st.warning(f"twse_ohlcv.db 裡找不到股票代碼 {item_code}，可能尚未更新這檔的價格資料。")
+        st.caption(f"共 {len(stock_pick_options)} 檔（{browse_date_str}，符合已選訊號類型）{data_source_note}")
 
 
 # --------------------------------------------------------------------------
@@ -1034,10 +1127,10 @@ with col3:
 with col4:
     st.write("")
     st.write("")
-    # `_pending_chart_run` 由上方「📋 掃描結果瀏覽」卡片的「查看K線圖」按鈕設定：
-    # 按下卡片按鈕時會先把 main_stock_choice / chart_scan_target_date 帶入 session_state
-    # 再 st.rerun()，這裡讀到旗標後視同使用者按下了 RUN，沿用下面完整的既有 RUN 邏輯
-    # (指標計算＋模擬回測＋K線＋B/S/停利標記)，不用另外重寫一套圖表繪製流程。
+    # `_pending_chart_run` 由上方「📋 掃描結果瀏覽」的「✅ 查看K線圖」按鈕設定：
+    # 按下該按鈕時會先把 main_stock_choice / chart_scan_target_date / chart_scan_end_date
+    # 帶入 session_state 再 st.rerun()，這裡讀到旗標後視同使用者按下了 RUN，沿用下面完整的
+    # 既有 RUN 邏輯 (指標計算＋模擬回測＋K線＋B/S/停利標記)，不用另外重寫一套圖表繪製流程。
     run_clicked = st.button("RUN", use_container_width=True, type="primary", key="chart_run_btn") \
         or st.session_state.pop("_pending_chart_run", False)
 
