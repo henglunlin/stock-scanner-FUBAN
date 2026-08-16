@@ -856,6 +856,16 @@ with st.sidebar:
             for e in st.session_state.signal_errors: st.error(f"載入失敗: {e}")
 
     st.subheader("日期設定")
+    # 「📋 掃描結果瀏覽」的「K線日期」欄位若有帶新值過來，要在這個 key 對應的
+    # st.date_input 建立"之前"套用，不能在按鈕的 callback 裡直接寫
+    # st.session_state["chart_scan_end_date"]——因為這個 widget 在腳本裡的位置
+    # (側邊欄) 比「📋 掃描結果瀏覽」區塊還早執行，同一輪內對已建立過的 widget key
+    # 賦值會被 Streamlit 擋下 (StreamlitAPIException: cannot be modified after the
+    # widget is instantiated)。改成先把新值放進一個獨立的暫存 key
+    # (_pending_kline_date)，rerun 後、在這個 widget 建立之前先套用進去，
+    # 跟下面 RUN 按鈕沿用的 `_pending_chart_run` 是同一種寫法。
+    if "_pending_kline_date" in st.session_state:
+        st.session_state["chart_scan_end_date"] = st.session_state.pop("_pending_kline_date")
     scan_start_date = st.date_input("掃描起始日期", value=pd.to_datetime("2026-04-27"), key="chart_scan_start_date")
     scan_end_date = st.date_input("結束日期", value=datetime.today().date(), key="chart_scan_end_date")
 
@@ -1045,16 +1055,15 @@ with st.expander("展開瀏覽掃描結果", expanded=True):
             "股票代碼/名稱", options=select_options, disabled=not stock_pick_options, key="browse_stock_pick",
         )
 
-    # --- 欄位2：K線日期 (獨立欄位，決定K線圖畫到哪一天，不參與上面三者的階層連動) ---
-    kline_min = browse_scan_date
+    # --- 欄位2：K線日期 (自由日期，決定K線圖畫到哪一天，不參與上面三者的階層連動) ---
+    # 完全自由選擇，不限制一定要晚於/等於「掃描資料日期」(例如想只看訊號當天之前的走勢
+    # 也可以)，只提供一個合理的預設值方便快速使用。
     if "browse_kline_date" not in st.session_state:
-        st.session_state["browse_kline_date"] = max(_default_kline_date(), kline_min)
-    elif st.session_state["browse_kline_date"] < kline_min:
-        st.session_state["browse_kline_date"] = kline_min
+        st.session_state["browse_kline_date"] = _default_kline_date()
     with sel_col2:
         kline_date = st.date_input(
-            "K線日期", min_value=kline_min, key="browse_kline_date",
-            help="K線圖要顯示到哪一天為止（可晚於掃描資料日期，用來看訊號發生後的走勢）",
+            "K線日期", key="browse_kline_date",
+            help="K線圖要顯示到哪一天為止（可自由選擇，不限於掃描資料日期之後）",
         )
 
     # --- 按鈕1：查看K線圖 (自動帶入下方 Main 控制列並觸發 RUN) ---
@@ -1081,7 +1090,11 @@ with st.expander("展開瀏覽掃描結果", expanded=True):
         if matched_option:
             st.session_state["main_stock_choice"] = matched_option
             st.session_state["chart_scan_target_date"] = pd.to_datetime(browse_date_str).date()
-            st.session_state["chart_scan_end_date"] = pd.to_datetime(kline_date).date()
+            # 不能在這裡直接寫 st.session_state["chart_scan_end_date"]：那個 widget
+            # (側邊欄「結束日期」) 在本輪腳本裡已經先跑過了，Streamlit 會擋下這種賦值。
+            # 改寫進 _pending_kline_date，留給側邊欄那段程式碼在下一輪、建立該 widget
+            # 之前套用 (見「日期設定」上方的套用邏輯)。
+            st.session_state["_pending_kline_date"] = pd.to_datetime(kline_date).date()
             st.session_state["_pending_chart_run"] = True
             st.rerun()
         else:
