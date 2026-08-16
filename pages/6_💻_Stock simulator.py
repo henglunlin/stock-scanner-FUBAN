@@ -868,13 +868,23 @@ with st.sidebar:
 st.markdown("### 📋 掃描結果瀏覽（讀取台股掃描器的掃描結果）")
 
 with st.expander("展開瀏覽掃描結果", expanded=False):
-    browse_col1, browse_col2 = st.columns([1, 2])
+    browse_col1, browse_col2, browse_col3 = st.columns([1, 2, 0.6])
     with browse_col1:
         browse_scan_date = st.date_input("掃描日期", value=datetime.today().date(), key="browse_scan_date")
+    with browse_col3:
+        st.write("")
+        if st.button("🔄 重新整理", use_container_width=True, key="browse_refresh_btn"):
+            st.rerun()
     browse_date_str = pd.to_datetime(browse_scan_date).strftime("%Y-%m-%d")
 
     try:
-        scan_results_df = db_utils.get_scan_results(conn, browse_date_str)
+        # 這裡刻意不用上面 `conn`（由 st.cache_resource 依 mtime 快取），改用一個
+        # 短命的新連線直接查詢：掃描器寫入 signal_scan_results 是用 WAL 模式的獨立連線，
+        # 提交後主要的 .db 檔案 mtime 不一定會立刻變動，導致 `_get_conn` 的快取 key
+        # (path, mtime) 沒偵測到變化、繼續回傳掃描前就已經開啟的舊連線物件，讀不到
+        # 剛寫入的新資料。每次都開一個新連線可以確保一定讀到最新已提交的內容。
+        with sqlite3.connect(db_path) as _scan_conn:
+            scan_results_df = db_utils.get_scan_results(_scan_conn, browse_date_str)
     except Exception as e:
         scan_results_df = pd.DataFrame()
         st.error(f"讀取掃描結果失敗：{e}")
