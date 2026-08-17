@@ -264,3 +264,54 @@ def build_relative_strength_fields(base: dict, benchmark_ctx: dict) -> dict:
         "benchmark_ma_trend": benchmark_ctx.get("ma_trend", "-"),
         "rs_excess": rs_excess,
     }
+
+
+_TREND_RANK = {"多頭": 1, "糾結": 0, "空頭": -1}
+
+
+def classify_relative_strength(rs_excess, rs_rating, ma_trend, benchmark_ma_trend, rs_line_new_high) -> str:
+    """
+    綜合「RS超額報酬% / RS Rating / MA排列(個股 vs 大盤) / RS創新高」四項訊號，
+    給出「大盤相比(強/弱)」的簡化文字判斷，方便一眼掃過整份掃描結果表格，
+    不用逐檔對照好幾個欄位自己判斷。
+
+    評分規則（每項 -1~+1 分，RS創新高只加分不扣分）：
+      1. RS超額報酬% 為正/負 → +1 / -1
+      2. RS Rating >= 70 / <= 30 → +1 / -1（中段 30~70 不加不扣）
+      3. MA排列強度（多頭 > 糾結 > 空頭）個股相對大盤更強/更弱 → +1 / -1
+         （例如大盤是「糾結」、個股是「多頭」→ +1；大盤「多頭」個股「糾結」→ -1）
+      4. RS創新高為 True → +1（沒創新高不扣分，只是額外的加分確認項）
+    加總分數 >= 2 判定「強」，<= -2 判定「弱」，其餘（分數不足、訊號互相矛盾）判定「持平」。
+
+    rs_excess 為 None（例如大盤資料當次抓取失敗，整體比較欄位都算不出來）時，直接回傳 "-"。
+    """
+    if rs_excess is None:
+        return "-"
+
+    score = 0.0
+    if rs_excess > 0:
+        score += 1
+    elif rs_excess < 0:
+        score -= 1
+
+    if isinstance(rs_rating, (int, float)):
+        if rs_rating >= 70:
+            score += 1
+        elif rs_rating <= 30:
+            score -= 1
+
+    if ma_trend in _TREND_RANK and benchmark_ma_trend in _TREND_RANK:
+        diff = _TREND_RANK[ma_trend] - _TREND_RANK[benchmark_ma_trend]
+        if diff > 0:
+            score += 1
+        elif diff < 0:
+            score -= 1
+
+    if rs_line_new_high is True:
+        score += 1
+
+    if score >= 2:
+        return "強"
+    if score <= -2:
+        return "弱"
+    return "持平"
