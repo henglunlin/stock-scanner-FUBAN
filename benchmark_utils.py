@@ -151,6 +151,14 @@ def save_benchmark_to_db(db_path: str, df: pd.DataFrame) -> int:
         return 0
 
     with sqlite3.connect(db_path, timeout=30.0) as conn:
+        # 2026-08-17 修正：這裡原本切到 WAL 模式後就沒有切回來，而 journal_mode 是記錄在
+        # .db 檔案本身、跨連線持續生效的設定——GitHub Actions 只會 `git add twse_ohlcv.db`，
+        # 不會一起提交 WAL 模式需要的 -wal/-shm side-car 檔案，導致提交進 repo 的 db 檔案
+        # 停留在「檔頭記錄 WAL、卻沒有對應側車檔案」的狀態，這是這次 Stock simulator 讀取
+        # ohlcv_data 直接丟出 pandas.errors.DatabaseError 的根因（db_utils.py 那邊也已經加了
+        # 一層自動偵測/修復，這裡則是從源頭避免繼續把 WAL 模式寫進被提交的 db 檔案）。
+        # WAL 模式在「寫入當下」仍然保留，用來避免跟其他同時讀取這個檔案的行程發生
+        # database is locked，只是寫完、commit 之後就主動切回 SQLite 預設的 DELETE 模式。
         conn.execute("PRAGMA journal_mode=WAL;")
         dates = work["Date"].unique().tolist()
         CHUNK = 500
@@ -162,6 +170,8 @@ def save_benchmark_to_db(db_path: str, df: pd.DataFrame) -> int:
                 [BENCHMARK_CODE, *chunk],
             )
         work.to_sql("ohlcv_data", conn, if_exists="append", index=False)
+        conn.commit()
+        conn.execute("PRAGMA journal_mode=DELETE;")
         conn.commit()
     return len(work)
 
