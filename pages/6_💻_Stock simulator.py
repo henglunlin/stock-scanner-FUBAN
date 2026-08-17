@@ -27,6 +27,7 @@ import streamlit.components.v1 as components
 import db_utils
 import indicators
 import module_loader
+import benchmark_utils
 from scoring import calc_signal_quality_score, classify_signal_grade
 
 # 忽略憑證警告
@@ -871,6 +872,7 @@ with st.sidebar:
                 status_text = st.empty()
                 all_frames = []
                 total_twse, total_tpex = 0, 0
+                total_benchmark_days = 0
                 skipped_days = []
                 for i, (d_obj, date_str) in enumerate(zip(update_dates, date_list)):
                     status_text.text(f"抓取進度：{i + 1} / {len(date_list)}　日期：{date_str}")
@@ -899,6 +901,15 @@ with st.sidebar:
                         else:
                             skipped_days.append(date_str)
 
+                        # 2026-08-16 新增：這裡跟 update_db.py 一樣是打官方 TWSE MI_INDEX 端點抓全市場資料，
+                        # 同步把「大盤（加權指數）」這天的收盤值也存進同一個 db_path，
+                        # 失敗不擋主流程（上市櫃資料已經抓到就照樣寫入），只是這天的比較欄位可能會是 "-"。
+                        try:
+                            if benchmark_utils.update_benchmark_daily(db_path, date_str):
+                                total_benchmark_days += 1
+                        except Exception:
+                            pass
+
                     if progress_bar is not None:
                         progress_bar.progress((i + 1) / len(date_list))
                     if i < len(date_list) - 1:
@@ -909,7 +920,7 @@ with st.sidebar:
                     combined_df = pd.concat(all_frames, ignore_index=True)
                     st.cache_resource.clear() # 寫入前先切斷緩存讀取連線
                     save_to_database(db_path, combined_df)
-                    st.success(f"全市場更新成功！共 {len(date_list) - len(skipped_days)} 天，上市 {total_twse} 筆 / 上櫃 {total_tpex} 筆")
+                    st.success(f"全市場更新成功！共 {len(date_list) - len(skipped_days)} 天，上市 {total_twse} 筆 / 上櫃 {total_tpex} 筆；大盤指數同步 {total_benchmark_days} 天")
                     if skipped_days:
                         st.caption(f"以下日期無交易資料，已略過：{'、'.join(skipped_days)}")
                 else:
@@ -928,6 +939,12 @@ with st.sidebar:
                     if not range_df.empty:
                         st.cache_resource.clear() # 寫入前先切斷緩存讀取連線
                         save_to_database(db_path, range_df)
+                        # 2026-08-16 新增：yfinance 單股模式不會經過官方 TWSE 端點，
+                        # 順便確保「大盤」資料至少跟這次更新的最新日期一樣新（不足才會補，成本很低）。
+                        try:
+                            benchmark_utils.ensure_benchmark_history(db_path, report_date=date_list[-1])
+                        except Exception:
+                            pass
                         st.success(f"單股更新成功！已更新 {current_code} {current_name}，共 {len(range_df)} 筆交易日資料")
                     else:
                         st.warning(f"無法從 yfinance 取得 {range_label} 的資料 (可能尚未開盤、代碼錯誤，或區間內無交易日)")
@@ -969,6 +986,11 @@ with st.sidebar:
                     all_df = pd.concat(success_rows, ignore_index=True)
                     st.cache_resource.clear() # 寫入前先切斷緩存讀取連線
                     save_to_database(db_path, all_df)
+                    # 2026-08-16 新增：批次模式一樣不會經過官方 TWSE 端點，同步確保「大盤」資料夠新。
+                    try:
+                        benchmark_utils.ensure_benchmark_history(db_path, report_date=date_list[-1])
+                    except Exception:
+                        pass
                     st.success(f"批次更新完成！成功 {len(success_rows)} 檔，共 {len(all_df)} 筆交易日資料，失敗 {len(fail_list)} 檔。")
                     if fail_list:
                         with st.expander(f"查看失敗的 {len(fail_list)} 檔股票"):
