@@ -244,6 +244,40 @@ def update_benchmark_daily(db_path: str, report_date: str, mi_index_payload: dic
     return save_benchmark_to_db(db_path, day_row) > 0
 
 
+def fetch_taiex_today_yfinance(today_str: str) -> pd.DataFrame:
+    """
+    2026-08-16 新增：取得「今天」這一筆大盤即時/最新值，用法跟
+    common_fubon.py 的 download_stock_data_yfinance_today() 完全對應——
+    個股掃描時會另外即時抓「今天」這一筆(不等每日排程更新資料庫)，
+    大盤原本只從資料庫讀（等於只有到「昨天」），這裡補上同一種「今天」即時抓法，
+    讓「個股 vs 大盤」比較在盤中也能反映當天最新的大盤位置，不會一直停在昨收。
+    today_str 格式 YYYY-MM-DD。抓不到（yfinance 未安裝/尚未收盤沒有今天這筆/連線失敗）回傳空 DataFrame。
+    """
+    hist = fetch_taiex_history_yfinance(period="5d")
+    if hist.empty:
+        return hist
+    try:
+        today = pd.to_datetime(today_str).date()
+    except Exception:
+        return pd.DataFrame()
+    return hist[hist["Date"] == today].reset_index(drop=True)
+
+
+def combine_benchmark_history_and_today(history_df: pd.DataFrame, today_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    把「資料庫裡的大盤歷史(不含今天)」跟「即時抓到的今天這一筆」合併成掃描器可以直接用的
+    完整序列，邏輯跟 common_fubon.py download_stock_data_by_source() 內的 _combine() 一致：
+    同一天以「今天即時抓到的」為準（如果有的話），按日期排序後回傳。
+    """
+    frames = [d for d in [history_df, today_df] if d is not None and not d.empty]
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    if "Date" in combined.columns:
+        combined = combined.drop_duplicates(subset=["Date"], keep="last").sort_values("Date").reset_index(drop=True)
+    return combined
+
+
 def ensure_benchmark_history(db_path: str, report_date: str = None) -> bool:
     """
     自我修復用：確保資料庫內的大盤資料「足夠新、足夠多」，供掃描器隨時可以直接使用。
