@@ -407,10 +407,18 @@ def unique_columns(fields: list) -> list:
         result.append(base if seen[base] == 1 else f"{base}_{seen[base]}")
     return result
 
-def fetch_twse_daily(report_date: str) -> pd.DataFrame:
+def fetch_twse_daily(report_date: str, return_payload: bool = False):
+    """
+    return_payload=True 時改回傳 (df, payload) tuple——2026-08-17 新增：
+    讓呼叫端可以把這裡已經打過一次的官方 MI_INDEX payload 直接轉給
+    benchmark_utils.update_benchmark_daily() 解析大盤指數，不用為了大盤
+    又對同一個官方端點多打一次一模一樣的請求，降低被限流(429)的風險。
+    """
+    payload = None
     try:
         payload = get_json(TWSE_URL, {"date": report_date, "type": "ALLBUT0999", "response": "json"})
-        if not check_status(payload, "上市"): return pd.DataFrame()
+        if not check_status(payload, "上市"):
+            return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
         for table in payload.get("tables", []):
             columns = unique_columns(table.get("fields", []))
             if "證券代號" in columns and "收盤價" in columns:
@@ -424,10 +432,11 @@ def fetch_twse_daily(report_date: str) -> pd.DataFrame:
                     df[col] = df[col].map(number)
                 df.insert(0, "Date", pd.to_datetime(report_date, format="%Y%m%d").date())
                 df.insert(1, "Market", "上市")
-                return df[df["Close"] > 0].drop_duplicates("SecurityCode")
-        return pd.DataFrame()
-    except Exception as e:
-        return pd.DataFrame()
+                result_df = df[df["Close"] > 0].drop_duplicates("SecurityCode")
+                return (result_df, payload) if return_payload else result_df
+        return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
+    except Exception:
+        return (pd.DataFrame(), payload) if return_payload else pd.DataFrame()
 
 def fetch_tpex_daily(report_date: str) -> pd.DataFrame:
     dt = datetime.strptime(report_date, "%Y%m%d")
@@ -883,8 +892,11 @@ with st.sidebar:
                     else:
                         twse_df = pd.DataFrame()
                         tpex_df = pd.DataFrame()
+                        mi_payload = None
                         for attempt in range(2):
-                            twse_df = fetch_twse_daily(date_str)
+                            # 2026-08-17 修改：改用 return_payload=True 拿回原始 MI_INDEX payload，
+                            # 下面同步大盤指數時可以直接複用，不用再多打一次官方 API。
+                            twse_df, mi_payload = fetch_twse_daily(date_str, return_payload=True)
                             if not twse_df.empty:
                                 break
                             time.sleep(1)
@@ -905,7 +917,7 @@ with st.sidebar:
                         # 同步把「大盤（加權指數）」這天的收盤值也存進同一個 db_path，
                         # 失敗不擋主流程（上市櫃資料已經抓到就照樣寫入），只是這天的比較欄位可能會是 "-"。
                         try:
-                            if benchmark_utils.update_benchmark_daily(db_path, date_str):
+                            if benchmark_utils.update_benchmark_daily(db_path, date_str, mi_index_payload=mi_payload):
                                 total_benchmark_days += 1
                         except Exception:
                             pass
