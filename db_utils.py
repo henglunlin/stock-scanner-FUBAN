@@ -5,6 +5,7 @@ twse_ohlcv.db 存取工具
   Date (TEXT, YYYY-MM-DD), Market, SecurityCode, SecurityName,
   Open, High, Low, Close, Volume
 """
+import os
 import sqlite3
 import pandas as pd
 
@@ -35,44 +36,45 @@ def ensure_indexes(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _demote_wal_mode_if_needed(conn: sqlite3.Connection) -> None:
-    """
-    2026-08-17 新增（修 Stock simulator 的 pandas.errors.DatabaseError）：
-
-    背景：`journal_mode=WAL` 一旦被設定，會直接記錄在 .db 檔案本身（不是連線層級的設定），
-    設定過一次之後，任何人之後打開同一個檔案都會沿用 WAL 模式，直到有人明確把它切回去。
-    Stock simulator 自己的 save_to_database()（手動更新按鈕）跟這次新增的
-    benchmark_utils.save_benchmark_to_db()（大盤指數同步，GitHub Actions 每天排程都會跑到）
-    都會把 journal_mode 切成 WAL 來避免寫入時的「database is locked」問題。
-
-    問題是 WAL 模式需要額外的 -wal / -shm side-car 檔案才能正常運作，但 GitHub Actions
-    的 commit 步驟只有 `git add twse_ohlcv.db`，不會一起把 -wal/-shm 檔案也提交進 repo。
-    這代表：只要哪一次寫入把 journal_mode 設成 WAL 之後就沒有切回來，被提交進 repo 的
-    twse_ohlcv.db 就會是「檔頭記錄著 WAL 模式、卻沒有對應 -wal/-shm 檔案」的狀態。
-    Streamlit Cloud 的容器環境重新 clone repo 之後第一次打開這個檔案時，
-    在某些檔案系統/掛載環境下可能沒辦法正常建立 WAL 需要的共享記憶體鎖定，
-    進而讓連線／查詢整個失敗（例如這次 pandas.errors.DatabaseError 這種讀取
-    `ohlcv_data` 都會炸掉的狀況）。
-
-    這裡在每次建立連線時檢查一次，如果偵測到還停留在 WAL 模式，就主動切回 SQLite 預設的
-    DELETE 模式（會自動把 WAL 裡尚未回寫的資料 checkpoint 回主檔案，不會遺失資料），
-    讓已經被「污染」成 WAL 模式的 db 檔案下次連線時自動修復回來，不需要使用者手動處理。
-    寫入端(save_to_database/save_benchmark_to_db)那邊也已經在寫入完成後主動切回 DELETE 模式，
-    避免之後又把 WAL 模式重新提交進 repo。
-    """
-    try:
-        current_mode = conn.execute("PRAGMA journal_mode;").fetchone()
-        if current_mode and str(current_mode[0]).lower() == "wal":
-            conn.execute("PRAGMA journal_mode=DELETE;")
-            conn.commit()
-    except sqlite3.Error:
-        # 檢查/切換本身失敗也不要擋住後續讀取，讓呼叫端至少還能嘗試用現有模式查詢
-        pass
+def _remove_stale_wal_files(db_path: str) -> None:
+    """刪除跟主資料庫檔案內容對不上的 -wal / -shm 暫存檔 (不是 git 追蹤的檔案，
+    刪掉不會影響已經 commit 進 twse_ohlcv.db 的資料)。"""
+    for suffix in ("-wal", "-shm"):
+        stale_path = db_path + suffix
+        if os.path.exists(stale_path):
+            try:
+                os.remove(stale_path)
+            except OSError:
+                pass
 
 
 def get_connection(db_path: str) -> sqlite3.Connection:
+    """
+    開啟 twse_ohlcv.db 連線。
+
+    2026-08-22 新增容錯：Streamlit Cloud 部署時，容器裡的 twse_ohlcv.db 會因為
+    git pull 換成 repo 裡的新版本，但如果同一個資料夾還殘留著「舊版」寫入時留下的
+    -wal / -shm 暫存檔 (SQLite 在 WAL 模式下寫入會產生的暫存檔，不會被 git 追蹤)，
+    SQLite 打開檔案時會發現主檔案跟這兩個暫存檔的內容對不上，回報
+    "database disk image is malformed"，即使 twse_ohlcv.db 本體其實完全正常。
+    這裡開檔後先用 PRAGMA quick_check 驗證一次，遇到 malformed 就自動清掉這兩個
+    暫存檔並重試一次，通常就能自我修復，不需要手動到 Streamlit Cloud 按 Reboot app。
+    """
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    _demote_wal_mode_if_needed(conn)
+    try:
+        conn.execute("PRAGMA quick_check")
+    except sqlite3.DatabaseError as e:
+        if "malformed" not in str(e).lower():
+            raise
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _remove_stale_wal_files(db_path)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        # 這次如果還是壞的 (代表主檔案本體真的損毀，不是暫存檔的問題)，
+        # 就讓例外往上拋，讓呼叫端 (Stock simulator 頁面) 顯示明確的錯誤訊息。
+        conn.execute("PRAGMA quick_check")
     ensure_indexes(conn)
     return conn
 
