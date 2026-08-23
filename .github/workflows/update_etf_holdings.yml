@@ -1,0 +1,59 @@
+name: Auto Update ETF Holdings DB
+
+# 獨立於 update.yml (抓OHLCV) 之外的排程，因為這支需要安裝 Playwright + Chromium，
+# 安裝依賴、執行時間都跟抓OHLCV的流程差異很大，分開跑避免互相拖累或其中一個失敗
+# 影響到另一個。
+
+on:
+  schedule:
+    # 30 10 * * 1-5 (UTC) = 每個交易日台北時間 18:30
+    # ⚠️ 主動式ETF持股頁面的「持股快照」實際更新時間不確定(觀察到的快照日期
+    #    似乎有1天以上的落後)，這個時間是先抓一個「盤後應該有更新」的保守時間點，
+    #    建議實際跑幾天觀察 etf_holdings.db 或 Telegram 通知的「持股快照」日期，
+    #    確認符合預期後再視需要調整這個 cron 時間。
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  update-etf-holdings:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          pip install pandas requests playwright
+
+      - name: Install Chromium for Playwright
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run ETF holdings fetch script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python fetch_etf_holdings.py
+
+      - name: Commit and push etf_holdings.db changes
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add etf_holdings.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update etf_holdings.db" && git push)
+
+      - name: Upload run log as artifact (供除錯用)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etf-holdings-fetch-log
+          path: etf_holdings_log/fetch_etf_holdings.log
+          retention-days: 14
