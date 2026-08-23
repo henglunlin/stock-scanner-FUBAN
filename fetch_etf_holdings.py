@@ -192,6 +192,22 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_stock_code(value) -> str:
+    """
+    ⚠️ 2026-08-23發現：不是所有「主動式ETF」都只投資台股。有些主動式ETF
+    (例如 00402A 主動安聯美國科技、00983A 主動中信ARK創新、00986A 主動台新
+    龍頭成長)主要持有美股，這一欄的內容會是「美股代號+公司名稱」直接相連、
+    中間沒有空格或任何分隔符號(例如 "NVDANVIDIA Corp"、"AAPLApple Inc")。
+    這種格式沒辦法100%可靠地切出「純代號」——因為有些公司名稱本身也是
+    全大寫顯示(像NVIDIA)，會跟代號黏在一起分不清楚邊界在哪。
+
+    所以這裡的策略是：
+      1. 台股(4位數字開頭)：照原本邏輯抓出4位數字代碼。
+      2. 非台股、但開頭是一段大寫英文字母：沒辦法乾淨切開代號/名稱，
+         乾脆把「整段原始文字」當作這筆持股的識別碼。雖然不是教科書上
+         乾淨的ticker(例如可能是"NVDANVIDIA Corp"整串)，但每天抓到的
+         格式是一致的，足夠拿來做逐日比對「這筆持股還在不在」「有沒有
+         加碼/減碼」——不影響異動偵測的正確性，只是顯示上不夠乾淨。
+    """
     if pd.isna(value):
         return ""
     text = str(value).strip()
@@ -202,6 +218,8 @@ def normalize_stock_code(value) -> str:
     match = re.match(r"^(\d{4})", text)
     if match:
         return match.group(1)
+    if re.match(r"^[A-Z]{1,6}", text):
+        return text
     return ""
 
 
@@ -211,7 +229,15 @@ def extract_stock_name(value) -> str:
     text = str(value).strip()
     if text == "" or text.lower() == "nan":
         return ""
-    text = re.sub(r"^\d{4}\s*", "", text).strip()
+    stripped = re.sub(r"^\d{4}\s*", "", text).strip()
+    if stripped != text:
+        # 有成功去掉台股4位數字代碼前綴，代表這是台股格式，剩下的就是名稱。
+        text = stripped
+    elif re.match(r"^[A-Z]{1,6}", text):
+        # 非台股、代碼跟名稱黏在一起沒辦法乾淨切開(見 normalize_stock_code 的說明)，
+        # 與其硬切出一個可能錯誤的名稱、造成誤導，不如留空——
+        # 代碼(整段原文)才是逐日比對持股異動真正倚賴的欄位，名稱只是顯示用。
+        return ""
     bad_values = ["登入查看", "登入", "查看", "--", "-", "nan"]
     if text in bad_values:
         return ""
@@ -238,7 +264,14 @@ def build_stock_name_series(df: pd.DataFrame, code_col: str, name_col) -> pd.Ser
 
 def is_stock_code_like(value) -> bool:
     code = normalize_stock_code(value)
-    return bool(re.fullmatch(r"\d{4}", code))
+    if not code:
+        return False
+    if re.fullmatch(r"\d{4}", code):
+        return True
+    # 非台股(美股等)代碼+名稱黏在一起的情況，normalize_stock_code() 會回傳整段原文，
+    # 這裡只要求「開頭是一段大寫英文字母」就當作代碼欄位的候選值——見
+    # normalize_stock_code() 開頭的說明。
+    return bool(re.match(r"^[A-Z]{1,6}", code))
 
 
 def score_as_stock_code_column(series: pd.Series) -> float:
@@ -425,6 +458,13 @@ def extract_best_table_from_html(html: str):
     try:
         tables = pd.read_html(StringIO(html))
     except ValueError:
+        # 頁面裡真的一個table都沒有時，pandas會丟這個。
+        return None
+    except ImportError:
+        # ⚠️ 2026-08-23發現：當lxml解析不到任何表格時，pandas.read_html()內部會
+        # 自動改試下一個解析引擎(html5lib)當備援，如果html5lib沒裝，會丟出
+        # ImportError而不是預期的ValueError。這裡一併接住，避免這種情況把
+        # 「這頁根本沒有表格」誤判成程式crash。
         return None
     candidates = []
     for table in tables:
@@ -537,7 +577,16 @@ async def fetch_one_etf_full_holdings(browser, etf_code: str, url: str) -> pd.Da
         viewport={"width": 1440, "height": 1200},
     )
 
-    await page.goto(url, wait_until="networkidle", timeout=60000)
+    # ⚠️ 2026-08-23調整：原本用 wait_until="networkidle"，但實際在 GitHub Actions
+    # 上觀察到部分ETF頁面會因為背景的分析/廣告連線一直有流量、導致「網路真的完全
+    # 閒置」遲遲不會發生，白白等到60秒逾時——即使頁面內容其實早就渲染完成了。
+    # 改成「等DOM載入完成」+「明確等待頁面出現表格」，只要真正需要的內容(表格)
+    # 出現就繼續，不會被無關的背景網路流量拖累到逾時。
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    try:
+        await page.wait_for_selector("table", timeout=20000)
+    except Exception:
+        logging.warning(f"{etf_code} 等待表格出現逾時(20秒)，仍嘗試繼續解析目前頁面內容。")
     await page.wait_for_timeout(PAGE_WAIT_MS)
 
     page_tables = []
@@ -717,6 +766,149 @@ def compare_etf_holdings(etf_code: str, current_df: pd.DataFrame, previous_std_d
 
 
 # =========================
+# 單一ETF「抓取+存快照+比較異動+寫紀錄」(排程/手動共用)
+# =========================
+async def fetch_and_save_one_etf(browser, db_path: str, etf_code: str, url: str, run_date: str) -> dict:
+    """
+    抓取單一ETF的完整持股、存快照、跟資料庫裡前一次快照比較存異動、寫入抓取紀錄。
+
+    這個函式被兩個地方共用：
+      - main_async()：GitHub Actions 排程，一次跑全部主動式ETF。
+      - run_fetch_for_etfs()：pages/7 頁面上「立即抓取」按鈕，可以只跑使用者
+        選擇的部分ETF(例如只抓目前選擇的那一檔)。
+    共用同一套邏輯，才不會「排程抓的」跟「手動按鈕抓的」行為兜不起來。
+
+    回傳 {"etf_code", "status"("success"/"failed"), "row_count", "n_changes", "message"}。
+    """
+    # ⚠️ 2026-08-23新增：GitHub Actions上觀察到部分ETF會遇到 Page.goto Timeout
+    # (可能是etfinfo.tw對雲端機房IP偶發性的流量限制、或單純網路較慢/不穩定，
+    # 使用者自己電腦上直接跑同一支腳本反而不會遇到)。這種逾時通常是暫時性的，
+    # 重試個1~2次很有機會就成功，所以在「抓取」這一步(不含後面存檔/比較邏輯)
+    # 加上最多3次嘗試、每次間隔5秒再重試。
+    df = None
+    fetch_error = None
+    for attempt in range(1, 4):
+        try:
+            df = await fetch_one_etf_full_holdings(browser=browser, etf_code=etf_code, url=url)
+            break
+        except Exception as e:
+            fetch_error = e
+            logging.warning(f"{etf_code} 第{attempt}次抓取嘗試失敗: {type(e).__name__}: {e}")
+            if attempt < 3:
+                await asyncio.sleep(5)
+
+    if df is None:
+        error_msg = f"{type(fetch_error).__name__}: {fetch_error}"
+        logging.error(f"{etf_code} 重試3次後仍抓取失敗: {error_msg}\n{traceback.format_exc()}")
+        etf_db.log_fetch_run(db_path, run_date, etf_code, "failed", row_count=0, message=error_msg)
+        return {"etf_code": etf_code, "status": "failed", "row_count": 0, "n_changes": 0, "message": error_msg}
+
+    try:
+        if len(df) < MIN_EXPECTED_ROWS_WARN:
+            logging.warning(f"{etf_code} 抓到 {len(df)} 筆，數量偏少，請留意網站是否改版。")
+
+        std_df = standardize_holdings_for_compare(df)
+        n_saved = etf_db.save_holdings_snapshot(db_path, etf_code, run_date, std_df)
+        logging.info(f"{etf_code} 持股快照已存入資料庫，共 {n_saved} 筆")
+
+        conn = etf_db.get_connection(db_path)
+        previous_date = etf_db.get_previous_snapshot_date(conn, etf_code, run_date)
+
+        n_changes = 0
+        if previous_date:
+            try:
+                previous_std_df = etf_db.get_holdings_snapshot(conn, etf_code, previous_date)
+                # 欄位名稱對齊 standardize_holdings_for_compare() 的輸出格式
+                previous_std_df = previous_std_df.rename(columns={
+                    "stock_code": "股票代碼", "stock_name": "股票名稱",
+                    "weight": "權重數值", "weight_text": "權重",
+                    "shares": "股數數值", "shares_text": "股數",
+                })[["股票代碼", "股票名稱", "權重", "權重數值", "股數", "股數數值"]]
+
+                changes_df = compare_etf_holdings(etf_code, df, previous_std_df, previous_date)
+                n_changes = etf_db.save_holding_changes(db_path, etf_code, run_date, changes_df)
+                logging.info(f"{etf_code} 異動比較完成，共 {n_changes} 筆異動 (基準日 {previous_date})")
+            except Exception as e:
+                logging.error(f"{etf_code} 異動比較失敗: {e}")
+        else:
+            logging.warning(f"{etf_code} 資料庫內找不到更早的快照，略過本次異動比較(這是它第一次被抓取)。")
+
+        etf_db.log_fetch_run(db_path, run_date, etf_code, "success", row_count=len(df))
+        return {"etf_code": etf_code, "status": "success", "row_count": len(df), "n_changes": n_changes, "message": ""}
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logging.error(f"{etf_code} 抓取失敗: {error_msg}\n{traceback.format_exc()}")
+        etf_db.log_fetch_run(db_path, run_date, etf_code, "failed", row_count=0, message=error_msg)
+        return {"etf_code": etf_code, "status": "failed", "row_count": 0, "n_changes": 0, "message": error_msg}
+
+
+async def _launch_chromium_with_auto_install(playwright_instance):
+    """
+    啟動Chromium；如果偵測到「瀏覽器binary根本沒安裝」(在Streamlit Cloud這種
+    環境第一次跑很可能會遇到)，自動跑一次 `playwright install chromium` 再重試一次。
+
+    ⚠️ 這裡只能自動補「瀏覽器binary本身」，沒辦法補系統動態函式庫(例如libnss3等)——
+    那些需要在部署環境的 packages.txt 裡設定好，這裡沒有sudo權限可以裝。
+    如果是缺系統函式庫，這裡重試還是會失敗，錯誤訊息會直接往外拋，讓網頁那邊
+    可以印出清楚的錯誤提示。
+    """
+    try:
+        return await launch_chromium_browser(playwright_instance)
+    except Exception as e:
+        err_text = str(e)
+        if "Executable doesn't exist" not in err_text:
+            raise
+        logging.warning("偵測到Chromium瀏覽器binary尚未安裝，嘗試自動安裝(python -m playwright install chromium)...")
+        import subprocess
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True, capture_output=True, text=True, timeout=300,
+        )
+        return await launch_chromium_browser(playwright_instance)
+
+
+async def run_fetch_for_etfs(etf_codes: list, db_path: str = DB_PATH, csv_path: str = ACTIVE_ETF_LIST_CSV, on_progress=None) -> dict:
+    """
+    只抓「指定的一部分ETF」，供 pages/7 頁面的「立即抓取」按鈕使用
+    (跟 main_async() 的差異是：main_async() 一定抓 active_etf_list.csv 裡全部ETF，
+    這裡可以是任意子集合，例如只抓目前選擇的1檔)。
+
+    on_progress(index, total, result_dict)：每抓完一檔就會呼叫一次，供網頁畫進度條用。
+    """
+    etf_map = load_active_etf_list(csv_path)
+    run_date = today_string()
+
+    targets = [(code, etf_map[code]) for code in etf_codes if code in etf_map]
+    missing = [code for code in etf_codes if code not in etf_map]
+
+    results = []
+    async with async_playwright() as p:
+        browser = await _launch_chromium_with_auto_install(p)
+        try:
+            for i, (etf_code, info) in enumerate(targets, start=1):
+                result = await fetch_and_save_one_etf(browser, db_path, etf_code, info["url"], run_date)
+                results.append(result)
+                if on_progress:
+                    on_progress(i, len(targets), result)
+        finally:
+            await browser.close()
+
+    success = [r["etf_code"] for r in results if r["status"] == "success"]
+    fail = [(r["etf_code"], r["message"]) for r in results if r["status"] == "failed"]
+    return {"run_date": run_date, "results": results, "success": success, "fail": fail, "missing_from_csv": missing}
+
+
+def run_fetch_for_etfs_sync(etf_codes: list, db_path: str = DB_PATH, csv_path: str = ACTIVE_ETF_LIST_CSV, on_progress=None) -> dict:
+    """
+    給 Streamlit 頁面(同步的script)直接呼叫用的包裝——內部用 asyncio.run() 執行，
+    跟一般的 async def 函式呼叫方式不同，這裡故意設計成同步函式，
+    這樣頁面程式碼不用自己管理事件迴圈。
+    """
+    return asyncio.run(run_fetch_for_etfs(etf_codes, db_path=db_path, csv_path=csv_path, on_progress=on_progress))
+
+
+# =========================
 # 主程式
 # =========================
 async def main_async():
@@ -729,54 +921,16 @@ async def main_async():
     run_date = today_string()
     success_list = []
     fail_list = []
-    all_etf_codes_processed = []
 
     async with async_playwright() as p:
         browser = await launch_chromium_browser(p)
 
         for etf_code, info in etf_map.items():
-            url = info["url"]
-            try:
-                df = await fetch_one_etf_full_holdings(browser=browser, etf_code=etf_code, url=url)
-
-                if len(df) < MIN_EXPECTED_ROWS_WARN:
-                    logging.warning(f"{etf_code} 抓到 {len(df)} 筆，數量偏少，請留意網站是否改版。")
-
-                std_df = standardize_holdings_for_compare(df)
-                n_saved = etf_db.save_holdings_snapshot(DB_PATH, etf_code, run_date, std_df)
-                logging.info(f"{etf_code} 持股快照已存入資料庫，共 {n_saved} 筆")
-
-                conn = etf_db.get_connection(DB_PATH)
-                previous_date = etf_db.get_previous_snapshot_date(conn, etf_code, run_date)
-
-                if previous_date:
-                    try:
-                        previous_std_df = etf_db.get_holdings_snapshot(conn, etf_code, previous_date)
-                        # 欄位名稱對齊 standardize_holdings_for_compare() 的輸出格式
-                        previous_std_df = previous_std_df.rename(columns={
-                            "stock_code": "股票代碼", "stock_name": "股票名稱",
-                            "weight": "權重數值", "weight_text": "權重",
-                            "shares": "股數數值", "shares_text": "股數",
-                        })[["股票代碼", "股票名稱", "權重", "權重數值", "股數", "股數數值"]]
-
-                        changes_df = compare_etf_holdings(etf_code, df, previous_std_df, previous_date)
-                        n_changes = etf_db.save_holding_changes(DB_PATH, etf_code, run_date, changes_df)
-                        logging.info(f"{etf_code} 異動比較完成，共 {n_changes} 筆異動 (基準日 {previous_date})")
-                    except Exception as e:
-                        logging.error(f"{etf_code} 異動比較失敗: {e}")
-                else:
-                    logging.warning(f"{etf_code} 資料庫內找不到更早的快照，略過本次異動比較(這是它第一次被抓取)。")
-
-                etf_db.log_fetch_run(DB_PATH, run_date, etf_code, "success", row_count=len(df))
+            result = await fetch_and_save_one_etf(browser, DB_PATH, etf_code, info["url"], run_date)
+            if result["status"] == "success":
                 success_list.append(etf_code)
-
-            except Exception as e:
-                error_msg = f"{type(e).__name__}: {e}"
-                logging.error(f"{etf_code} 抓取失敗: {error_msg}\n{traceback.format_exc()}")
-                etf_db.log_fetch_run(DB_PATH, run_date, etf_code, "failed", row_count=0, message=error_msg)
-                fail_list.append((etf_code, error_msg))
-
-            all_etf_codes_processed.append(etf_code)
+            else:
+                fail_list.append((etf_code, result["message"]))
 
         await browser.close()
 
