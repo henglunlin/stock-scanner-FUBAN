@@ -378,12 +378,21 @@ def pick_common_columns(df: pd.DataFrame) -> dict:
 
     candidate_cols = [col for col in df.columns if str(col) not in exclude_cols]
 
+    # ⚠️ 2026-08-23調整：原本遇到欄名含「股數/權重/收盤價/漲跌幅」等字樣就直接
+    # continue(整欄跳過、完全不看內容)。但etfinfo.tw這次的表格出現過「欄名跟欄位
+    # 內容對不上」的情況(研判是原始HTML的多層表頭colspan/rowspan跟pandas.read_html
+    # 攤平表頭的方式沒對齊，導致某一欄的「表頭文字」其實是別的欄位的、但底下裝的
+    # 卻是股票代碼+名稱的真實內容)。原本的寫法會直接把這種「掛羊頭賣狗肉」的欄位
+    # 整個排除掉，內容分數再高也永遠不會被選到，導致抓不到代碼欄整檔失敗。
+    # 改成「壞關鍵字只扣分、不直接淘汰」——如果內容本身分數夠高(像是一堆看起來
+    # 像股票代碼的值)，還是能夠勝出；如果內容真的是價格/權重這種數字，內容分數
+    # 接近0，扣分後还是會被自然淘汰，不會誤選。
     code_scores = []
     for col in candidate_cols:
         col_text = str(col)
-        if any(k in col_text for k in bad_code_keywords):
-            continue
         score = score_as_stock_code_column(df[col])
+        if any(k in col_text for k in bad_code_keywords):
+            score -= 0.3
         if "代號" in col_text:
             score += 0.3
         code_scores.append((col, score))
@@ -395,9 +404,9 @@ def pick_common_columns(df: pd.DataFrame) -> dict:
         if col == code_col:
             continue
         col_text = str(col)
-        if any(k in col_text for k in bad_name_keywords):
-            continue
         score = score_as_name_column(df[col])
+        if any(k in col_text for k in bad_name_keywords):
+            score -= 0.3
         if "名稱" in col_text:
             score += 0.5
         name_scores.append((col, score))
@@ -527,11 +536,18 @@ async def make_page_signature(page) -> str:
 
 
 async def click_next_page_if_possible(page) -> bool:
+    # ⚠️ 2026-08-23調整：原本第一個候選用 page.get_by_text(...)，但在Streamlit Cloud
+    # 實際部署環境上曾經出現 AttributeError: 'Page' object has no attribute 'get_by_text'
+    # ——原因研判是雲端環境實際解析安裝到的 playwright 版本跟sandbox不同(此環境沒辦法
+    # 直接驗證，因為requirements.txt裡的 playwright 沒有鎖版本)，導致這個相對較新的
+    # Locators輔助方法在該版本上不存在。改用 page.locator("text=下一頁") 達到完全一樣的
+    # 效果——.locator() 是Playwright從一開始就有的最基礎API，不會有這個版本相容性問題，
+    # 而且這行本來就已經是下面候選清單的其中一個，等於只是把它移到第一順位、不再依賴
+    # get_by_text。
     next_locators = [
-        page.get_by_text("下一頁", exact=True),
+        page.locator("text=下一頁"),
         page.locator("a:has-text('下一頁')"),
         page.locator("button:has-text('下一頁')"),
-        page.locator("text=下一頁"),
         page.locator("a:has-text('»')"),
         page.locator("button:has-text('»')"),
     ]
@@ -642,7 +658,24 @@ def standardize_holdings_for_compare(df: pd.DataFrame) -> pd.DataFrame:
     share_col = col_map["share_col"]
 
     if not code_col:
-        raise RuntimeError(f"找不到股票代碼欄位，目前欄位為：{list(df.columns)}")
+        # ⚠️ 2026-08-23調整：原本錯誤訊息只有欄位「名稱」列表，看不出實際內容長什麼樣子，
+        # 導致每次判斷失敗都要另外想辦法(WebFetch/使用者截圖)才能知道實際資料格式。
+        # 這裡把每個「候選欄位」的前3筆實際內容一起印出來，下次如果還是抓不到，
+        # log會直接告訴我實際資料長怎樣，不用再用猜的。
+        sample_lines = []
+        for col in df.columns:
+            if str(col) in {"ETF", "抓取時間", "資料來源", "來源頁次"}:
+                continue
+            try:
+                samples = df[col].dropna().astype(str).head(3).tolist()
+            except Exception:
+                samples = ["<無法讀取>"]
+            sample_lines.append(f"[{col}] {samples}")
+        sample_text = " | ".join(sample_lines)
+        raise RuntimeError(
+            f"找不到股票代碼欄位，目前欄位為：{list(df.columns)}；"
+            f"各候選欄位前3筆內容：{sample_text}"
+        )
 
     result = pd.DataFrame(index=df.index)
     result["股票代碼"] = df[code_col].apply(normalize_stock_code)
