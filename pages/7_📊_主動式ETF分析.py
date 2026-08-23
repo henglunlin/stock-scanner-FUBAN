@@ -141,6 +141,84 @@ def etf_label(code: str) -> str:
     return f"{code} {name}" if name else code
 
 
+# --------------------------------------------------------------------------
+# 側邊欄：手動抓取 (直接在這個網頁裡用瀏覽器抓取，不用等每日排程)
+# --------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### 🔄 更新ETF買賣資料")
+    st.caption(
+        "直接在這個網頁裡用瀏覽器抓取，不用等每日排程跑。"
+        "⚠️ 每次抓到的都是etfinfo.tw「當下」的最新持股——"
+        "這個網站本身沒有歷史查詢功能，沒辦法回溯抓過去某一天的資料，"
+        "所以這裡沒有「起始/結束日期」可以選(下面4️⃣的日期範圍是查詢"
+        "「資料庫裡已經收集到的」異動紀錄用的，跟這裡的抓取動作是分開的)。"
+    )
+
+    manual_fetch_scope = st.radio(
+        "抓取範圍",
+        ["只抓目前選擇的ETF", "只抓追蹤清單", "全部32檔主動式ETF"],
+        key="manual_fetch_scope",
+    )
+
+    if st.button("🚀 立即抓取", key="manual_fetch_btn", use_container_width=True):
+        if manual_fetch_scope == "只抓目前選擇的ETF":
+            _current_pick = st.session_state.get("etf_chart_etf_select")
+            target_codes = [_current_pick] if _current_pick else (all_active_codes[:1] if all_active_codes else [])
+        elif manual_fetch_scope == "只抓追蹤清單":
+            target_codes = tracked_etfs
+        else:
+            target_codes = all_active_codes
+
+        if not target_codes:
+            st.warning("沒有可抓取的ETF代碼。")
+        else:
+            try:
+                import fetch_etf_holdings
+            except ImportError:
+                st.error(
+                    "找不到 Playwright，這個環境還沒裝好直接在網頁裡抓取需要的套件。\n\n"
+                    "需要：1) `requirements.txt` 加上 `playwright` 和 `lxml`；"
+                    "2) `packages.txt` 加上 Chromium 需要的系統動態函式庫。"
+                    "詳見交付說明文件。"
+                )
+            else:
+                progress_bar = st.progress(0, text=f"準備抓取 {len(target_codes)} 檔ETF...")
+                status_placeholder = st.empty()
+
+                def _on_manual_fetch_progress(i, total, result):
+                    pct = int(i / total * 100) if total else 0
+                    icon = "✅" if result["status"] == "success" else "❌"
+                    progress_bar.progress(pct, text=f"{i}/{total}　{icon} {result['etf_code']}")
+                    if result["status"] == "success":
+                        status_placeholder.caption(f"最新：{icon} {etf_label(result['etf_code'])}（{result['row_count']} 筆）")
+                    else:
+                        status_placeholder.caption(f"最新：{icon} {etf_label(result['etf_code'])}：{result['message'][:100]}")
+
+                with st.spinner(f"正在抓取 {len(target_codes)} 檔ETF，請稍候(可能需要幾十秒到幾分鐘)..."):
+                    try:
+                        manual_fetch_summary = fetch_etf_holdings.run_fetch_for_etfs_sync(
+                            target_codes, db_path=ETF_DB_PATH, csv_path=ACTIVE_ETF_CSV,
+                            on_progress=_on_manual_fetch_progress,
+                        )
+                    except Exception as e:
+                        st.error(f"抓取過程發生未預期的錯誤：{type(e).__name__}: {e}")
+                        manual_fetch_summary = None
+
+                if manual_fetch_summary:
+                    progress_bar.progress(100, text="抓取完成")
+                    st.success(f"✅ 成功 {len(manual_fetch_summary['success'])} 檔")
+                    if manual_fetch_summary["fail"]:
+                        st.warning(f"❌ 失敗 {len(manual_fetch_summary['fail'])} 檔")
+                        for code, msg in manual_fetch_summary["fail"]:
+                            st.caption(f"　{etf_label(code)}：{msg[:150]}")
+                    if manual_fetch_summary.get("missing_from_csv"):
+                        st.caption(
+                            "（略過，不在 active_etf_list.csv 裡：" +
+                            "、".join(manual_fetch_summary["missing_from_csv"]) + "）"
+                        )
+                    st.rerun()
+
+
 st.title("📊 主動式ETF分析")
 st.caption(
     "分析主動式ETF的持股買賣狀況。持股資料每日由 GitHub Actions "
@@ -463,6 +541,64 @@ else:
             )
             fig.update_xaxes(type="category")
             st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# --------------------------------------------------------------------------
+# Section F: 區間異動查詢 (查詢「資料庫裡已經收集到的」異動紀錄，不會觸發新的抓取)
+# --------------------------------------------------------------------------
+st.markdown("### 4️⃣ 區間異動查詢")
+st.caption(
+    "查詢一段日期範圍內、資料庫裡已經收集到的持股異動紀錄。"
+    "這裡純粹是瀏覽已經存進 etf_holdings.db 的資料，不會觸發新的抓取"
+    "(要抓新資料請用左側「🔄 更新ETF買賣資料」)。"
+)
+
+if available_dates:
+    _default_range_start = pd.to_datetime(available_dates[-1])  # available_dates 是新到舊排序
+    _default_range_end = pd.to_datetime(available_dates[0])
+
+    colF1, colF2, colF3 = st.columns([1, 1, 1.2])
+    with colF1:
+        range_start = st.date_input("起始日期", value=_default_range_start, key="range_query_start")
+    with colF2:
+        range_end = st.date_input("結束日期", value=_default_range_end, key="range_query_end")
+    with colF3:
+        range_scope_choice = st.radio(
+            "查詢範圍", ["只看追蹤清單", "全部主動式ETF"], key="range_query_scope", horizontal=True
+        )
+    range_scope_codes = tracked_etfs if range_scope_choice == "只看追蹤清單" else all_active_codes
+
+    if pd.to_datetime(range_start) > pd.to_datetime(range_end):
+        st.warning("起始日期比結束日期晚，請重新選擇。")
+    else:
+        range_df = etf_db.get_holding_changes(
+            etf_conn,
+            start_date=pd.to_datetime(range_start).strftime("%Y-%m-%d"),
+            end_date=pd.to_datetime(range_end).strftime("%Y-%m-%d"),
+            etf_codes=range_scope_codes,
+        )
+        if range_df.empty:
+            st.info(f"{range_start} ~ {range_end} 期間，選定範圍內沒有查到任何持股異動紀錄。")
+        else:
+            st.caption(f"共 {len(range_df)} 筆異動紀錄。")
+            range_display_cols = [
+                "change_date", "etf_code", "stock_code", "stock_name", "change_type", "direction",
+                "weight_prev", "weight_curr", "weight_change",
+                "shares_prev", "shares_curr", "shares_change",
+            ]
+            range_display_names = {
+                "change_date": "異動日期", "etf_code": "ETF代碼", "stock_code": "股票代碼", "stock_name": "股票名稱",
+                "change_type": "異動類型", "direction": "調整方向",
+                "weight_prev": "權重(前次)", "weight_curr": "權重(本次)", "weight_change": "權重變化",
+                "shares_prev": "股數(前次)", "shares_curr": "股數(本次)", "shares_change": "股數變化",
+            }
+            st.dataframe(
+                range_df[range_display_cols].rename(columns=range_display_names),
+                use_container_width=True, hide_index=True,
+            )
+else:
+    st.info("尚無資料可查詢。")
 
 st.divider()
 
