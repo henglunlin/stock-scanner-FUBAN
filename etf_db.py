@@ -407,6 +407,26 @@ def get_stock_etf_events(
     ).sort_values("change_date")
 
 
+def get_etf_held_stocks(conn: sqlite3.Connection, etf_code: str) -> pd.DataFrame:
+    """
+    取得「某檔ETF」在資料庫裡曾經出現過(任何一天快照裡)的全部持股清單，
+    供頁面「選了ETF代碼後，股票代碼下拉選單只列出這檔ETF持有過的股票」做連動篩選用。
+
+    回傳欄位: stock_code, stock_name (每檔股票一列，去重；股票名稱取最新一筆快照的名稱)
+    """
+    q = """
+        SELECT stock_code, stock_name
+        FROM etf_holdings
+        WHERE etf_code = ?
+        AND snapshot_date = (
+            SELECT MAX(snapshot_date) FROM etf_holdings h2
+            WHERE h2.etf_code = etf_holdings.etf_code AND h2.stock_code = etf_holdings.stock_code
+        )
+        ORDER BY stock_code
+    """
+    return pd.read_sql(q, conn, params=[etf_code])
+
+
 # --------------------------------------------------------------------------
 # 抓取執行紀錄 (etf_fetch_log)
 # --------------------------------------------------------------------------

@@ -31,7 +31,11 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install pandas requests playwright
+          # lxml 是 pandas.read_html() 解析HTML表格需要的解析引擎，
+          # 這支腳本大量依賴 pd.read_html() 抓持股表格，沒裝會直接失敗
+          # (使用者本機環境可能透過其他套件間接裝了lxml，但GitHub Actions
+          # 這個乾淨環境要明確安裝)。
+          pip install pandas requests playwright lxml
 
       - name: Install Chromium for Playwright
         run: |

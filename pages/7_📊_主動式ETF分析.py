@@ -308,8 +308,34 @@ if available_dates:
             key="common_change_pick_stock",
         )
         if st.button("✅ 查看K線圖", key="common_change_view_chart_btn"):
-            st.session_state["etf_chart_stock_code"] = pick_stock_for_chart
-            st.session_state["etf_chart_end_date"] = common_date
+            # ⚠️ Streamlit 的小坑：selectbox/date_input 只要曾經被畫出來過一次，
+            # 之後的 rerun 就會優先採用 st.session_state[該widget自己的key] 裡記住的值，
+            # 這裡傳的 index=/value= 參數會被忽略。所以要「從按鈕跳轉、強制切換下面
+            # 3️⃣區塊的預設值」，必須直接寫入下面小節那三個widget「自己的key」
+            # (etf_chart_etf_select / etf_chart_stock_select / etf_chart_end_date_input)，
+            # 而且要在3️⃣區塊的widget於本次rerun建立之前寫入(此區塊C本來就在區塊D之前執行，
+            # 順序上沒問題)。
+
+            # 這檔股票在「多數ETF共同買賣」是被好幾檔ETF一起異動，
+            # 但K線圖區塊(3️⃣)一次只能看一檔ETF的標記，預設先帶入異動清單裡的第一檔，
+            # 使用者到下面可以自己換成想看的其他ETF。
+            etf_list_str = common_df.loc[
+                common_df["股票代碼"] == pick_stock_for_chart, "異動ETF清單"
+            ].iloc[0]
+            first_etf = etf_list_str.split("、")[0].strip() if etf_list_str else None
+
+            if first_etf:
+                st.session_state["etf_chart_etf_select"] = first_etf
+                # 用跟區塊D完全相同的資料來源/組字串邏輯，確保能在下拉選單選項裡精準命中
+                held_df = etf_db.get_etf_held_stocks(etf_conn, first_etf)
+                match_row = held_df[held_df["stock_code"] == pick_stock_for_chart]
+                if not match_row.empty:
+                    nm = match_row["stock_name"].iloc[0]
+                    st.session_state["etf_chart_stock_select"] = (
+                        f"{pick_stock_for_chart} {nm}" if nm else str(pick_stock_for_chart)
+                    )
+            st.session_state["etf_chart_end_date_input"] = pd.to_datetime(common_date).date()
+            st.rerun()
 else:
     st.info("尚無資料可顯示。")
 
@@ -320,37 +346,55 @@ st.divider()
 # --------------------------------------------------------------------------
 st.markdown("### 3️⃣ 個股K線 + ETF建倉標記")
 st.caption(
-    "這裡是簡化版K線圖，只用來快速確認ETF買賣點位置。"
+    "先選一檔主動式ETF，再選這檔ETF持有過的股票，"
+    "看這檔ETF在這檔股票上的買賣點標示在K線圖上(簡化版K棒，只標記選定的這檔ETF)。"
     "完整回測/停利/移動停利等功能請到「Stock simulator」頁面查看。"
 )
 
 if twse_conn is None:
     st.warning(f"找不到 twse_ohlcv.db ({TWSE_DB_PATH})，無法繪製K線圖。")
 else:
-    stock_list_df = db_utils.get_stock_list(twse_conn)
-    stock_options = [f"{r.SecurityCode} {r.SecurityName}" for r in stock_list_df.itertuples()]
+    colD1, colD2, colD3 = st.columns([1, 1.2, 1])
 
-    default_stock_choice = None
-    pending_code = st.session_state.get("etf_chart_stock_code")
-    if pending_code:
-        for opt in stock_options:
-            if opt.startswith(pending_code):
-                default_stock_choice = opt
-                break
+    # 這三個widget的「預設值」都是用 st.session_state.setdefault(widget自己的key, ...) 的方式，
+    # 只在該key第一次出現時塞入初始值；之後不管是使用者自己手動改選單、還是2️⃣的
+    # 「✅ 查看K線圖」按鈕直接改寫這些key，widget都會照著session_state裡目前的值顯示——
+    # 不能同時又傳 index=/value= 又寫session_state，Streamlit會發出警告(兩邊互相打架)。
+    if all_active_codes:
+        st.session_state.setdefault("etf_chart_etf_select", all_active_codes[0])
 
-    colD1, colD2 = st.columns([1.4, 1])
     with colD1:
-        default_idx = stock_options.index(default_stock_choice) if default_stock_choice in stock_options else 0
-        chart_stock_choice = st.selectbox(
-            "股票代碼", options=stock_options, index=default_idx if stock_options else 0,
-            key="etf_chart_stock_select",
+        chart_etf_code = st.selectbox(
+            "ETF代碼", options=all_active_codes, format_func=etf_label,
+            key="etf_chart_etf_select",
         )
-    with colD2:
-        default_end = st.session_state.get("etf_chart_end_date")
-        default_end_dt = pd.to_datetime(default_end) if default_end else pd.to_datetime(datetime.now(TW_TZ).date())
-        chart_end_date = st.date_input("K線結束日期", value=default_end_dt, key="etf_chart_end_date_input")
 
-    if stock_options:
+    held_stocks_df = etf_db.get_etf_held_stocks(etf_conn, chart_etf_code)
+    stock_options = [
+        f"{r.stock_code} {r.stock_name}" if r.stock_name else str(r.stock_code)
+        for r in held_stocks_df.itertuples()
+    ]
+
+    with colD2:
+        if stock_options:
+            # 換了ETF代碼、如果session_state裡記住的舊選項不屬於這檔ETF的持股清單，
+            # 就清掉讓它自然回到清單第一筆(避免下面selectbox因為值不在options裡而報錯)。
+            if st.session_state.get("etf_chart_stock_select") not in stock_options:
+                st.session_state["etf_chart_stock_select"] = stock_options[0]
+            chart_stock_choice = st.selectbox(
+                "股票代碼", options=stock_options,
+                key="etf_chart_stock_select",
+            )
+        else:
+            chart_stock_choice = None
+            st.selectbox("股票代碼", options=["(尚無持股資料)"], disabled=True, key="etf_chart_stock_select_disabled")
+    with colD3:
+        st.session_state.setdefault("etf_chart_end_date_input", datetime.now(TW_TZ).date())
+        chart_end_date = st.date_input("K線結束日期", key="etf_chart_end_date_input")
+
+    if not stock_options:
+        st.info(f"{etf_label(chart_etf_code)} 在資料庫裡目前還沒有任何持股快照，無法選擇股票(可能排程還沒抓過這檔)。")
+    else:
         chart_code = chart_stock_choice.split(" ")[0]
         chart_start_date = (pd.to_datetime(chart_end_date) - timedelta(days=120)).strftime("%Y-%m-%d")
         chart_end_str = pd.to_datetime(chart_end_date).strftime("%Y-%m-%d")
@@ -361,7 +405,8 @@ else:
             st.info(f"{chart_code} 在 {chart_start_date}~{chart_end_str} 期間查無K線資料。")
         else:
             events_df = etf_db.get_stock_etf_events(
-                etf_conn, chart_code, start_date=chart_start_date, end_date=chart_end_str
+                etf_conn, chart_code, start_date=chart_start_date, end_date=chart_end_str,
+                etf_codes=[chart_etf_code],
             )
 
             fig = go.Figure()
@@ -381,7 +426,7 @@ else:
                     if d not in ohlcv_df.index:
                         continue
                     y = ohlcv_df.loc[d, "High"] if ev["direction"] in ("加碼", "新納入") else ohlcv_df.loc[d, "Low"]
-                    label = f"{ev['etf_code']} {ev['direction']}"
+                    label = ev["direction"]
                     if ev["direction"] in ("加碼", "新納入"):
                         bullish_dates.append(d)
                         bullish_y.append(y)
@@ -397,7 +442,7 @@ else:
                         marker=dict(symbol="triangle-up", size=12, color=MARK_COLOR_BUY),
                         text=bullish_text, textposition="top center",
                         textfont=dict(size=9, color=MARK_COLOR_BUY),
-                        name="ETF加碼/新納入",
+                        name=f"{chart_etf_code} 加碼/新納入",
                     ))
                 if bearish_dates:
                     fig.add_trace(go.Scatter(
@@ -405,13 +450,14 @@ else:
                         marker=dict(symbol="triangle-down", size=12, color=MARK_COLOR_SELL),
                         text=bearish_text, textposition="bottom center",
                         textfont=dict(size=9, color=MARK_COLOR_SELL),
-                        name="ETF減碼/全數賣出",
+                        name=f"{chart_etf_code} 減碼/全數賣出",
                     ))
             else:
-                st.caption("這檔股票在此期間沒有偵測到追蹤ETF的持股異動紀錄。")
+                st.caption(f"這檔股票在此期間沒有偵測到 {etf_label(chart_etf_code)} 的持股異動紀錄。")
 
+            stock_name_part = chart_stock_choice.split(" ", 1)[1] if " " in chart_stock_choice else ""
             fig.update_layout(
-                title=f"{chart_code} {chart_stock_choice.split(' ', 1)[1] if ' ' in chart_stock_choice else ''}",
+                title=f"{chart_code} {stock_name_part} — {etf_label(chart_etf_code)} 建倉標記",
                 xaxis_rangeslider_visible=False, height=560, showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
