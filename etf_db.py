@@ -445,6 +445,73 @@ def get_etf_held_stocks(conn: sqlite3.Connection, etf_code: str) -> pd.DataFrame
     return pd.read_sql(q, conn, params=[etf_code])
 
 
+def get_stock_weight_history(conn: sqlite3.Connection, etf_code: str, stock_code: str) -> pd.DataFrame:
+    """
+    2026-08-24新增：取得「某檔股票」在「某檔ETF」裡，每一天快照的權重/股數走勢
+    (依日期由舊到新排序)，供頁面「1️⃣」畫「個股權重歷史趨勢」折線圖使用。
+
+    只有股票有出現在該日快照裡才會有一筆資料；如果某天這檔股票已經被剔除持股
+    (不在當天快照裡)，該天不會出現在結果裡(不會補0)，畫圖時看起來會是一段
+    折線在某天就中斷，不是掉到0，比較符合「已出場」的實際狀況。
+    """
+    q = """
+        SELECT snapshot_date, weight, weight_text, shares, shares_text
+        FROM etf_holdings
+        WHERE etf_code = ? AND stock_code = ?
+        ORDER BY snapshot_date ASC
+    """
+    return pd.read_sql(q, conn, params=[etf_code, stock_code])
+
+
+def get_all_held_stocks(conn: sqlite3.Connection, etf_codes: list) -> pd.DataFrame:
+    """
+    2026-08-24新增：取得「範圍內所有ETF」歷史上曾經出現過的股票清單(去重)，
+    供頁面「5️⃣ 個股全域查詢」的股票下拉選單使用。範圍限定在傳入的 etf_codes
+    清單內(呼叫端會傳「追蹤清單」或「全部主動式ETF」)，不含這個db沒有資料的
+    被動型ETF，股票名稱取同一股票代碼底下任一筆出現過的名稱(用MAX，理論上
+    同一股票代碼的名稱不會變動)。
+    """
+    if not etf_codes:
+        return pd.DataFrame(columns=["stock_code", "stock_name"])
+    placeholders = ",".join("?" * len(etf_codes))
+    q = f"""
+        SELECT stock_code, MAX(stock_name) AS stock_name
+        FROM etf_holdings
+        WHERE etf_code IN ({placeholders})
+        GROUP BY stock_code
+        ORDER BY stock_code
+    """
+    return pd.read_sql(q, conn, params=list(etf_codes))
+
+
+def get_stock_latest_holdings_across_etfs(conn: sqlite3.Connection, stock_code: str, etf_codes: list) -> pd.DataFrame:
+    """
+    2026-08-24新增：取得「這檔股票」在傳入範圍內每一檔ETF「最新一次快照」裡的
+    持股狀況(權重/股數)，供頁面「5️⃣ 個股全域查詢」使用——輸入一檔股票代碼，
+    看範圍內(追蹤清單或全部主動式ETF)目前哪些ETF還持有這檔股票、各自的權重多少。
+
+    只回傳「該ETF最新一次快照裡確實還持有這檔股票」的列；如果某檔ETF最新快照
+    已經不含這檔股票(代表已經被賣光出場)，不會出現在這裡的結果，但仍可能出現
+    在 get_holding_changes(stock_code=...) 查到的歷史異動紀錄裡(全數賣出那筆)。
+    依權重由高到低排序。
+    """
+    if not etf_codes:
+        return pd.DataFrame()
+    placeholders = ",".join("?" * len(etf_codes))
+    q = f"""
+        SELECT h.etf_code, h.snapshot_date, h.weight, h.weight_text, h.shares, h.shares_text
+        FROM etf_holdings h
+        WHERE h.stock_code = ?
+          AND h.etf_code IN ({placeholders})
+          AND h.snapshot_date = (
+              SELECT MAX(snapshot_date) FROM etf_holdings h2
+              WHERE h2.etf_code = h.etf_code
+          )
+        ORDER BY h.weight DESC
+    """
+    return pd.read_sql(q, conn, params=[stock_code] + list(etf_codes))
+
+
 # --------------------------------------------------------------------------
 # 抓取執行紀錄 (etf_fetch_log)
 # --------------------------------------------------------------------------
