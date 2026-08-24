@@ -118,6 +118,12 @@ def load_active_etf_list(csv_path: str = ACTIVE_ETF_LIST_CSV) -> dict:
     """
     讀取 Database/active_etf_list.csv，回傳 {代號: {"name": 名稱, "url": 持股頁面網址}}。
     CSV 欄位需含「股票代號」「ETF名稱」(UTF-8 編碼)。
+
+    ⚠️ 2026-08-24新增「啟用」欄位：這次討論後決定先只穩定抓6檔已驗證過的純台股
+    主動式ETF，其餘26檔(含美股/混合持股的)暫時保留在清單裡當「目錄」，但「啟用」
+    設為0，不會被實際抓取。之後要擴充只要把對應那一列的「啟用」改成1即可，
+    不用重新輸入ETF代號/名稱。CSV裡沒有「啟用」欄位時(舊格式)視為全部啟用，
+    保持向下相容。
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
@@ -126,6 +132,7 @@ def load_active_etf_list(csv_path: str = ACTIVE_ETF_LIST_CSV) -> dict:
         )
     df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
     df.columns = [c.strip() for c in df.columns]
+    has_enabled_col = "啟用" in df.columns
 
     result = {}
     for _, row in df.iterrows():
@@ -133,6 +140,10 @@ def load_active_etf_list(csv_path: str = ACTIVE_ETF_LIST_CSV) -> dict:
         name = str(row.get("ETF名稱", "")).strip()
         if not code:
             continue
+        if has_enabled_col:
+            enabled_raw = str(row.get("啟用", "")).strip()
+            if enabled_raw not in ("1", "1.0", "True", "true", "是"):
+                continue
         result[code] = {
             "name": name,
             "url": f"https://www.etfinfo.tw/etf/{code}/holdings",
@@ -141,8 +152,48 @@ def load_active_etf_list(csv_path: str = ACTIVE_ETF_LIST_CSV) -> dict:
 
 
 # =========================
-# Chromium 啟動工具 (取代原本的 launch_edge_browser)
+# 瀏覽器啟動工具 (雙瀏覽器支援：Edge優先、Chromium備援)
 # =========================
+# ⚠️ 2026-08-24調整：使用者確認「保留雙瀏覽器支援」——這支腳本要能在兩種環境下跑：
+#   1. 使用者自己的Windows電腦(本機手動執行) → 用真正的 Microsoft Edge，
+#      這是使用者原本 Fund_change_common_summary.py / etf_utils.py 就驗證過穩定可靠的方式。
+#   2. GitHub Actions (ubuntu-latest，最終正式排程/Streamlit按鈕觸發的執行環境)
+#      → 沒有Edge可用，改用 headless Chromium(這個repo在v3就驗證過能穩定連到etfinfo.tw)。
+# launch_browser() 會先嘗試Edge，抓不到才自動退回Chromium，同一份程式碼兩種環境都能跑，
+# 不用另外維護兩份腳本。
+
+async def launch_edge_browser(playwright):
+    """
+    嘗試啟動本機Microsoft Edge(取自使用者確認可靠的 etf_utils.py 原始寫法)。
+    只有在真的有安裝Edge的環境(通常是使用者自己的Windows電腦)才會成功；
+    GitHub Actions ubuntu-latest 上一定會失敗，由呼叫端 launch_browser() 接住並退回Chromium。
+    """
+    launch_options = {
+        "headless": True,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ],
+    }
+    try:
+        logging.info("嘗試使用 channel='msedge' 啟動 Microsoft Edge")
+        return await playwright.chromium.launch(channel="msedge", **launch_options)
+    except Exception as e:
+        logging.warning(f"使用 channel='msedge' 啟動失敗: {e}")
+
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    for edge_path in edge_paths:
+        if os.path.exists(edge_path):
+            logging.info(f"改用 Edge 路徑啟動: {edge_path}")
+            return await playwright.chromium.launch(executable_path=edge_path, **launch_options)
+
+    raise RuntimeError("找不到 Microsoft Edge 執行檔，這台機器上沒有安裝Edge或路徑不在預期位置。")
+
+
 async def launch_chromium_browser(playwright):
     """
     在 GitHub Actions (ubuntu-latest) / 一般 Linux 環境啟動 headless Chromium。
@@ -193,20 +244,14 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_stock_code(value) -> str:
     """
-    ⚠️ 2026-08-23發現：不是所有「主動式ETF」都只投資台股。有些主動式ETF
-    (例如 00402A 主動安聯美國科技、00983A 主動中信ARK創新、00986A 主動台新
-    龍頭成長)主要持有美股，這一欄的內容會是「美股代號+公司名稱」直接相連、
-    中間沒有空格或任何分隔符號(例如 "NVDANVIDIA Corp"、"AAPLApple Inc")。
-    這種格式沒辦法100%可靠地切出「純代號」——因為有些公司名稱本身也是
-    全大寫顯示(像NVIDIA)，會跟代號黏在一起分不清楚邊界在哪。
+    ⚠️ 2026-08-24調整：改回使用者「確定可以抓值」的 etf_utils.py 版本(只認台股4位
+    數字代碼)，取代v4/v7為了處理美股/混合持股ETF加上的英文代碼fallback邏輯。
 
-    所以這裡的策略是：
-      1. 台股(4位數字開頭)：照原本邏輯抓出4位數字代碼。
-      2. 非台股、但開頭是一段大寫英文字母：沒辦法乾淨切開代號/名稱，
-         乾脆把「整段原始文字」當作這筆持股的識別碼。雖然不是教科書上
-         乾淨的ticker(例如可能是"NVDANVIDIA Corp"整串)，但每天抓到的
-         格式是一致的，足夠拿來做逐日比對「這筆持股還在不在」「有沒有
-         加碼/減碼」——不影響異動偵測的正確性，只是顯示上不夠乾淨。
+    原因：這次討論後範圍先縮小到6檔已驗證過的純台股主動式ETF(00981A/00991A/
+    00980A/00982A/00403A/00985A)，這6檔完全沒有美股持股問題，不需要那段
+    fallback邏輯；而且那段邏輯是根據log現象推理寫的、沒有實際連到etfinfo.tw驗證過，
+    相對之下這個簡化版本已經用使用者自己本機真實抓到的資料(2026-08-20/21)驗證過
+    正確無誤。之後如果要擴充到含美股/混合持股的ETF，再另外討論怎麼處理。
     """
     if pd.isna(value):
         return ""
@@ -218,8 +263,6 @@ def normalize_stock_code(value) -> str:
     match = re.match(r"^(\d{4})", text)
     if match:
         return match.group(1)
-    if re.match(r"^[A-Z]{1,6}", text):
-        return text
     return ""
 
 
@@ -229,15 +272,7 @@ def extract_stock_name(value) -> str:
     text = str(value).strip()
     if text == "" or text.lower() == "nan":
         return ""
-    stripped = re.sub(r"^\d{4}\s*", "", text).strip()
-    if stripped != text:
-        # 有成功去掉台股4位數字代碼前綴，代表這是台股格式，剩下的就是名稱。
-        text = stripped
-    elif re.match(r"^[A-Z]{1,6}", text):
-        # 非台股、代碼跟名稱黏在一起沒辦法乾淨切開(見 normalize_stock_code 的說明)，
-        # 與其硬切出一個可能錯誤的名稱、造成誤導，不如留空——
-        # 代碼(整段原文)才是逐日比對持股異動真正倚賴的欄位，名稱只是顯示用。
-        return ""
+    text = re.sub(r"^\d{4}\s*", "", text).strip()
     bad_values = ["登入查看", "登入", "查看", "--", "-", "nan"]
     if text in bad_values:
         return ""
@@ -264,14 +299,7 @@ def build_stock_name_series(df: pd.DataFrame, code_col: str, name_col) -> pd.Ser
 
 def is_stock_code_like(value) -> bool:
     code = normalize_stock_code(value)
-    if not code:
-        return False
-    if re.fullmatch(r"\d{4}", code):
-        return True
-    # 非台股(美股等)代碼+名稱黏在一起的情況，normalize_stock_code() 會回傳整段原文，
-    # 這裡只要求「開頭是一段大寫英文字母」就當作代碼欄位的候選值——見
-    # normalize_stock_code() 開頭的說明。
-    return bool(re.match(r"^[A-Z]{1,6}", code))
+    return bool(re.fullmatch(r"\d{4}", code))
 
 
 def score_as_stock_code_column(series: pd.Series) -> float:
@@ -901,6 +929,21 @@ async def _launch_chromium_with_auto_install(playwright_instance):
         return await launch_chromium_browser(playwright_instance)
 
 
+async def launch_browser(playwright_instance):
+    """
+    雙瀏覽器統一入口：先試Edge(本機Windows環境會成功)，失敗就自動退回Chromium
+    (GitHub Actions / Streamlit Cloud等沒有Edge的環境)。main_async()跟
+    run_fetch_for_etfs()都改叫這個函式，不用各自判斷要用哪個瀏覽器。
+    """
+    try:
+        browser = await launch_edge_browser(playwright_instance)
+        logging.info("已使用 Microsoft Edge 啟動瀏覽器")
+        return browser
+    except Exception as e:
+        logging.info(f"本機找不到可用的Edge({e})，改用 headless Chromium")
+        return await _launch_chromium_with_auto_install(playwright_instance)
+
+
 async def run_fetch_for_etfs(etf_codes: list, db_path: str = DB_PATH, csv_path: str = ACTIVE_ETF_LIST_CSV, on_progress=None) -> dict:
     """
     只抓「指定的一部分ETF」，供 pages/7 頁面的「立即抓取」按鈕使用
@@ -917,7 +960,7 @@ async def run_fetch_for_etfs(etf_codes: list, db_path: str = DB_PATH, csv_path: 
 
     results = []
     async with async_playwright() as p:
-        browser = await _launch_chromium_with_auto_install(p)
+        browser = await launch_browser(p)
         try:
             for i, (etf_code, info) in enumerate(targets, start=1):
                 result = await fetch_and_save_one_etf(browser, db_path, etf_code, info["url"], run_date)
@@ -956,7 +999,7 @@ async def main_async():
     fail_list = []
 
     async with async_playwright() as p:
-        browser = await launch_chromium_browser(p)
+        browser = await launch_browser(p)
 
         for etf_code, info in etf_map.items():
             result = await fetch_and_save_one_etf(browser, DB_PATH, etf_code, info["url"], run_date)

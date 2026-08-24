@@ -224,12 +224,30 @@ def save_holding_changes(db_path: str, etf_code: str, change_date: str, changes_
         # 權重變化/股數變化欄位在 compare_etf_holdings() 裡已算成字串，這裡另外保留數值版本
         return None
 
+    def _first_valid_name(*vals):
+        # ⚠️ 2026-08-24修正：原本用 `row.get("股票名稱_今日") or row.get("股票名稱_昨日") or ""`，
+        # 但當「股票名稱_今日」是pandas的NaN(浮點數)時，Python裡 `nan or x` 會回傳nan本身
+        # (因為float('nan')本身是truthy的)，不會照預期退回去用「股票名稱_昨日」。
+        # 這在「全數賣出」(股票今天已經不在持股裡，今日名稱欄位自然是NaN)這種情況下
+        # 會導致存進資料庫的股票名稱是NaN，用實際資料測試(2026-08-21 00982A的7769
+        # 鴻勁精密全數賣出)時發現「共同異動」清單裡這檔股票名稱顯示不出來。
+        # 改成明確檢查NaN/空字串，才會正確退回去用昨日的名稱。
+        for v in vals:
+            if v is None:
+                continue
+            if isinstance(v, float) and pd.isna(v):
+                continue
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                return s
+        return ""
+
     records = []
     for _, row in changes_df.iterrows():
         stock_code = str(row.get("股票代碼", "")).strip()
         if not stock_code:
             continue
-        stock_name = row.get("股票名稱_今日") or row.get("股票名稱_昨日") or ""
+        stock_name = _first_valid_name(row.get("股票名稱_今日"), row.get("股票名稱_昨日"))
         records.append((
             change_date,
             etf_code,

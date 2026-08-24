@@ -68,17 +68,29 @@ def save_watchlist_config(config_path: str, tracked_etfs: list, common_change_mi
 
 
 def load_active_etf_name_map(csv_path: str) -> dict:
-    """讀取 Database/active_etf_list.csv，回傳 {代號: 名稱} 對照表，供頁面checkbox顯示用。"""
+    """
+    讀取 Database/active_etf_list.csv，回傳 {代號: 名稱} 對照表，供頁面checkbox顯示用。
+
+    ⚠️ 2026-08-24：只回傳「啟用」欄位為1的ETF(目前先只穩定6檔純台股ETF)，
+    避免頁面下拉選單/「全部XX檔」選項列出還沒有實際資料的ETF、造成使用者選了
+    卻看到「沒有資料」的困惑。CSV沒有「啟用」欄位時(舊格式)視為全部啟用。
+    """
     import pandas as pd
 
     if not os.path.exists(csv_path):
         return {}
     df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
     df.columns = [c.strip() for c in df.columns]
+    has_enabled_col = "啟用" in df.columns
     result = {}
     for _, row in df.iterrows():
         code = str(row.get("股票代號", "")).strip()
         name = str(row.get("ETF名稱", "")).strip()
-        if code:
-            result[code] = name
+        if not code:
+            continue
+        if has_enabled_col:
+            enabled_raw = str(row.get("啟用", "")).strip()
+            if enabled_raw not in ("1", "1.0", "True", "true", "是"):
+                continue
+        result[code] = name
     return result
