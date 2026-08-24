@@ -308,6 +308,9 @@ def get_twse_conn():
 
 etf_conn = get_etf_conn()
 twse_conn = get_twse_conn()
+# 2026-08-24新增：db檔案的mtime，當作下面查詢快取(st.cache_data)的失效依據——
+# 直接內嵌計算(不呼叫下面才定義的_etf_db_mtime()函式)，避免函式定義順序問題。
+etf_db_mtime = os.path.getmtime(ETF_DB_PATH) if os.path.exists(ETF_DB_PATH) else 0.0
 
 active_etf_name_map = etf_watchlist.load_active_etf_name_map(ACTIVE_ETF_CSV)
 all_active_codes = sorted(active_etf_name_map.keys())
@@ -330,6 +333,77 @@ def etf_label(code: str) -> str:
 # 剩不滿一張的零股在這幾張表裡不特別處理，直接四捨五入)。
 def shares_series_to_lots(series: pd.Series) -> pd.Series:
     return (series / 1000).round(0)
+
+
+# --------------------------------------------------------------------------
+# 查詢快取 (2026-08-24新增)
+# --------------------------------------------------------------------------
+# ⚠️ Streamlit的機制：畫面上任何一個widget互動(切分頁不算，但選日期/選股票/
+# 按按鈕都算)都會讓整頁重新執行一次，而且四個(現在五個)分頁的程式碼在同一次
+# rerun裡「全部都會執行」(只是畫面上只顯示目前選中的分頁)。這代表原本沒加快取
+# 的時候，使用者在「3️⃣」調整K線日期，「1️⃣」「2️⃣」「4️⃣」用不到那次互動結果的
+# 查詢其實也都跟著重新對db查了一次，只是沒有顯示變化而已，互動一多、db資料一大
+# 就容易感覺卡頓。這裡統一幫 etf_db.get_*() 這幾個查詢函式包一層 st.cache_data：
+#   - 參數名稱前面加底線的(_conn)代表「不參與快取key的雜湊比對」(Streamlit的慣例)，
+#     單純只是拿來實際執行查詢——sqlite3.Connection物件本身沒辦法被雜湊，一定要
+#     用底線開頭排除掉，否則st.cache_data會直接報錯。
+#   - mtime(不加底線，會參與快取key)是db檔案的最後修改時間，只要
+#     update_etf_holdings.yml排程寫入新資料、db檔案mtime改變，快取就會自動失效
+#     重新查詢；沒有新資料進來的期間，同樣的查詢條件會直接吃快取，不用重新連db。
+@st.cache_data(show_spinner=False)
+def cached_available_dates(_conn, mtime: float, etf_code=None) -> list:
+    return etf_db.get_available_snapshot_dates(_conn, etf_code)
+
+
+@st.cache_data(show_spinner=False)
+def cached_holdings_snapshot(_conn, mtime: float, etf_code: str, snapshot_date: str) -> pd.DataFrame:
+    return etf_db.get_holdings_snapshot(_conn, etf_code, snapshot_date)
+
+
+@st.cache_data(show_spinner=False)
+def cached_holding_changes(_conn, mtime: float, change_date=None, etf_code=None, etf_codes=None,
+                            stock_code=None, start_date=None, end_date=None) -> pd.DataFrame:
+    return etf_db.get_holding_changes(
+        _conn, change_date=change_date, etf_code=etf_code, etf_codes=etf_codes,
+        stock_code=stock_code, start_date=start_date, end_date=end_date,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def cached_common_changes(_conn, mtime: float, change_date: str, etf_codes: list, min_etf_count: int) -> pd.DataFrame:
+    return etf_db.get_common_changes(_conn, change_date, etf_codes, min_etf_count=min_etf_count)
+
+
+@st.cache_data(show_spinner=False)
+def cached_stock_etf_events(_conn, mtime: float, stock_code: str, start_date=None, end_date=None,
+                             etf_codes=None) -> pd.DataFrame:
+    return etf_db.get_stock_etf_events(_conn, stock_code, start_date=start_date, end_date=end_date,
+                                        etf_codes=etf_codes)
+
+
+@st.cache_data(show_spinner=False)
+def cached_etf_held_stocks(_conn, mtime: float, etf_code: str) -> pd.DataFrame:
+    return etf_db.get_etf_held_stocks(_conn, etf_code)
+
+
+@st.cache_data(show_spinner=False)
+def cached_stock_weight_history(_conn, mtime: float, etf_code: str, stock_code: str) -> pd.DataFrame:
+    return etf_db.get_stock_weight_history(_conn, etf_code, stock_code)
+
+
+@st.cache_data(show_spinner=False)
+def cached_all_held_stocks(_conn, mtime: float, etf_codes: list) -> pd.DataFrame:
+    return etf_db.get_all_held_stocks(_conn, etf_codes)
+
+
+@st.cache_data(show_spinner=False)
+def cached_stock_latest_holdings(_conn, mtime: float, stock_code: str, etf_codes: list) -> pd.DataFrame:
+    return etf_db.get_stock_latest_holdings_across_etfs(_conn, stock_code, etf_codes)
+
+
+@st.cache_data(show_spinner=False)
+def cached_latest_fetch_log(_conn, mtime: float, limit: int = 60) -> pd.DataFrame:
+    return etf_db.get_latest_fetch_log(_conn, limit=limit)
 
 
 # --------------------------------------------------------------------------
@@ -380,7 +454,7 @@ if not all_active_codes:
     )
     st.stop()
 
-available_dates = etf_db.get_available_snapshot_dates(etf_conn)
+available_dates = cached_available_dates(etf_conn, etf_db_mtime)
 if not available_dates:
     st.warning(
         "etf_holdings.db 裡目前還沒有任何持股資料——"
@@ -443,14 +517,16 @@ tracked_etfs = [c for c in cfg["tracked_etfs"] if c in active_etf_name_map] or a
 st.divider()
 
 # --------------------------------------------------------------------------
-# Section B~F：四個分析區塊改用橫向分頁(st.tabs)顯示，取代原本上下堆疊、
+# Section B~G：分析區塊改用橫向分頁(st.tabs)顯示，取代原本上下堆疊、
 # 要一直往下滾的版面(2026-08-24調整)。同一次rerun裡所有分頁的程式碼都會執行
 # (只是畫面上只顯示目前選中的分頁)，所以分頁之間互相連動(例如2️⃣按鈕跳轉到3️⃣
 # 的K線圖)的session_state邏輯不用改，只是使用者要自己點一下切換分頁查看結果。
+# 「5️⃣ 個股全域查詢」是2026-08-24新增的第五個分頁。
 # --------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1️⃣ 指定ETF買賣狀況", "2️⃣ 多數ETF共同買賣",
     "3️⃣ 個股K線 + ETF建倉標記", "4️⃣ 區間異動查詢",
+    "5️⃣ 個股全域查詢",
 ])
 
 with tab1:
@@ -462,7 +538,7 @@ with tab1:
                 "選擇ETF", options=tracked_etfs, format_func=etf_label, key="single_etf_pick"
             )
         with colB2:
-            etf_dates = etf_db.get_available_snapshot_dates(etf_conn, pick_etf)
+            etf_dates = cached_available_dates(etf_conn, etf_db_mtime, pick_etf)
             if etf_dates:
                 pick_date = st.selectbox("選擇日期", options=etf_dates, key="single_etf_date")
             else:
@@ -470,7 +546,7 @@ with tab1:
                 st.info(f"{etf_label(pick_etf)} 目前資料庫裡還沒有任何快照。")
 
         if pick_date:
-            changes = etf_db.get_holding_changes(etf_conn, change_date=pick_date, etf_code=pick_etf)
+            changes = cached_holding_changes(etf_conn, etf_db_mtime, change_date=pick_date, etf_code=pick_etf)
             if changes.empty:
                 st.info(f"{pick_date} {etf_label(pick_etf)} 沒有偵測到持股異動(或這是第一天被抓取、沒有比較基準)。")
             else:
@@ -503,7 +579,7 @@ with tab1:
             # 資料來源沿用同一個 etf_holdings 快照表(etf_db.get_holdings_snapshot)，
             # 跟畫面上方顯示的異動明細本來就是同一份資料庫、同一次抓取結果。
             st.markdown("#### 📋 成分股比例")
-            holdings_snapshot = etf_db.get_holdings_snapshot(etf_conn, pick_etf, pick_date)
+            holdings_snapshot = cached_holdings_snapshot(etf_conn, etf_db_mtime, pick_etf, pick_date)
             if holdings_snapshot.empty:
                 st.info(f"{pick_date} {etf_label(pick_etf)} 沒有持股快照資料。")
             else:
@@ -544,6 +620,42 @@ with tab1:
                     holdings_table.rename(columns=holdings_display_names),
                     use_container_width=True, hide_index=True,
                 )
+
+                # 2026-08-24新增：「成分股比例」只能看單一天的快照，看不出這檔股票
+                # 在這檔ETF裡是「持續加碼中」還是「單次調整」，這裡加一個小折線圖，
+                # 直接用 etf_holdings 表裡逐日快照的權重畫出歷史趨勢(不用另外抓資料)。
+                st.markdown("#### 📈 個股權重歷史趨勢")
+                trend_options = [
+                    f"{r.stock_code} {r.stock_name}" if r.stock_name else str(r.stock_code)
+                    for r in holdings_snapshot.itertuples()
+                ]
+                trend_pick = st.selectbox(
+                    "選擇股票，查看它在這檔ETF裡的權重(%)隨時間變化",
+                    options=trend_options, key="tab1_trend_stock_pick",
+                )
+                trend_code = trend_pick.split(" ")[0]
+                trend_df = cached_stock_weight_history(etf_conn, etf_db_mtime, pick_etf, trend_code)
+                trend_df = trend_df.dropna(subset=["weight"])
+                if trend_df.empty:
+                    st.caption("這檔股票沒有足夠的權重歷史資料可以畫趨勢圖。")
+                else:
+                    trend_fig = go.Figure(go.Scatter(
+                        x=trend_df["snapshot_date"], y=trend_df["weight"],
+                        mode="lines+markers", line=dict(color="#2c6fbb", width=2),
+                        marker=dict(size=6),
+                        text=trend_df["weight_text"], hovertemplate="%{x}<br>權重 %{text}<extra></extra>",
+                    ))
+                    trend_fig.update_layout(
+                        title=f"{trend_pick} 在 {etf_label(pick_etf)} 的權重走勢",
+                        yaxis_title="權重(%)", height=320,
+                        margin=dict(l=10, r=10, t=40, b=10),
+                    )
+                    trend_fig.update_xaxes(type="category")
+                    st.plotly_chart(trend_fig, use_container_width=True)
+                    st.caption(
+                        "折線只畫出「有出現在當天快照裡」的日期；如果某天這檔股票已經被剔除持股、"
+                        "不在快照裡，折線會在那天之前中斷，不會畫成掉到0。"
+                    )
     else:
         st.info("尚無資料可顯示。")
 
@@ -572,7 +684,7 @@ with tab2:
             cfg = etf_watchlist.save_watchlist_config(WATCHLIST_CONFIG_PATH, cfg["tracked_etfs"], min_etf_count)
             st.session_state.etf_watchlist_cfg = cfg
 
-        common_df = etf_db.get_common_changes(etf_conn, common_date, scope_codes, min_etf_count=min_etf_count)
+        common_df = cached_common_changes(etf_conn, etf_db_mtime, common_date, scope_codes, min_etf_count)
         if common_df.empty:
             st.info(f"{common_date} 沒有找到至少 {min_etf_count} 檔ETF同時異動的股票。")
         else:
@@ -606,7 +718,7 @@ with tab2:
                 if first_etf:
                     st.session_state["etf_chart_etf_select"] = first_etf
                     # 用跟區塊D完全相同的資料來源/組字串邏輯，確保能在下拉選單選項裡精準命中
-                    held_df = etf_db.get_etf_held_stocks(etf_conn, first_etf)
+                    held_df = cached_etf_held_stocks(etf_conn, etf_db_mtime, first_etf)
                     match_row = held_df[held_df["stock_code"] == pick_stock_for_chart]
                     if not match_row.empty:
                         nm = match_row["stock_name"].iloc[0]
@@ -651,7 +763,7 @@ with tab3:
         _highlight_date = st.session_state["etf_chart_end_date_input"]
         _highlight_date_str = pd.to_datetime(_highlight_date).strftime("%Y-%m-%d")
 
-        held_stocks_df = etf_db.get_etf_held_stocks(etf_conn, chart_etf_code)
+        held_stocks_df = cached_etf_held_stocks(etf_conn, etf_db_mtime, chart_etf_code)
         stock_options = [
             f"{r.stock_code} {r.stock_name}" if r.stock_name else str(r.stock_code)
             for r in held_stocks_df.itertuples()
@@ -661,8 +773,8 @@ with tab3:
         # 下拉選單裡有異動的股票前面加🟢(加碼/新納入)或🔴(減碼/全數賣出)圖示。
         # 用format_func只影響「顯示文字」，selectbox實際回傳值還是原本的
         # "代碼 名稱"字串，不影響下面 chart_code = chart_stock_choice.split(" ")[0] 的邏輯。
-        _same_day_changes = etf_db.get_holding_changes(
-            etf_conn, change_date=_highlight_date_str, etf_code=chart_etf_code
+        _same_day_changes = cached_holding_changes(
+            etf_conn, etf_db_mtime, change_date=_highlight_date_str, etf_code=chart_etf_code
         )
         _direction_by_code = dict(zip(_same_day_changes["stock_code"], _same_day_changes["direction"])) \
             if not _same_day_changes.empty else {}
@@ -716,8 +828,8 @@ with tab3:
             if ohlcv_df.empty:
                 st.info(f"{chart_code} 在 {chart_start_date}~{chart_end_str} 期間查無K線資料。")
             else:
-                events_df = etf_db.get_stock_etf_events(
-                    etf_conn, chart_code, start_date=chart_start_date, end_date=chart_end_str,
+                events_df = cached_stock_etf_events(
+                    etf_conn, etf_db_mtime, chart_code, start_date=chart_start_date, end_date=chart_end_str,
                     etf_codes=[chart_etf_code],
                 )
 
@@ -832,8 +944,8 @@ with tab4:
         if pd.to_datetime(range_start) > pd.to_datetime(range_end):
             st.warning("起始日期比結束日期晚，請重新選擇。")
         else:
-            range_df = etf_db.get_holding_changes(
-                etf_conn,
+            range_df = cached_holding_changes(
+                etf_conn, etf_db_mtime,
                 start_date=pd.to_datetime(range_start).strftime("%Y-%m-%d"),
                 end_date=pd.to_datetime(range_end).strftime("%Y-%m-%d"),
                 etf_codes=range_scope_codes,
@@ -864,13 +976,95 @@ with tab4:
     else:
         st.info("尚無資料可查詢。")
 
+with tab5:
+    # 2026-08-24新增：原本只能「先選ETF、再看它買了哪些股票」，這裡反過來，
+    # 輸入/選一檔股票代碼，直接看「這檔股票目前被範圍內哪些主動式ETF持有、
+    # 各自權重多少」+「這檔股票過去被範圍內ETF加碼/減碼過的完整歷史」。
+    # ⚠️ 查詢範圍限定在這個頁面本來就在追蹤的主動式ETF(ETF_data/active_etf_list.csv
+    # 篩選出的清單，目前資料庫裡有資料的是6檔啟用中的)，不是台股市場所有ETF——
+    # 資料庫 etf_holdings/etf_holding_changes 這兩張表本來就只存這個頁面在抓的
+    # 主動式ETF資料，不含被動型ETF(例如0050)的持股。
+    st.caption(
+        "輸入或選一檔股票代碼，查看這檔股票目前被範圍內哪些主動式ETF持有、"
+        "以及過去被這些ETF加碼/減碼過的完整歷史紀錄。"
+        "⚠️ 查詢範圍限定在本頁面追蹤的主動式ETF清單，不含被動型ETF(如0050)。"
+    )
+
+    if available_dates:
+        colG1, colG2 = st.columns([1, 2])
+        with colG1:
+            global_scope_choice = st.radio(
+                "查詢範圍", ["只看追蹤清單", "全部主動式ETF"], key="global_query_scope", horizontal=True
+            )
+        global_scope_codes = tracked_etfs if global_scope_choice == "只看追蹤清單" else all_active_codes
+
+        all_held_df = cached_all_held_stocks(etf_conn, etf_db_mtime, global_scope_codes)
+        if all_held_df.empty:
+            st.info("這個範圍內目前資料庫裡還沒有任何持股資料。")
+        else:
+            global_stock_options = [
+                f"{r.stock_code} {r.stock_name}" if r.stock_name else str(r.stock_code)
+                for r in all_held_df.itertuples()
+            ]
+            with colG2:
+                global_pick = st.selectbox(
+                    "選擇股票(可直接輸入代碼或名稱搜尋)",
+                    options=global_stock_options, key="global_query_stock_pick",
+                )
+            global_code = global_pick.split(" ")[0]
+
+            latest_df = cached_stock_latest_holdings(etf_conn, etf_db_mtime, global_code, global_scope_codes)
+            history_df = cached_holding_changes(
+                etf_conn, etf_db_mtime, stock_code=global_code, etf_codes=global_scope_codes,
+            )
+
+            gm1, gm2 = st.columns(2)
+            gm1.metric("目前持有這檔股票的ETF數", f"{len(latest_df)} 檔")
+            gm2.metric("歷史異動紀錄筆數", f"{len(history_df)} 筆")
+
+            st.markdown("#### 📋 目前持有狀況(各ETF最新一次快照)")
+            if latest_df.empty:
+                st.caption(f"範圍內目前沒有任何ETF的最新快照持有 {global_pick} (可能已經被全部賣出，可以往下看歷史異動紀錄)。")
+            else:
+                latest_show = latest_df[["etf_code", "snapshot_date", "weight_text", "shares"]].copy()
+                latest_show["etf_code"] = latest_show["etf_code"].apply(etf_label)
+                latest_show["shares"] = shares_series_to_lots(latest_show["shares"])
+                latest_show = latest_show.rename(columns={
+                    "etf_code": "ETF", "snapshot_date": "快照日期",
+                    "weight_text": "權重", "shares": "張數",
+                })
+                st.dataframe(latest_show, use_container_width=True, hide_index=True)
+
+            st.markdown("#### 📋 歷史異動紀錄")
+            if history_df.empty:
+                st.caption(f"範圍內沒有查到 {global_pick} 的任何加碼/減碼歷史紀錄。")
+            else:
+                history_display_cols = [
+                    "change_date", "etf_code", "change_type", "direction",
+                    "weight_prev", "weight_curr", "weight_change",
+                    "shares_prev", "shares_curr", "shares_change",
+                ]
+                history_display_names = {
+                    "change_date": "異動日期", "etf_code": "ETF代碼",
+                    "change_type": "異動類型", "direction": "調整方向",
+                    "weight_prev": "權重(前次)", "weight_curr": "權重(本次)", "weight_change": "權重變化",
+                    "shares_prev": "張數(前次)", "shares_curr": "張數(本次)", "shares_change": "張數變化",
+                }
+                history_show = history_df[history_display_cols].copy()
+                for _col in ("shares_prev", "shares_curr", "shares_change"):
+                    history_show[_col] = shares_series_to_lots(history_show[_col])
+                history_show = history_show.rename(columns=history_display_names)
+                st.dataframe(history_show, use_container_width=True, hide_index=True)
+    else:
+        st.info("尚無資料可查詢。")
+
 st.divider()
 
 # --------------------------------------------------------------------------
 # Section E: 抓取狀態診斷
 # --------------------------------------------------------------------------
 with st.expander("🔧 抓取狀態診斷", expanded=False):
-    log_df = etf_db.get_latest_fetch_log(etf_conn, limit=60)
+    log_df = cached_latest_fetch_log(etf_conn, etf_db_mtime, limit=60)
     if log_df.empty:
         st.caption("尚無抓取紀錄。")
     else:
