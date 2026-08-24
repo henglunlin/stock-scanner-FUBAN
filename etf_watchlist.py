@@ -97,3 +97,49 @@ def load_active_etf_name_map(csv_path: str) -> dict:
                 continue
         result[code] = name
     return result
+
+
+def load_full_active_etf_list(csv_path: str):
+    """
+    2026-08-24新增：讀取 active_etf_list.csv「完整內容」(不像 load_active_etf_name_map
+    那樣篩選掉啟用=0的列)，供頁面「⚙️ ETF抓取範圍管理」UI使用——那裡需要讓使用者
+    看到全部32檔、勾選/取消勾選每一檔的啟用狀態，跟 load_active_etf_name_map()
+    只回傳「已經啟用」的用途不同。
+
+    回傳一個 pandas.DataFrame，欄位：股票代號、ETF名稱、啟用(int，0或1)，
+    保留CSV原本的列順序。檔案不存在時回傳空的DataFrame(欄位仍然存在，避免呼叫端要
+    額外判斷None)。
+    """
+    import pandas as pd
+
+    if not os.path.exists(csv_path):
+        return pd.DataFrame(columns=["股票代號", "ETF名稱", "啟用"])
+    df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    if "啟用" not in df.columns:
+        df["啟用"] = "1"
+    df["股票代號"] = df["股票代號"].astype(str).str.strip()
+    df["ETF名稱"] = df["ETF名稱"].astype(str).str.strip()
+    df["啟用"] = df["啟用"].apply(
+        lambda v: 1 if str(v).strip() in ("1", "1.0", "True", "true", "是") else 0
+    )
+    return df[["股票代號", "ETF名稱", "啟用"]]
+
+
+def save_full_active_etf_list(csv_path: str, updated_df) -> None:
+    """
+    2026-08-24新增：把「⚙️ ETF抓取範圍管理」UI裡使用者勾選/取消勾選後的啟用狀態，
+    寫回 active_etf_list.csv(整份覆寫，保留傳入DataFrame的列順序，通常就是
+    load_full_active_etf_list() 讀回來、只改了「啟用」欄位值的那份)。
+
+    ⚠️ 這個函式只負責寫「本次網頁執行環境」的本機檔案——Streamlit Cloud的檔案系統
+    是暫時性的(重新部署/長時間無人使用後container會被回收)，而且更重要的是
+    GitHub Actions排程是完全獨立的執行環境，每次執行都是重新從repo clone/pull，
+    不會讀到這個container本機寫入的檔案。呼叫端(頁面)存完之後，一定要同時呼叫
+    upload_file_to_github() 把這個檔案實際推回GitHub repo，排程才會真的套用
+    這次的啟用/停用設定，這個函式本身不處理推送GitHub的部分。
+    """
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    out_df = updated_df[["股票代號", "ETF名稱", "啟用"]].copy()
+    out_df["啟用"] = out_df["啟用"].astype(int)
+    out_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
