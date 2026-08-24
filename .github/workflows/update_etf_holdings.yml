@@ -49,9 +49,10 @@ jobs:
 
       - name: Commit and push etf_holdings.db changes
         run: |
+          # 2026-08-24：etf_holdings.db 改放到 ETF_data/ 資料夾(不再放repo根目錄)。
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add etf_holdings.db
+          git add ETF_data/etf_holdings.db
           git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update etf_holdings.db" && git push)
 
       - name: Upload run log as artifact (供除錯用)
