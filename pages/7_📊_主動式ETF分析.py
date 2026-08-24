@@ -463,13 +463,94 @@ if not available_dates:
     )
 
 # --------------------------------------------------------------------------
+# Section A0: ETF抓取範圍管理 (2026-08-24新增)
+# --------------------------------------------------------------------------
+# ⚠️ 這裡管理的是 ETF_data/active_etf_list.csv 的「啟用」欄位，跟下面
+# Section A的「追蹤清單」是兩個不同的概念：
+#   - 「啟用」(這裡)：同時決定(1)這個頁面所有分頁/下拉選單能選到哪些ETF
+#     (all_active_codes)，(2) GitHub Actions每日排程實際會抓哪些ETF
+#     (fetch_etf_holdings.py的load_active_etf_list()讀同一個「啟用」欄位)。
+#     一開始只有6檔已用真實資料驗證過的純台股ETF是啟用的，其餘26檔先當「目錄」保留。
+#   - 「追蹤」(下面Section A)：從「已啟用」的ETF裡，再挑一個子集合當「分析預設focus」，
+#     只影響頁面顯示/篩選，不影響抓取範圍。
+GITHUB_ACTIVE_ETF_CSV_PATH = os.path.relpath(ACTIVE_ETF_CSV, _REPO_ROOT_DIR).replace(os.sep, "/")
+GITHUB_WATCHLIST_CONFIG_PATH = os.path.relpath(WATCHLIST_CONFIG_PATH, _REPO_ROOT_DIR).replace(os.sep, "/")
+
+with st.expander("⚙️ ETF抓取範圍管理(啟用/停用主動式ETF)", expanded=False):
+    st.caption(
+        "這裡的「啟用」狀態就是 ETF_data/active_etf_list.csv 的「啟用」欄位，"
+        "同時控制(1)這個頁面所有分頁能選到哪些ETF、(2)GitHub Actions每日排程實際會抓哪些ETF。"
+    )
+    st.warning(
+        "⚠️ GitHub Actions排程是完全獨立的執行環境，每次執行都是重新從repo抓最新版本的檔案，"
+        "不會讀到這個網頁自己儲存在本機的檔案。**只按「💾 儲存」而沒有勾選「同時提交到GitHub」，"
+        "這次的啟用/停用設定不會影響排程，而且下次網頁重新啟動(重新部署/長時間沒人用)就會消失**——"
+        "要讓改動真的生效，請務必勾選「同時提交到GitHub」一起送出。"
+    )
+    st.caption(
+        "⚠️ 目前只有6檔(00403A/00980A/00981A/00982A/00985A/00991A)是已經用真實資料驗證過、"
+        "確定純台股持股、抓取邏輯正確的。其餘ETF裡，名稱含「美國」「全球」「ARK」等字樣的，"
+        "很可能持有非台股資產，目前簡化版的抓取/欄位解析邏輯還沒針對這類ETF驗證過——"
+        "啟用後建議先手動觸發一次側邊欄「🛰️ 觸發背景排程抓取」，到下面「🔧 抓取狀態診斷」"
+        "確認這檔的抓取狀態是「success」，再放心長期使用。"
+    )
+
+    full_etf_df = etf_watchlist.load_full_active_etf_list(ACTIVE_ETF_CSV)
+    if full_etf_df.empty:
+        st.warning(f"讀不到 {ACTIVE_ETF_CSV}，無法管理啟用範圍。")
+    else:
+        new_enabled = {}
+        n_cols0 = 3
+        cols0 = st.columns(n_cols0)
+        for i, row in enumerate(full_etf_df.itertuples()):
+            with cols0[i % n_cols0]:
+                checked0 = st.checkbox(
+                    f"{row.股票代號} {row.ETF名稱}",
+                    value=bool(row.啟用),
+                    key=f"enable_chk_{row.股票代號}",
+                )
+                new_enabled[row.股票代號] = 1 if checked0 else 0
+
+        also_push_github_enable = st.checkbox(
+            "同時提交到 GitHub (強烈建議勾選，否則排程不會套用這次改動)",
+            value=True,
+            key="enable_list_push_github",
+        )
+
+        if st.button("💾 儲存啟用範圍", key="save_enable_list_btn"):
+            updated_etf_df = full_etf_df.copy()
+            updated_etf_df["啟用"] = updated_etf_df["股票代號"].map(new_enabled)
+            etf_watchlist.save_full_active_etf_list(ACTIVE_ETF_CSV, updated_etf_df)
+            n_enabled_now = int(updated_etf_df["啟用"].sum())
+            st.success(f"已儲存，目前啟用 {n_enabled_now} 檔ETF。")
+
+            if also_push_github_enable:
+                with open(ACTIVE_ETF_CSV, "rb") as f:
+                    file_bytes = f.read()
+                ok = upload_file_to_github(
+                    file_bytes, GITHUB_ACTIVE_ETF_CSV_PATH,
+                    "Update active_etf_list.csv 啟用範圍 via 主動式ETF分析頁面",
+                )
+                if ok:
+                    st.success("已提交到 GitHub，下次排程會套用這次的啟用/停用設定。")
+                else:
+                    st.warning(
+                        "提交到 GitHub 失敗，請確認 Secrets 中的 GITHUB_TOKEN 設定——"
+                        "這次改動暫時只存在本次網頁環境裡，排程還不會套用。"
+                    )
+            else:
+                st.warning("⚠️ 沒有勾選「同時提交到GitHub」，這次的啟用/停用設定不會影響排程，且下次網頁重新啟動就會消失。")
+            st.rerun()
+
+# --------------------------------------------------------------------------
 # Section A: 追蹤ETF清單編輯
 # --------------------------------------------------------------------------
 with st.expander("🎯 追蹤ETF清單編輯", expanded=not available_dates):
     st.caption(
-        "勾選你想「重點關注/分析」的主動式ETF(下面的分析區塊預設只看這裡勾選的清單，"
-        "但每日抓取一律會抓全部主動式ETF，不受這裡影響，所以之後想擴大追蹤範圍，"
-        "歷史資料本來就已經在資料庫裡了)。"
+        "勾選你想「重點關注/分析」的主動式ETF(下面的分析區塊預設只看這裡勾選的清單)。"
+        "⚠️ 這裡只影響頁面顯示的預設範圍，每日排程實際抓取哪些ETF是由上面"
+        "「⚙️ ETF抓取範圍管理」的「啟用」狀態決定，不是這裡——"
+        "之後想擴大追蹤範圍，只要該ETF已經啟用，歷史資料本來就已經在資料庫裡了。"
     )
 
     checked_codes = []
@@ -502,8 +583,13 @@ with st.expander("🎯 追蹤ETF清單編輯", expanded=not available_dates):
         if also_push_github:
             with open(WATCHLIST_CONFIG_PATH, "rb") as f:
                 file_bytes = f.read()
+            # ⚠️ 2026-08-24修正：這裡先前傳的github_path是"etf_watchlist_config.json"
+            # (repo根目錄)，但本機實際檔案早在v9就搬到"ETF_data/etf_watchlist_config.json"了，
+            # 兩者不一致會導致「提交到GitHub」把檔案寫到repo根目錄的錯誤位置，跟本機讀取的
+            # 路徑對不起來，等於這個功能實際上沒有真的生效。改用GITHUB_WATCHLIST_CONFIG_PATH
+            # (從WATCHLIST_CONFIG_PATH動態算出跟repo根目錄的相對路徑)確保兩邊路徑一致。
             ok = upload_file_to_github(
-                file_bytes, "etf_watchlist_config.json",
+                file_bytes, GITHUB_WATCHLIST_CONFIG_PATH,
                 f"Update etf_watchlist_config.json via 主動式ETF分析頁面",
             )
             if ok:
