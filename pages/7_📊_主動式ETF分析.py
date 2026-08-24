@@ -59,7 +59,6 @@ MARK_COLOR_SELL = "#1e8449"
 # GitHub 上傳工具 (沿用其他頁面既有的做法)
 # --------------------------------------------------------------------------
 def github_repo_config():
-<<<<<<< HEAD
     # ⚠️ 2026-08-24發現(用AppTest測新按鈕時意外測出來的)：如果這個環境完全沒有
     # 任何 secrets.toml(不是「GITHUB_TOKEN這個key不存在」，是「整個secrets機制
     # 都沒設定過」)，st.secrets.get(...) 會直接丟 StreamlitSecretNotFoundError、
@@ -75,14 +74,6 @@ def github_repo_config():
         }
     except Exception:
         return {"token": "", "owner": "henglunlin", "repo": "stock-scanner-FUBAN", "branch": "main"}
-=======
-    return {
-        "token": st.secrets.get("GITHUB_TOKEN", ""),
-        "owner": st.secrets.get("GITHUB_OWNER", "henglunlin"),
-        "repo": st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN"),
-        "branch": st.secrets.get("GITHUB_BRANCH", "main"),
-    }
->>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
 
 
 def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: str) -> bool:
@@ -116,7 +107,6 @@ def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: s
         return False
 
 
-<<<<<<< HEAD
 def trigger_etf_update_workflow(workflow_file: str = "update_etf_holdings.yml") -> tuple[bool, str]:
     """
     觸發 GitHub Actions 的 workflow_dispatch，讓抓取實際跑在 Actions 的
@@ -151,8 +141,6 @@ def trigger_etf_update_workflow(workflow_file: str = "update_etf_holdings.yml") 
         return False, f"送出失敗：{type(e).__name__}: {e}"
 
 
-=======
->>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
 # --------------------------------------------------------------------------
 # 資料庫連線 (分開快取，避免同一個 cache key 混用兩個不同的db)
 # --------------------------------------------------------------------------
@@ -211,11 +199,7 @@ with st.sidebar:
 
     manual_fetch_scope = st.radio(
         "抓取範圍",
-<<<<<<< HEAD
         ["只抓目前選擇的ETF", "只抓追蹤清單", f"全部{len(all_active_codes)}檔主動式ETF"],
-=======
-        ["只抓目前選擇的ETF", "只抓追蹤清單", "全部32檔主動式ETF"],
->>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
         key="manual_fetch_scope",
     )
 
@@ -277,7 +261,6 @@ with st.sidebar:
                         )
                     st.rerun()
 
-<<<<<<< HEAD
     st.divider()
     st.caption(
         "或者不想佔著這個分頁等、想丟給背景排程處理："
@@ -293,8 +276,6 @@ with st.sidebar:
         else:
             st.error(f"❌ {msg}")
 
-=======
->>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
 
 st.title("📊 主動式ETF分析")
 st.caption(
