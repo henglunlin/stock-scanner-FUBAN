@@ -2,7 +2,7 @@
 refresh_active_etf_list.py
 ============================
 維護工具：當 TWSE 有新的主動式ETF上市時，用這支腳本重新產生
-Database/active_etf_list.csv，不用手動編輯。
+ETF_data/active_etf_list.csv，不用手動編輯。
 
 使用方式：
   1. 到證交所/公開資訊網下載最新的「上市ETF總覽」CSV
@@ -13,7 +13,7 @@ Database/active_etf_list.csv，不用手動編輯。
 已用實際TWSE清單驗證過：所有代碼結尾為字母且名稱含「主動」的ETF，
 跟「代碼結尾字母但不含主動」的槓桿/反向/債券ETF可以用名稱關鍵字正確區分)。
 
-⚠️ 2026-08-24新增「啟用」欄位保留邏輯：現有的 Database/active_etf_list.csv 裡
+⚠️ 2026-08-24新增「啟用」欄位保留邏輯：現有的 ETF_data/active_etf_list.csv 裡
 每一列多了一個「啟用」欄位(1=實際會被抓取、0=清單裡列著但先不抓，見
 fetch_etf_holdings.py/etf_watchlist.py的說明)。這支工具改成「合併更新」而不是
 整個覆蓋：既有代碼保留原本的「啟用」值不變；新出現的代碼(TWSE新上市的主動式ETF)
@@ -24,7 +24,7 @@ import os
 import sys
 import pandas as pd
 
-OUTPUT_PATH = "Database/active_etf_list.csv"
+OUTPUT_PATH = "ETF_data/active_etf_list.csv"
 
 
 def main():
@@ -77,6 +77,7 @@ def main():
 
     new_codes = [c for c in active["股票代號"] if str(c).strip() not in existing_enabled]
 
+    os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
     active.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
     print(f"已更新 {OUTPUT_PATH}，共 {len(active)} 檔主動式ETF：")
     print(active.to_string(index=False))

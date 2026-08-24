@@ -6,7 +6,10 @@ etf_watchlist.py
 設計成獨立小檔案(不是直接寫在頁面裡)，方便之後其他頁面(例如未來要在
 Stock simulator 疊加ETF標記時)也能重複使用同一份設定，不用複製貼上邏輯。
 
-設定檔格式 (etf_watchlist_config.json):
+設定檔位置：ETF_data/etf_watchlist_config.json (2026-08-24起跟 active_etf_list.csv /
+etf_holdings.db 一起集中放在 ETF_data/ 資料夾，不再放repo根目錄)。
+
+設定檔格式：
 {
     "tracked_etfs": ["00981A", "00991A", "00980A", "00982A", "00403A", "00985A"],
     "common_change_min_etf_count": 2,
@@ -15,7 +18,7 @@ Stock simulator 疊加ETF標記時)也能重複使用同一份設定，不用複
 
 - tracked_etfs: 使用者在網頁上勾選、目前想「重點關注/分析」的ETF代碼清單。
   ⚠️ 這份清單只影響「網頁上分析時預設focus哪些ETF」，
-     不影響每日抓取範圍——抓取一律抓 Database/active_etf_list.csv 裡全部主動式ETF
+     不影響每日抓取範圍——抓取一律抓 ETF_data/active_etf_list.csv 裡全部主動式ETF
      (見 fetch_etf_holdings.py)，這樣之後調整追蹤清單不會漏掉歷史資料。
 - common_change_min_etf_count: 「多檔ETF同日共同買賣」門檻的使用者上次設定值，
   網頁上用滑桿調整時順便記住，下次打開網頁不用重設。
@@ -69,7 +72,7 @@ def save_watchlist_config(config_path: str, tracked_etfs: list, common_change_mi
 
 def load_active_etf_name_map(csv_path: str) -> dict:
     """
-    讀取 Database/active_etf_list.csv，回傳 {代號: 名稱} 對照表，供頁面checkbox顯示用。
+    讀取 ETF_data/active_etf_list.csv，回傳 {代號: 名稱} 對照表，供頁面checkbox顯示用。
 
     ⚠️ 2026-08-24：只回傳「啟用」欄位為1的ETF(目前先只穩定6檔純台股ETF)，
     避免頁面下拉選單/「全部XX檔」選項列出還沒有實際資料的ETF、造成使用者選了

@@ -8,11 +8,16 @@ fetch_etf_holdings.py
      因為這支腳本要跑在 GitHub Actions (ubuntu-latest)，機器上沒有 Edge，
      且原本 launch_edge_browser() 設計就是給「使用者自己的電腦(Windows)」用的。
   2. 追蹤的ETF清單從程式碼裡寫死的 ETFS dict，改成動態讀取
-     Database/active_etf_list.csv（欄位：股票代號, ETF名稱），
+     ETF_data/active_etf_list.csv（欄位：股票代號, ETF名稱），
      並用固定URL規則 https://www.etfinfo.tw/etf/{代號}/holdings 組出網址。
      這樣之後 TWSE 有新的主動式ETF上市，只要更新這份CSV，不用改程式碼。
-  3. 所有輸出從「逐日 xlsx 檔案」改成寫入 etf_holdings.db（見 etf_db.py），
+  3. 所有輸出從「逐日 xlsx 檔案」改成寫入 ETF_data/etf_holdings.db（見 etf_db.py），
      方便之後查歷史、跟K線整合查詢。
+     ⚠️ 2026-08-24：ETF相關資料檔案(active_etf_list.csv / etf_holdings.db /
+     etf_watchlist_config.json)這次統一集中放到獨立的 ETF_data/ 資料夾，
+     不再借用scanner既有的 Database/ 資料夾——避免跟掃描器本來就在用的
+     Database/ 內容混在一起，這個功能自己的資料要新增/搬移/清空都不會影響到
+     掃描器其他部分。
   4. 「找前一天持股檔案」從掃資料夾檔名，改成查資料庫裡「該ETF在今天之前
      最近一次的快照日期」(etf_db.get_previous_snapshot_date)。
   5. 「共同每日異動」的門檻(min_etf_count)不在這裡寫死判斷輸出檔——
@@ -47,8 +52,12 @@ import etf_db
 # =========================
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-ACTIVE_ETF_LIST_CSV = os.path.join(REPO_ROOT, "Database", "active_etf_list.csv")
-DB_PATH = os.path.join(REPO_ROOT, "etf_holdings.db")
+# ⚠️ 2026-08-24：改用獨立的 ETF_data/ 資料夾，不再放在scanner共用的 Database/ 資料夾
+# 或repo根目錄，讓這個功能的資料檔案(清單CSV/db/追蹤清單設定)集中在同一個地方。
+ETF_DATA_DIR = os.path.join(REPO_ROOT, "ETF_data")
+os.makedirs(ETF_DATA_DIR, exist_ok=True)
+ACTIVE_ETF_LIST_CSV = os.path.join(ETF_DATA_DIR, "active_etf_list.csv")
+DB_PATH = os.path.join(ETF_DATA_DIR, "etf_holdings.db")
 
 OUTPUT_LOG_DIR = "etf_holdings_log"
 TIMEZONE = "Asia/Taipei"
@@ -116,7 +125,7 @@ def send_telegram_message(text: str):
 # =========================
 def load_active_etf_list(csv_path: str = ACTIVE_ETF_LIST_CSV) -> dict:
     """
-    讀取 Database/active_etf_list.csv，回傳 {代號: {"name": 名稱, "url": 持股頁面網址}}。
+    讀取 ETF_data/active_etf_list.csv，回傳 {代號: {"name": 名稱, "url": 持股頁面網址}}。
     CSV 欄位需含「股票代號」「ETF名稱」(UTF-8 編碼)。
 
     ⚠️ 2026-08-24新增「啟用」欄位：這次討論後決定先只穩定抓6檔已驗證過的純台股
@@ -128,7 +137,7 @@ def load_active_etf_list(csv_path: str = ACTIVE_ETF_LIST_CSV) -> dict:
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
             f"找不到主動式ETF清單檔案: {csv_path}\n"
-            "請確認 Database/active_etf_list.csv 已存在於 repo 內。"
+            "請確認 ETF_data/active_etf_list.csv 已存在於 repo 內。"
         )
     df = pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
     df.columns = [c.strip() for c in df.columns]
