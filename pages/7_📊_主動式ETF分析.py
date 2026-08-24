@@ -5,12 +5,15 @@ pages/7_📊_主動式ETF分析.py
 主動式ETF持股/買賣分析頁面。
 
 資料來源：
-  - etf_holdings.db (由 fetch_etf_holdings.py 經 GitHub Actions 每日排程寫入)
+  - ETF_data/etf_holdings.db (由 fetch_etf_holdings.py 經 GitHub Actions 每日排程寫入)
       etf_holdings         每日持股快照
       etf_holding_changes   每日持股異動 (加碼/減碼/新納入/全數賣出)
   - twse_ohlcv.db (掃描器既有的個股OHLCV資料庫，這裡只讀取，不寫入)
-  - Database/active_etf_list.csv  全部主動式ETF代號/名稱對照
-  - etf_watchlist_config.json     使用者勾選「重點關注」的ETF清單(可編輯)
+  - ETF_data/active_etf_list.csv  全部主動式ETF代號/名稱對照
+  - ETF_data/etf_watchlist_config.json  使用者勾選「重點關注」的ETF清單(可編輯)
+
+⚠️ 2026-08-24：ETF相關資料檔案這次統一集中放到獨立的 ETF_data/ 資料夾(跟scanner
+   既有、用途不同的 Database/ 資料夾分開)，不再放在repo根目錄或Database/裡。
 
 功能：
   1. 追蹤ETF清單編輯 (勾選 + 存檔，可選擇同時提交到 GitHub)
@@ -45,9 +48,13 @@ _REPO_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT_DIR = os.path.dirname(_REPO_ROOT_DIR)  # pages/ 的上一層 = repo 根目錄
 
 TWSE_DB_PATH = os.path.join(_REPO_ROOT_DIR, "twse_ohlcv.db")
-ETF_DB_PATH = os.path.join(_REPO_ROOT_DIR, "etf_holdings.db")
-ACTIVE_ETF_CSV = os.path.join(_REPO_ROOT_DIR, "Database", "active_etf_list.csv")
-WATCHLIST_CONFIG_PATH = os.path.join(_REPO_ROOT_DIR, "etf_watchlist_config.json")
+# ⚠️ 2026-08-24：ETF相關資料檔案改集中放到獨立的 ETF_data/ 資料夾，不再放在
+# repo根目錄或跟scanner共用的 Database/ 資料夾(避免混在一起)。
+_ETF_DATA_DIR = os.path.join(_REPO_ROOT_DIR, "ETF_data")
+os.makedirs(_ETF_DATA_DIR, exist_ok=True)
+ETF_DB_PATH = os.path.join(_ETF_DATA_DIR, "etf_holdings.db")
+ACTIVE_ETF_CSV = os.path.join(_ETF_DATA_DIR, "active_etf_list.csv")
+WATCHLIST_CONFIG_PATH = os.path.join(_ETF_DATA_DIR, "etf_watchlist_config.json")
 
 TW_TZ = ZoneInfo("Asia/Taipei")
 
@@ -286,7 +293,7 @@ st.caption(
 if not all_active_codes:
     st.error(
         f"找不到主動式ETF清單: {ACTIVE_ETF_CSV}\n\n"
-        "請確認 Database/active_etf_list.csv 已存在於 repo 內(欄位需含「股票代號」「ETF名稱」)。"
+        "請確認 ETF_data/active_etf_list.csv 已存在於 repo 內(欄位需含「股票代號」「ETF名稱」)。"
     )
     st.stop()
 
