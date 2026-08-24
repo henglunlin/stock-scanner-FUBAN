@@ -323,6 +323,15 @@ def etf_label(code: str) -> str:
     return f"{code} {name}" if name else code
 
 
+# 2026-08-24新增：台股慣例用「張」(1張=1000股)顯示持股/異動股數比「股」直覺，
+# 這裡統一用同一個函式把資料庫存的原始股數欄位轉成張數，四個顯示股數的地方
+# (1️⃣異動明細、1️⃣成分股比例、3️⃣買賣紀錄明細、4️⃣區間異動查詢)都共用，
+# 避免各處分別寫、算法不一致。無條件捨去到整數張(股票交易本來就是以張為單位，
+# 剩不滿一張的零股在這幾張表裡不特別處理，直接四捨五入)。
+def shares_series_to_lots(series: pd.Series) -> pd.Series:
+    return (series / 1000).round(0)
+
+
 # --------------------------------------------------------------------------
 # 側邊欄：觸發背景排程抓取 (GitHub Actions)
 # --------------------------------------------------------------------------
@@ -480,10 +489,13 @@ with tab1:
                 display_names = {
                     "stock_code": "股票代碼", "stock_name": "股票名稱", "change_type": "異動類型",
                     "direction": "調整方向", "weight_prev": "權重(昨日)", "weight_curr": "權重(今日)",
-                    "weight_change": "權重變化", "shares_prev": "股數(昨日)", "shares_curr": "股數(今日)",
-                    "shares_change": "股數變化", "compare_base_date": "比較基準日期",
+                    "weight_change": "權重變化", "shares_prev": "張數(昨日)", "shares_curr": "張數(今日)",
+                    "shares_change": "張數變化", "compare_base_date": "比較基準日期",
                 }
-                show_df = changes[display_cols].rename(columns=display_names)
+                show_df = changes[display_cols].copy()
+                for _col in ("shares_prev", "shares_curr", "shares_change"):
+                    show_df[_col] = shares_series_to_lots(show_df[_col])
+                show_df = show_df.rename(columns=display_names)
                 st.dataframe(show_df, use_container_width=True, hide_index=True)
 
             # 2026-08-24新增：除了「異動」明細，也讓使用者能直接看到這檔ETF在
@@ -520,13 +532,16 @@ with tab1:
                     )
                     st.plotly_chart(bar_fig, use_container_width=True)
 
-                holdings_display_cols = ["stock_code", "stock_name", "weight_text", "shares_text"]
+                # 2026-08-24調整：改用數值欄位「shares」(不是抓取來的原始文字「shares_text」)
+                # 換算成張數(shares_series_to_lots，÷1000)，台股慣例用張比用股直覺。
+                holdings_table = holdings_snapshot[["stock_code", "stock_name", "weight_text", "shares"]].copy()
+                holdings_table["shares"] = shares_series_to_lots(holdings_table["shares"])
                 holdings_display_names = {
                     "stock_code": "股票代碼", "stock_name": "股票名稱",
-                    "weight_text": "權重", "shares_text": "股數",
+                    "weight_text": "權重", "shares": "張數",
                 }
                 st.dataframe(
-                    holdings_snapshot[holdings_display_cols].rename(columns=holdings_display_names),
+                    holdings_table.rename(columns=holdings_display_names),
                     use_container_width=True, hide_index=True,
                 )
     else:
@@ -614,9 +629,9 @@ with tab3:
     if twse_conn is None:
         st.warning(f"找不到 twse_ohlcv.db ({TWSE_DB_PATH})，無法繪製K線圖。")
     else:
-        colD1, colD2, colD3 = st.columns([1, 1.2, 1])
+        colD1, colD2, colD3, colD4 = st.columns([1, 1.2, 1, 1])
 
-        # 這三個widget的「預設值」都是用 st.session_state.setdefault(widget自己的key, ...) 的方式，
+        # 這幾個widget的「預設值」都是用 st.session_state.setdefault(widget自己的key, ...) 的方式，
         # 只在該key第一次出現時塞入初始值；之後不管是使用者自己手動改選單、還是2️⃣的
         # 「✅ 查看K線圖」按鈕直接改寫這些key，widget都會照著session_state裡目前的值顯示——
         # 不能同時又傳 index=/value= 又寫session_state，Streamlit會發出警告(兩邊互相打架)。
@@ -629,11 +644,37 @@ with tab3:
                 key="etf_chart_etf_select",
             )
 
+        # 2026-08-24新增：先把「K線結束日期」目前的值讀出來(還沒畫出date_input也沒關係，
+        # 用setdefault確保session_state裡一定有值)，才能在下面決定股票下拉選單順序/
+        # 顏色標示的時候知道「目前是哪一天」，用來查這檔ETF在這一天對每檔股票的異動方向。
+        st.session_state.setdefault("etf_chart_end_date_input", datetime.now(TW_TZ).date())
+        _highlight_date = st.session_state["etf_chart_end_date_input"]
+        _highlight_date_str = pd.to_datetime(_highlight_date).strftime("%Y-%m-%d")
+
         held_stocks_df = etf_db.get_etf_held_stocks(etf_conn, chart_etf_code)
         stock_options = [
             f"{r.stock_code} {r.stock_name}" if r.stock_name else str(r.stock_code)
             for r in held_stocks_df.itertuples()
         ]
+
+        # 2026-08-24新增：查這檔ETF在「K線結束日期」當天對每檔股票的異動方向，
+        # 下拉選單裡有異動的股票前面加🟢(加碼/新納入)或🔴(減碼/全數賣出)圖示。
+        # 用format_func只影響「顯示文字」，selectbox實際回傳值還是原本的
+        # "代碼 名稱"字串，不影響下面 chart_code = chart_stock_choice.split(" ")[0] 的邏輯。
+        _same_day_changes = etf_db.get_holding_changes(
+            etf_conn, change_date=_highlight_date_str, etf_code=chart_etf_code
+        )
+        _direction_by_code = dict(zip(_same_day_changes["stock_code"], _same_day_changes["direction"])) \
+            if not _same_day_changes.empty else {}
+
+        def _stock_option_label(opt: str) -> str:
+            code = opt.split(" ")[0]
+            direction = _direction_by_code.get(code)
+            if direction in ("加碼", "新納入"):
+                return f"🟢 {opt}"
+            if direction in ("減碼", "全數賣出"):
+                return f"🔴 {opt}"
+            return opt
 
         with colD2:
             if stock_options:
@@ -643,20 +684,31 @@ with tab3:
                     st.session_state["etf_chart_stock_select"] = stock_options[0]
                 chart_stock_choice = st.selectbox(
                     "股票代碼", options=stock_options,
+                    format_func=_stock_option_label,
                     key="etf_chart_stock_select",
+                    help="🟢＝在「K線結束日期」當天加碼/新納入、🔴＝減碼/全數賣出，沒有圖示代表當天沒有異動。",
                 )
             else:
                 chart_stock_choice = None
                 st.selectbox("股票代碼", options=["(尚無持股資料)"], disabled=True, key="etf_chart_stock_select_disabled")
         with colD3:
-            st.session_state.setdefault("etf_chart_end_date_input", datetime.now(TW_TZ).date())
+            # 2026-08-24新增：改成可以自由選「開始日期」，不再固定寫死回溯120天，
+            # 預設值第一次還是抓120天前，之後使用者自己調整過就會照使用者選的範圍。
+            st.session_state.setdefault(
+                "etf_chart_start_date_input",
+                (pd.to_datetime(_highlight_date) - timedelta(days=120)).date(),
+            )
+            chart_start_date_val = st.date_input("K線開始日期", key="etf_chart_start_date_input")
+        with colD4:
             chart_end_date = st.date_input("K線結束日期", key="etf_chart_end_date_input")
 
         if not stock_options:
             st.info(f"{etf_label(chart_etf_code)} 在資料庫裡目前還沒有任何持股快照，無法選擇股票(可能排程還沒抓過這檔)。")
+        elif pd.to_datetime(chart_start_date_val) > pd.to_datetime(chart_end_date):
+            st.warning("K線開始日期比結束日期晚，請重新選擇。")
         else:
             chart_code = chart_stock_choice.split(" ")[0]
-            chart_start_date = (pd.to_datetime(chart_end_date) - timedelta(days=120)).strftime("%Y-%m-%d")
+            chart_start_date = pd.to_datetime(chart_start_date_val).strftime("%Y-%m-%d")
             chart_end_str = pd.to_datetime(chart_end_date).strftime("%Y-%m-%d")
 
             ohlcv_df = db_utils.get_stock_ohlcv(twse_conn, chart_code, chart_start_date, chart_end_str)
@@ -696,20 +748,28 @@ with tab3:
                             bearish_y.append(y)
                             bearish_text.append(label)
 
+                    # 2026-08-24調整：標記/文字都放大(原本三角形12px/文字9px在密集K棒裡太不明顯，
+                    # 使用者反應看不清楚)，並加白色描邊讓三角形跟K棒顏色接近時也能分辨出來。
                     if bullish_dates:
                         fig.add_trace(go.Scatter(
                             x=bullish_dates, y=bullish_y, mode="markers+text",
-                            marker=dict(symbol="triangle-up", size=12, color=MARK_COLOR_BUY),
+                            marker=dict(
+                                symbol="triangle-up", size=20, color=MARK_COLOR_BUY,
+                                line=dict(width=1.5, color="white"),
+                            ),
                             text=bullish_text, textposition="top center",
-                            textfont=dict(size=9, color=MARK_COLOR_BUY),
+                            textfont=dict(size=15, color=MARK_COLOR_BUY),
                             name=f"{chart_etf_code} 加碼/新納入",
                         ))
                     if bearish_dates:
                         fig.add_trace(go.Scatter(
                             x=bearish_dates, y=bearish_y, mode="markers+text",
-                            marker=dict(symbol="triangle-down", size=12, color=MARK_COLOR_SELL),
+                            marker=dict(
+                                symbol="triangle-down", size=20, color=MARK_COLOR_SELL,
+                                line=dict(width=1.5, color="white"),
+                            ),
                             text=bearish_text, textposition="bottom center",
-                            textfont=dict(size=9, color=MARK_COLOR_SELL),
+                            textfont=dict(size=15, color=MARK_COLOR_SELL),
                             name=f"{chart_etf_code} 減碼/全數賣出",
                         ))
                 else:
@@ -739,9 +799,12 @@ with tab3:
                     events_display_names = {
                         "change_date": "異動日期", "change_type": "異動類型", "direction": "調整方向",
                         "weight_prev": "權重(前次)", "weight_curr": "權重(本次)", "weight_change": "權重變化",
-                        "shares_prev": "股數(前次)", "shares_curr": "股數(本次)", "shares_change": "股數變化",
+                        "shares_prev": "張數(前次)", "shares_curr": "張數(本次)", "shares_change": "張數變化",
                     }
-                    events_show_df = events_df[events_display_cols].rename(columns=events_display_names)
+                    events_show_df = events_df[events_display_cols].copy()
+                    for _col in ("shares_prev", "shares_curr", "shares_change"):
+                        events_show_df[_col] = shares_series_to_lots(events_show_df[_col])
+                    events_show_df = events_show_df.rename(columns=events_display_names)
                     st.dataframe(events_show_df, use_container_width=True, hide_index=True)
 
 with tab4:
@@ -788,10 +851,14 @@ with tab4:
                     "change_date": "異動日期", "etf_code": "ETF代碼", "stock_code": "股票代碼", "stock_name": "股票名稱",
                     "change_type": "異動類型", "direction": "調整方向",
                     "weight_prev": "權重(前次)", "weight_curr": "權重(本次)", "weight_change": "權重變化",
-                    "shares_prev": "股數(前次)", "shares_curr": "股數(本次)", "shares_change": "股數變化",
+                    "shares_prev": "張數(前次)", "shares_curr": "張數(本次)", "shares_change": "張數變化",
                 }
+                range_show_df = range_df[range_display_cols].copy()
+                for _col in ("shares_prev", "shares_curr", "shares_change"):
+                    range_show_df[_col] = shares_series_to_lots(range_show_df[_col])
+                range_show_df = range_show_df.rename(columns=range_display_names)
                 st.dataframe(
-                    range_df[range_display_cols].rename(columns=range_display_names),
+                    range_show_df,
                     use_container_width=True, hide_index=True,
                 )
     else:
