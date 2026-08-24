@@ -485,6 +485,50 @@ with tab1:
                 }
                 show_df = changes[display_cols].rename(columns=display_names)
                 st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+            # 2026-08-24新增：除了「異動」明細，也讓使用者能直接看到這檔ETF在
+            # 選定日期「當下」的完整持股成分股比例(不是只看有變動的部分)，
+            # 資料來源沿用同一個 etf_holdings 快照表(etf_db.get_holdings_snapshot)，
+            # 跟畫面上方顯示的異動明細本來就是同一份資料庫、同一次抓取結果。
+            st.markdown("#### 📋 成分股比例")
+            holdings_snapshot = etf_db.get_holdings_snapshot(etf_conn, pick_etf, pick_date)
+            if holdings_snapshot.empty:
+                st.info(f"{pick_date} {etf_label(pick_etf)} 沒有持股快照資料。")
+            else:
+                st.caption(f"{pick_date} {etf_label(pick_etf)} 共持有 {len(holdings_snapshot)} 檔股票(依權重排序)。")
+
+                # dropna防呆：極少數情況下權重欄位可能是空值(例如來源網站當次沒有這個數字)，
+                # 畫長條圖前先排除，避免 plotly 因為 None 值報錯或畫出空白長條。
+                top_n = holdings_snapshot.dropna(subset=["weight"]).head(15).iloc[::-1]
+                if top_n.empty:
+                    st.caption("這批持股快照沒有權重數值，無法畫長條圖(下面表格仍可查看股數等其他欄位)。")
+                else:
+                    bar_fig = go.Figure(go.Bar(
+                        x=top_n["weight"],
+                        y=[f"{r.stock_code} {r.stock_name}" if r.stock_name else str(r.stock_code)
+                           for r in top_n.itertuples()],
+                        orientation="h",
+                        marker_color="#2c6fbb",
+                        text=top_n["weight_text"],
+                        textposition="outside",
+                    ))
+                    bar_fig.update_layout(
+                        title=f"前{len(top_n)}大持股權重",
+                        height=max(320, 28 * len(top_n)),
+                        xaxis_title="權重(%)",
+                        margin=dict(l=10, r=40, t=40, b=10),
+                    )
+                    st.plotly_chart(bar_fig, use_container_width=True)
+
+                holdings_display_cols = ["stock_code", "stock_name", "weight_text", "shares_text"]
+                holdings_display_names = {
+                    "stock_code": "股票代碼", "stock_name": "股票名稱",
+                    "weight_text": "權重", "shares_text": "股數",
+                }
+                st.dataframe(
+                    holdings_snapshot[holdings_display_cols].rename(columns=holdings_display_names),
+                    use_container_width=True, hide_index=True,
+                )
     else:
         st.info("尚無資料可顯示。")
 
@@ -679,6 +723,26 @@ with tab3:
                 )
                 fig.update_xaxes(type="category")
                 st.plotly_chart(fig, use_container_width=True)
+
+                # 2026-08-24新增：K線圖下方加上這檔ETF對這檔股票的完整買賣紀錄表，
+                # 直接沿用畫圖用的 events_df(跟圖上三角形標記是同一份資料，
+                # 不用另外查一次)，讓使用者不只看圖上的三角形，也能看到實際數字。
+                st.markdown("#### 📋 買賣紀錄明細")
+                if events_df.empty:
+                    st.caption(f"這檔股票在此期間沒有偵測到 {etf_label(chart_etf_code)} 的持股異動紀錄。")
+                else:
+                    events_display_cols = [
+                        "change_date", "change_type", "direction",
+                        "weight_prev", "weight_curr", "weight_change",
+                        "shares_prev", "shares_curr", "shares_change",
+                    ]
+                    events_display_names = {
+                        "change_date": "異動日期", "change_type": "異動類型", "direction": "調整方向",
+                        "weight_prev": "權重(前次)", "weight_curr": "權重(本次)", "weight_change": "權重變化",
+                        "shares_prev": "股數(前次)", "shares_curr": "股數(本次)", "shares_change": "股數變化",
+                    }
+                    events_show_df = events_df[events_display_cols].rename(columns=events_display_names)
+                    st.dataframe(events_show_df, use_container_width=True, hide_index=True)
 
 with tab4:
     st.caption(
