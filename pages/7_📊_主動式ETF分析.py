@@ -59,12 +59,30 @@ MARK_COLOR_SELL = "#1e8449"
 # GitHub 上傳工具 (沿用其他頁面既有的做法)
 # --------------------------------------------------------------------------
 def github_repo_config():
+<<<<<<< HEAD
+    # ⚠️ 2026-08-24發現(用AppTest測新按鈕時意外測出來的)：如果這個環境完全沒有
+    # 任何 secrets.toml(不是「GITHUB_TOKEN這個key不存在」，是「整個secrets機制
+    # 都沒設定過」)，st.secrets.get(...) 會直接丟 StreamlitSecretNotFoundError、
+    # 不會像一般dict.get()一樣安靜地回傳預設值，導致整頁crash。包一層try/except
+    # 讓「完全沒設定過secrets」這種情況也能優雅地回傳空字串(呼叫端本來就有在檢查
+    # token是否為空、會顯示對應的提示訊息，不會影響既有行為)。
+    try:
+        return {
+            "token": st.secrets.get("GITHUB_TOKEN", ""),
+            "owner": st.secrets.get("GITHUB_OWNER", "henglunlin"),
+            "repo": st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN"),
+            "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+        }
+    except Exception:
+        return {"token": "", "owner": "henglunlin", "repo": "stock-scanner-FUBAN", "branch": "main"}
+=======
     return {
         "token": st.secrets.get("GITHUB_TOKEN", ""),
         "owner": st.secrets.get("GITHUB_OWNER", "henglunlin"),
         "repo": st.secrets.get("GITHUB_REPO", "stock-scanner-FUBAN"),
         "branch": st.secrets.get("GITHUB_BRANCH", "main"),
     }
+>>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
 
 
 def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: str) -> bool:
@@ -98,6 +116,43 @@ def upload_file_to_github(file_bytes: bytes, github_path: str, commit_message: s
         return False
 
 
+<<<<<<< HEAD
+def trigger_etf_update_workflow(workflow_file: str = "update_etf_holdings.yml") -> tuple[bool, str]:
+    """
+    觸發 GitHub Actions 的 workflow_dispatch，讓抓取實際跑在 Actions 的
+    headless Chromium 環境裡(跟每日排程共用同一支workflow/同一套抓取程式碼)，
+    而不是在Streamlit Cloud這邊直接跑瀏覽器。
+
+    2026-08-24新增：跟側邊欄原本就有的「🚀 立即抓取」(App內直接跑Playwright，
+    適合單檔/追蹤清單快速測試)是兩條並存的路——這個按鈕比較適合「全部ETF」
+    這種比較花時間、想丟給背景排程去跑、不想佔著網頁分頁等的情境。
+    沿用跟「同步追蹤清單到GitHub」相同的 github_repo_config()/GITHUB_TOKEN 設定，
+    不用另外設定新的secret。
+
+    回傳 (成功與否, 訊息)。
+    """
+    cfg = github_repo_config()
+    token, owner, repo, branch = cfg["token"], cfg["owner"], cfg["repo"], cfg["branch"]
+    if not token or not owner or not repo:
+        return False, "尚未設定 GITHUB_TOKEN(在 Streamlit Secrets 裡)，無法觸發 GitHub Actions。"
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        res = requests.post(url, headers=headers, json={"ref": branch}, timeout=15)
+        if res.status_code == 204:
+            return True, "已送出，GitHub Actions 開始在背景執行(通常幾分鐘內會跑完，可以到repo的Actions頁面看即時進度)。"
+        return False, f"送出失敗：HTTP {res.status_code} {res.text[:200]}"
+    except Exception as e:
+        return False, f"送出失敗：{type(e).__name__}: {e}"
+
+
+=======
+>>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
 # --------------------------------------------------------------------------
 # 資料庫連線 (分開快取，避免同一個 cache key 混用兩個不同的db)
 # --------------------------------------------------------------------------
@@ -156,7 +211,11 @@ with st.sidebar:
 
     manual_fetch_scope = st.radio(
         "抓取範圍",
+<<<<<<< HEAD
+        ["只抓目前選擇的ETF", "只抓追蹤清單", f"全部{len(all_active_codes)}檔主動式ETF"],
+=======
         ["只抓目前選擇的ETF", "只抓追蹤清單", "全部32檔主動式ETF"],
+>>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
         key="manual_fetch_scope",
     )
 
@@ -218,6 +277,24 @@ with st.sidebar:
                         )
                     st.rerun()
 
+<<<<<<< HEAD
+    st.divider()
+    st.caption(
+        "或者不想佔著這個分頁等、想丟給背景排程處理："
+        "觸發跟每日排程共用的 GitHub Actions workflow，"
+        "在 Actions 的環境裡用headless Chromium跑完整套抓取(全部啟用中的ETF)，"
+        "跑完會自動commit回etf_holdings.db，之後回來這頁重新整理就看得到新資料。"
+    )
+    if st.button("🛰️ 觸發背景排程抓取 (GitHub Actions)", key="dispatch_gha_btn", use_container_width=True):
+        with st.spinner("正在呼叫 GitHub API 觸發 workflow..."):
+            ok, msg = trigger_etf_update_workflow()
+        if ok:
+            st.success(f"✅ {msg}")
+        else:
+            st.error(f"❌ {msg}")
+
+=======
+>>>>>>> f2e7a83e1c213a55ac0c20f11c862b06611b5c85
 
 st.title("📊 主動式ETF分析")
 st.caption(
