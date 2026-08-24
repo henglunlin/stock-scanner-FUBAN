@@ -114,12 +114,32 @@ def journal_github_config():
 
 
 def fetch_journal_bytes_from_github():
-    """從 GitHub repo 根目錄抓最新的 Trading Journal.xlsx 內容 (bytes)，抓不到回傳 None。"""
+    """從 GitHub repo 根目錄抓最新的 Trading Journal.xlsx 內容 (bytes)，抓不到回傳 None。
+
+    2026-08-24 修正：原本用 raw.githubusercontent.com 抓檔案，這個網址背後是 GitHub 的
+    Fastly CDN，同一個 URL 預設會被快取數分鐘——跟這支 app 有沒有用 st.cache 完全無關，
+    純粹是 GitHub 那一層快取，所以剛推上去的新版檔案，用同一個網址抓下來還是可能拿到
+    快取的舊版本，造成「要等一段時間才讀到新的」。改用 GitHub Contents API
+    (api.github.com，跟 upload_journal_to_github() 拿 sha 用的是同一組 API) 不會被同一層
+    CDN 快取；搭配 Accept: application/vnd.github.raw+json 直接回傳檔案原始 bytes
+    (不用自己解 base64)。若有設定 GITHUB_TOKEN 也一併帶上 Authorization，除了支援私有
+    repo，也能避免撞到未登入 API 呼叫每小時 60 次的限制。
+    """
     cfg = journal_github_config()
+    token, owner, repo, branch = cfg["token"], cfg["owner"], cfg["repo"], cfg["branch"]
+    if not owner or not repo:
+        return None
     encoded_path = urllib.parse.quote(JOURNAL_GITHUB_PATH, safe="/")
-    url = f"https://raw.githubusercontent.com/{cfg['owner']}/{cfg['repo']}/{cfg['branch']}/{encoded_path}"
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}"
+    headers = {
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Cache-Control": "no-cache",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, headers=headers, params={"ref": branch}, timeout=15)
         if resp.status_code == 200:
             return resp.content
     except Exception:
@@ -243,7 +263,39 @@ def save_journal_log(path: str, log_df: pd.DataFrame):
 
 @st.dialog("📝 交易紀錄編輯器 (Trading Journal)", width="large")
 def journal_editor_dialog():
-    st.caption(f"編輯目前讀取的檔案: {st.session_state.get('journal_path', DEFAULT_JOURNAL_PATH)}")
+    active_journal_path = st.session_state.get("journal_path", DEFAULT_JOURNAL_PATH)
+    cap_col, refresh_col = st.columns([5, 1])
+    cap_col.caption(f"編輯目前讀取的檔案: {active_journal_path}")
+    # 「清除快取」按鈕：只有目前讀取的是預設路徑 (對應 GitHub repo 的 Trading Journal.xlsx)
+    # 才有意義——側邊欄自行上傳的檔案本來就不會跟 GitHub 同步，沒有「快取」可清。
+    # 平常開啟編輯器時已經會自動抓一次 GitHub 最新版 (見下方側邊欄按鈕邏輯)，這顆按鈕是
+    # 讓使用者在編輯器「已經開著」的情況下，不用關掉重開，也能手動強制重新抓取最新內容，
+    # 例如剛在其他地方存檔、想立刻確認這裡有沒有同步到。
+    if active_journal_path == DEFAULT_JOURNAL_PATH:
+        if refresh_col.button(
+            "🔄 清除快取", use_container_width=True, key="journal_clear_cache_btn",
+            help="強制重新從 GitHub 抓取最新的 Trading Journal.xlsx，忽略任何快取",
+        ):
+            with st.spinner("正在清除快取並重新從 GitHub 抓取最新交易紀錄..."):
+                github_bytes = fetch_journal_bytes_from_github()
+            if github_bytes:
+                try:
+                    with open(DEFAULT_JOURNAL_PATH, "wb") as f:
+                        f.write(github_bytes)
+                    st.session_state.journal_log_df = load_journal_log(DEFAULT_JOURNAL_PATH)
+                    # st.data_editor 的編輯狀態是依 key ("journal_editor_widget") 快取的，
+                    # 光是換掉底層資料不會自動重置畫面上的內容，這裡明確清掉該 key，
+                    # 讓表格改用剛抓到的最新資料重繪，不會停留在原本(可能是舊的)畫面上。
+                    st.session_state.pop("journal_editor_widget", None)
+                    st.toast("已清除快取，成功抓取 GitHub 最新版本！", icon="✅")
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"⚠️ 抓到最新內容，但寫入本機失敗：{e}")
+            else:
+                st.warning(
+                    "⚠️ 清除快取失敗：無法從 GitHub 取得最新的 Trading Journal.xlsx"
+                    "（可能是網路問題，或 GITHUB_TOKEN／repo 設定有誤）。目前畫面仍是上次讀取的版本。"
+                )
 
     # 股票代碼→名稱對照表 (供「股票代碼」欄位可搜尋選單 + 自動帶入「股票名稱」欄位使用)
     code_to_name = dict(zip(stock_list_df["SecurityCode"], stock_list_df["SecurityName"])) if not stock_list_df.empty else {}
