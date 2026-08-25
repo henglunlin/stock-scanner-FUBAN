@@ -19,8 +19,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+from streamlit_echarts import st_echarts
+from pyecharts.charts import TreeMap
+from pyecharts import options as opts
 
 import common_fubon as cf
 import heatmap_utils
@@ -239,38 +241,107 @@ else:
 size_col = "MarketCap" if size_metric.startswith("市值") else "TradeValue"
 df_plot[size_col] = df_plot[size_col].clip(lower=1)  # treemap 面積不可為 0 或負值
 
+# --------------------------------------------------------------------------
+# 顏色計算：把 color_col 的值換算成 hex 色碼 (台股慣例：紅漲、綠跌、白色=持平)
+# 用「分位數」而不是最大/最小值當上下限 —— 少數離群值 (例如漲停/跌停個股) 才不會把
+# 其他正常漲跌 1~2% 的股票全部拉成幾乎無色的白色 (這是原本 Plotly 版本偏淡的主因)。
+# --------------------------------------------------------------------------
+def color_scale_cap(series: pd.Series) -> float:
+    cap = series.abs().quantile(0.9)
+    if pd.isna(cap) or cap <= 0:
+        cap = series.abs().max()
+    return max(float(cap), 1e-9)
+
+
+def pct_to_color(value: float, cap: float) -> str:
+    v = max(-cap, min(cap, value))
+    t = abs(v) / cap  # 0~1
+    if v >= 0:  # 紅
+        r = int(255 - t * (255 - 192))
+        g = int(255 - t * (255 - 57))
+        b = int(255 - t * (255 - 43))
+    else:  # 綠
+        r = int(255 - t * (255 - 30))
+        g = int(255 - t * (255 - 132))
+        b = int(255 - t * (255 - 73))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+color_cap = color_scale_cap(df_plot[color_col])
+df_plot["NodeColor"] = df_plot[color_col].apply(lambda v: pct_to_color(v, color_cap))
 df_plot["Label"] = df_plot.apply(
-    lambda r: f"{r['SecurityCode']} {r['SecurityName']}<br>{r['PctChange']:+.2f}%", axis=1
+    lambda r: f"{r['SecurityCode']} {r['SecurityName']}\n{r['PctChange']:+.2f}%", axis=1
 )
-df_plot["NodeId"] = df_plot["SecurityCode"] + "_" + df_plot["Group"]
 
 
 # --------------------------------------------------------------------------
-# 畫 Treemap（族群節點 + 個股節點合併在同一個 trace 裡）
-# 族群節點的顏色設為 None，讓 Plotly 自動用子節點平均值上色，不用自己手動平均。
+# 組成 ECharts Treemap 要的巢狀資料結構: [{name, children:[{name, value, itemStyle, label}]}]
 # --------------------------------------------------------------------------
-group_labels = list(group_map.keys())
-group_values = [df_plot.loc[df_plot["Group"] == g, size_col].sum() for g in group_labels]
+def build_tree_data(df: pd.DataFrame, group_map: dict) -> list:
+    tree = []
+    for group in group_map.keys():
+        sub = df[df["Group"] == group]
+        if sub.empty:
+            continue
+        children = [
+            {
+                "name": r["Label"],
+                "value": round(float(r[size_col]), 2),
+                "itemStyle": {"color": r["NodeColor"]},
+                "label": {
+                    "color": "#ffffff",
+                    "textBorderColor": "rgba(0,0,0,0.55)",
+                    "textBorderWidth": 2,
+                    "fontSize": 12,
+                },
+            }
+            for _, r in sub.iterrows()
+        ]
+        tree.append({"name": group, "children": children})
+    return tree
 
-max_abs = max(abs(df_plot[color_col].min()), abs(df_plot[color_col].max()), 1e-9)
 
-fig = go.Figure(go.Treemap(
-    labels=group_labels + df_plot["Label"].tolist(),
-    parents=[""] * len(group_labels) + df_plot["Group"].tolist(),
-    ids=group_labels + df_plot["NodeId"].tolist(),
-    values=group_values + df_plot[size_col].tolist(),
-    marker=dict(
-        colors=[None] * len(group_labels) + df_plot[color_col].tolist(),
-        colorscale=[[0, "#1e8449"], [0.5, "#f4f4f4"], [1, "#c0392b"]],  # 台股慣例：紅漲綠跌
-        cmin=-max_abs, cmax=max_abs, cmid=0,
-        colorbar=dict(title=color_label),
-    ),
-    textinfo="label",
-    root_color="lightgrey",
-))
-fig.update_layout(height=800, margin=dict(t=10, l=10, r=10, b=10))
+tree_data = build_tree_data(df_plot, group_map)
 
-st.plotly_chart(fig, use_container_width=True)
+treemap = (
+    TreeMap()
+    .add(
+        series_name="heatmap",
+        data=tree_data,
+        pos_top="0%", pos_bottom="0%", pos_left="0%", pos_right="0%",
+        width="100%", height="100%",
+        leaf_depth=2,
+        roam=False,
+        breadcrumb_opts=opts.TreeMapBreadcrumbOpts(is_show=False),
+        levels=[
+            opts.TreeMapLevelsOpts(),  # 根節點：不特別上色
+            opts.TreeMapLevelsOpts(  # 族群節點：淺灰底 + 左上角族群名稱標題列，模仿 TradingView 的分組標頭
+                treemap_itemstyle_opts=opts.TreeMapItemStyleOpts(
+                    border_color="#f0f0f0", border_width=4, gap_width=4, color="#e8e8e8",
+                ),
+                upper_label_opts=opts.LabelOpts(
+                    is_show=True, position="insideTopLeft", font_size=13, color="#333333",
+                ),
+            ),
+            opts.TreeMapLevelsOpts(  # 個股節點
+                treemap_itemstyle_opts=opts.TreeMapItemStyleOpts(border_color="#ffffff", border_width=1, gap_width=1),
+            ),
+        ],
+        tooltip_opts=opts.TooltipOpts(
+            formatter="{b}"
+        ),
+    )
+    .set_global_opts(
+        title_opts=opts.TitleOpts(title=""),
+    )
+)
+
+options = json.loads(treemap.dump_options())
+# 熱力圖底色固定用白色，不管 Streamlit 目前是深色還是淺色主題，
+# 這是 Image1 看起來灰暗的主因 —— 之前沒有明確指定背景色，跟著 App 深色主題走了。
+options["backgroundColor"] = "#ffffff"
+
+st_echarts(options=options, height="800px")
 
 with st.expander("查看原始資料表"):
     show_cols = ["Group", "SecurityCode", "SecurityName", "Close", "PctChange", "TradeValue", "MarketCap", "MoneyFlowProxy", "InstiNet"]
