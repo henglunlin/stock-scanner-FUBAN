@@ -49,3 +49,31 @@ def pct_change_today(df: pd.DataFrame) -> float:
     if pd.isna(prev_close) or prev_close == 0 or pd.isna(last_close):
         return 0.0
     return float((last_close - prev_close) / prev_close * 100)
+
+
+def format_twd(value, unit: str = "元") -> str:
+    """把金額格式化成「億/萬」單位的中文顯示字串，給熱力圖 tooltip 用，避免顯示一長串數字。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if pd.isna(v):
+        return "-"
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1e8:
+        return f"{sign}{v / 1e8:.2f}億{unit}"
+    if v >= 1e4:
+        return f"{sign}{v / 1e4:.1f}萬{unit}"
+    return f"{sign}{v:.0f}{unit}"
+
+
+def format_shares_as_lots(value) -> str:
+    """把股數格式化成「張」為單位（1張=1000股），給三大法人買賣超這類股數欄位的 tooltip 用。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if pd.isna(v):
+        return "-"
+    return f"{v / 1000:,.0f}張"

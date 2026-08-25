@@ -18,11 +18,19 @@ import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+<<<<<<< HEAD
+from streamlit_echarts import st_pyecharts
+from pyecharts.charts import TreeMap
+from pyecharts import options as opts
+from pyecharts.commons.utils import JsCode
+=======
 from streamlit_echarts import st_echarts
 from pyecharts.charts import TreeMap
 from pyecharts import options as opts
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
 
 import common_fubon as cf
 import heatmap_utils
@@ -33,6 +41,7 @@ st.title("🔥 台股熱力圖")
 DB_PATH = "twse_ohlcv.db"
 GROUPS_FILE = "stock_groups.json"
 LIVE_MODE_WARN_THRESHOLD = 300  # 即時模式下逐檔打 API，股票數太多時提醒改用收盤模式
+LABEL_MIN_AREA_FRACTION = 0.0012  # 格子面積佔整張熱力圖不到這個比例時，不顯示文字，只留顏色（改善2）
 
 cf.ensure_fubon_session_state()
 cf.render_fubon_login_sidebar()
@@ -96,6 +105,10 @@ with st.sidebar:
     )
     data_mode = st.radio("資料模式", ["收盤資料 (較快)", "盤中即時 (較慢)"], key="hm_data_mode")
     size_metric = st.radio("方塊大小", ["市值 (股本 × 股價)", "成交金額"], key="hm_size_metric")
+    min_group_size = st.slider(
+        "族群最少股票數（改善5）", min_value=1, max_value=10, value=3, key="hm_min_group_size",
+        help="族群裡股票數低於這個數字時，會被合併進「其他」分類，避免畫面被切成一堆看不清楚的碎格子。",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -121,6 +134,18 @@ all_codes = sorted({c for codes in group_map.values() for c in codes})
 
 if not all_codes:
     st.stop()
+
+# 改善5：股票數太少的族群合併成「其他」，避免畫面被切成一堆看不清楚的碎格子
+if group_map:
+    merged_group_map, leftover_codes = {}, []
+    for g, codes in group_map.items():
+        if len(codes) < min_group_size:
+            leftover_codes.extend(codes)
+        else:
+            merged_group_map[g] = codes
+    if leftover_codes:
+        merged_group_map["其他"] = sorted(set(leftover_codes))
+    group_map = merged_group_map
 
 if data_mode.startswith("盤中即時") and len(all_codes) > LIVE_MODE_WARN_THRESHOLD:
     st.warning(
@@ -191,10 +216,13 @@ for code in all_codes:
     meta = meta_map.get(code, {})
     shares = meta.get("SharesOutstanding") or 0.0
     market_cap = shares * last_close
+    full_name = meta.get("SecurityName") or code
+    short_name = meta.get("ShortName") or full_name
 
     rows.append({
         "SecurityCode": code,
-        "SecurityName": meta.get("SecurityName") or code,
+        "ShortName": short_name,
+        "FullName": full_name,
         "Close": last_close,
         "PctChange": pct,
         "TradeValue": trade_value,
@@ -241,10 +269,24 @@ else:
 size_col = "MarketCap" if size_metric.startswith("市值") else "TradeValue"
 df_plot[size_col] = df_plot[size_col].clip(lower=1)  # treemap 面積不可為 0 或負值
 
+<<<<<<< HEAD
+# 改善1：面積開根號壓縮 —— 台積電市值(~26兆)跟其他個股差了兩三個數量級，
+# 純線性大小會讓它一檔就佔掉快一半畫面，其他族群全部被壓成看不清楚的細條。
+# 開根號後，極端值跟中位數個股的「視覺面積差距」會被大幅壓縮，其他股票才有機會被看見。
+df_plot["AreaValue"] = np.sqrt(df_plot[size_col])
+
+# --------------------------------------------------------------------------
+# 顏色計算：把 color_col 的值換算成 hex 色碼 (台股慣例：紅漲、綠跌、白色=持平)
+# 上下限用「分位數」而不是最大/最小值 —— 少數離群值 (例如漲停/跌停個股) 才不會把
+# 其他正常漲跌 1~2% 的股票全部拉成幾乎無色的白色。
+# 改善4：t 再開根號一次 (非線性)，人眼對顏色深淺的感知本來就不是線性的，
+# 這樣中段漲跌幅 (例如 1~3%) 也會有明顯可辨識的顏色差異，不用等到接近漲跌停才看得出紅綠差別。
+=======
 # --------------------------------------------------------------------------
 # 顏色計算：把 color_col 的值換算成 hex 色碼 (台股慣例：紅漲、綠跌、白色=持平)
 # 用「分位數」而不是最大/最小值當上下限 —— 少數離群值 (例如漲停/跌停個股) 才不會把
 # 其他正常漲跌 1~2% 的股票全部拉成幾乎無色的白色 (這是原本 Plotly 版本偏淡的主因)。
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
 # --------------------------------------------------------------------------
 def color_scale_cap(series: pd.Series) -> float:
     cap = series.abs().quantile(0.9)
@@ -255,7 +297,11 @@ def color_scale_cap(series: pd.Series) -> float:
 
 def pct_to_color(value: float, cap: float) -> str:
     v = max(-cap, min(cap, value))
+<<<<<<< HEAD
+    t = (abs(v) / cap) ** 0.5  # 開根號讓中段差異也看得出來 (改善4)
+=======
     t = abs(v) / cap  # 0~1
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
     if v >= 0:  # 紅
         r = int(255 - t * (255 - 192))
         g = int(255 - t * (255 - 57))
@@ -269,6 +315,24 @@ def pct_to_color(value: float, cap: float) -> str:
 
 color_cap = color_scale_cap(df_plot[color_col])
 df_plot["NodeColor"] = df_plot[color_col].apply(lambda v: pct_to_color(v, color_cap))
+<<<<<<< HEAD
+
+# 改善2：格子標籤改用「公司簡稱」而不是「股份有限公司」全名，全名留給 tooltip 顯示
+df_plot["Label"] = df_plot.apply(
+    lambda r: f"{r['SecurityCode']} {r['ShortName']}\n{r['PctChange']:+.2f}%", axis=1
+)
+
+# 改善2（續）：格子面積佔整張圖不到 LABEL_MIN_AREA_FRACTION 的，不顯示文字，只留顏色，
+# 避免小格子文字擠在一起、被截斷看不清楚；完整資訊留給 tooltip (改善6) 補回來。
+total_area = df_plot["AreaValue"].sum()
+df_plot["ShowLabel"] = (df_plot["AreaValue"] / total_area) >= LABEL_MIN_AREA_FRACTION
+
+
+# --------------------------------------------------------------------------
+# 組成 ECharts Treemap 要的巢狀資料結構: [{name, children:[{name, value, itemStyle, label, ...}]}]
+# 每個葉節點額外帶上 code / fullName / close / pctChange / 金額顯示字串等欄位，
+# 專門給下面的 tooltip formatter 用 —— 這樣 tooltip 顯示的是完整資訊，不會跟著格子標籤一起被截斷 (改善6)。
+=======
 df_plot["Label"] = df_plot.apply(
     lambda r: f"{r['SecurityCode']} {r['SecurityName']}\n{r['PctChange']:+.2f}%", axis=1
 )
@@ -276,6 +340,7 @@ df_plot["Label"] = df_plot.apply(
 
 # --------------------------------------------------------------------------
 # 組成 ECharts Treemap 要的巢狀資料結構: [{name, children:[{name, value, itemStyle, label}]}]
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
 # --------------------------------------------------------------------------
 def build_tree_data(df: pd.DataFrame, group_map: dict) -> list:
     tree = []
@@ -283,28 +348,81 @@ def build_tree_data(df: pd.DataFrame, group_map: dict) -> list:
         sub = df[df["Group"] == group]
         if sub.empty:
             continue
+<<<<<<< HEAD
+        children = []
+        for _, r in sub.iterrows():
+            node = {
+                "name": r["Label"],
+                "value": round(float(r["AreaValue"]), 4),
+                "itemStyle": {"color": r["NodeColor"]},
+                "label": {
+                    "show": bool(r["ShowLabel"]),
+=======
         children = [
             {
                 "name": r["Label"],
                 "value": round(float(r[size_col]), 2),
                 "itemStyle": {"color": r["NodeColor"]},
                 "label": {
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
                     "color": "#ffffff",
                     "textBorderColor": "rgba(0,0,0,0.55)",
                     "textBorderWidth": 2,
                     "fontSize": 12,
                 },
+<<<<<<< HEAD
+                # tooltip 專用的完整資訊欄位
+                "code": r["SecurityCode"],
+                "fullName": r["FullName"],
+                "close": round(float(r["Close"]), 2),
+                "pctChange": round(float(r["PctChange"]), 2),
+                "marketCapDisplay": heatmap_utils.format_twd(r["MarketCap"]),
+                "tradeValueDisplay": heatmap_utils.format_twd(r["TradeValue"]),
+            }
+            if pd.notna(r["InstiNet"]):
+                node["instiNetDisplay"] = heatmap_utils.format_shares_as_lots(r["InstiNet"])
+            children.append(node)
+=======
             }
             for _, r in sub.iterrows()
         ]
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
         tree.append({"name": group, "children": children})
     return tree
 
 
 tree_data = build_tree_data(df_plot, group_map)
 
+<<<<<<< HEAD
+# 改善6：tooltip 用自訂 JS formatter，顯示不受格子大小限制的完整資訊
+# (代碼、全名、現價、漲跌幅、市值、成交金額，三大法人買賣超則視資料是否存在才顯示)
+tooltip_formatter = JsCode(
+    """
+    function (params) {
+        var d = params.data;
+        if (!d || d.code === undefined) { return params.name; }
+        var pct = d.pctChange >= 0 ? ('+' + d.pctChange) : d.pctChange;
+        var lines = [
+            d.code + ' ' + d.fullName,
+            '現價: ' + d.close,
+            '漲跌幅: ' + pct + '%',
+            '市值: ' + d.marketCapDisplay,
+            '成交金額: ' + d.tradeValueDisplay
+        ];
+        if (d.instiNetDisplay) {
+            lines.push('三大法人買賣超: ' + d.instiNetDisplay);
+        }
+        return lines.join('<br/>');
+    }
+    """
+)
+
+treemap = (
+    TreeMap(init_opts=opts.InitOpts(bg_color="#ffffff"))  # 改善3：固定白色背景，不受 App 深色主題影響
+=======
 treemap = (
     TreeMap()
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
     .add(
         series_name="heatmap",
         data=tree_data,
@@ -327,6 +445,17 @@ treemap = (
                 treemap_itemstyle_opts=opts.TreeMapItemStyleOpts(border_color="#ffffff", border_width=1, gap_width=1),
             ),
         ],
+<<<<<<< HEAD
+        tooltip_opts=opts.TooltipOpts(formatter=tooltip_formatter),
+    )
+    .set_global_opts(
+        title_opts=opts.TitleOpts(title=""),
+        legend_opts=opts.LegendOpts(is_show=False),  # 改善3：關掉左上角「heatmap」圖例
+    )
+)
+
+st_pyecharts(treemap, height="800px")
+=======
         tooltip_opts=opts.TooltipOpts(
             formatter="{b}"
         ),
@@ -342,9 +471,10 @@ options = json.loads(treemap.dump_options())
 options["backgroundColor"] = "#ffffff"
 
 st_echarts(options=options, height="800px")
+>>>>>>> 9736a0a13c62cd09bb80959933b52391ec1139fa
 
 with st.expander("查看原始資料表"):
-    show_cols = ["Group", "SecurityCode", "SecurityName", "Close", "PctChange", "TradeValue", "MarketCap", "MoneyFlowProxy", "InstiNet"]
+    show_cols = ["Group", "SecurityCode", "ShortName", "Close", "PctChange", "TradeValue", "MarketCap", "MoneyFlowProxy", "InstiNet"]
     st.dataframe(
         df_plot[show_cols].sort_values("PctChange", ascending=False),
         use_container_width=True, hide_index=True,

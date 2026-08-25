@@ -74,6 +74,7 @@ def fetch_mops_basic(market_label: str, url: str) -> pd.DataFrame:
     keep = {
         "公司代號": "SecurityCode",
         "公司名稱": "SecurityName",
+        "公司簡稱": "ShortName",
         "產業別": "IndustryCode",
         "普通股每股面額": "ParValueRaw",
         "實收資本額": "PaidInCapital",
@@ -87,6 +88,7 @@ def fetch_mops_basic(market_label: str, url: str) -> pd.DataFrame:
     out = df[list(keep.keys())].rename(columns=keep)
     out["SecurityCode"] = out["SecurityCode"].astype(str).str.strip()
     out["SecurityName"] = out["SecurityName"].astype(str).str.strip()
+    out["ShortName"] = out["ShortName"].astype(str).str.strip()
     out["IndustryCode"] = out["IndustryCode"].astype(str).str.strip()
     out["IndustryName"] = out["IndustryCode"].map(INDUSTRY_CODE_MAP).fillna("未分類")
     out["PaidInCapital"] = out["PaidInCapital"].map(number)
