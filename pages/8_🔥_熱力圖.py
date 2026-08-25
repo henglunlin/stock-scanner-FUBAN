@@ -98,6 +98,14 @@ with st.sidebar:
         "顏色依據", ["漲跌幅 (%)", "三大法人買賣超", "資金流向代理指標 (OBV)"], key="hm_color_metric"
     )
     data_mode = st.radio("資料模式", ["收盤資料 (較快)", "盤中即時 (較慢)"], key="hm_data_mode")
+    if data_mode.startswith("收盤"):
+        selected_date = st.date_input(
+            "資料日期", value=tw_now.date(), max_value=tw_now.date(), key="hm_selected_date",
+            help="選擇要看哪一天的收盤資料。若當天不是交易日、或資料庫還沒同步到那天，"
+                 "會自動往前抓最近一個有資料的交易日（下方會顯示實際抓到的日期）。",
+        )
+    else:
+        selected_date = tw_now.date()
     size_metric = st.radio("方塊大小", ["市值 (股本 × 股價)", "成交金額"], key="hm_size_metric")
     min_group_size = st.slider(
         "族群最少股票數（改善5）", min_value=1, max_value=10, value=3, key="hm_min_group_size",
@@ -150,7 +158,9 @@ if data_mode.startswith("盤中即時") and len(all_codes) > LIVE_MODE_WARN_THRE
 
 st.caption(
     f"掃描範圍：{len(group_map)} 個族群、共 {len(all_codes)} 檔股票"
-    f"（{data_mode}，價格來源：{active_source}）"
+    f"（{data_mode}"
+    + (f"，日期：{selected_date_str}" if data_mode.startswith("收盤") else f"，價格來源：{active_source}")
+    + "）"
 )
 
 
@@ -158,18 +168,54 @@ st.caption(
 # 抓價格資料
 # --------------------------------------------------------------------------
 today_str = tw_now.strftime("%Y-%m-%d")
+selected_date_str = selected_date.strftime("%Y-%m-%d")
 
 
-@st.cache_data(ttl=1800)
-def bulk_close_mode(symbols: tuple) -> dict:
-    """收盤模式：一次從本地 DB 撈全部股票近期資料，取最後兩天算漲跌幅，速度快很多。"""
-    return cf.bulk_download_db_history(symbols, today_str)
+@st.cache_data(ttl=600)
+def load_closing_snapshot(codes: tuple, as_of_date: str) -> dict:
+    """
+    收盤模式專用：直接從本地 DB 撈「不晚於 as_of_date」的最後兩個交易日資料，用來算漲跌幅。
+
+    不能沿用 common_fubon.bulk_download_db_history() —— 那支函式內部寫死用
+    「執行當下的系統日期」過濾 (df[df['Date'] < today])，不管資料庫裡實際存了哪天的資料，
+    永遠會排除「今天」這一筆，導致熱力圖看起來永遠慢一天。這裡改成完全依照使用者
+    指定的 as_of_date 為準，資料庫裡有到哪天就用到哪天。
+    """
+    if not os.path.exists(DB_PATH) or not codes:
+        return {}, None
+    placeholders = ",".join("?" * len(codes))
+    query = f"""
+        SELECT Date, SecurityCode, Open, High, Low, Close, Volume
+        FROM ohlcv_data
+        WHERE SecurityCode IN ({placeholders}) AND Date <= ?
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            df = pd.read_sql(query, conn, params=list(codes) + [as_of_date])
+    except Exception:
+        return {}, None
+
+    if df.empty:
+        return {}, None
+
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    latest_available_date = df["Date"].max()
+
+    result = {}
+    for code, sub in df.groupby("SecurityCode"):
+        sub = sub.sort_values("Date").tail(2).reset_index(drop=True)
+        result[code] = sub[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    return result, latest_available_date
 
 
 symbols = tuple(f"{c}.TW" for c in all_codes)
 
 if data_mode.startswith("收盤"):
-    price_data = {sym.split(".")[0]: df for sym, df in bulk_close_mode(symbols).items()}
+    price_data, latest_available_date = load_closing_snapshot(tuple(all_codes), selected_date_str)
+    if latest_available_date is not None and latest_available_date != selected_date:
+        st.info(f"資料庫裡沒有 {selected_date_str} 的資料，已自動顯示最近一個有資料的交易日：{latest_available_date}")
+    elif latest_available_date is None:
+        st.warning("資料庫裡完全查不到這個範圍的股票資料，請確認 twse_ohlcv.db 是否已同步。")
 else:
     yf_today_map = (
         cf.bulk_download_yfinance_today(symbols, today_str) if active_source == "Yfinance" else {}
