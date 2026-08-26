@@ -1893,10 +1893,20 @@ if st.session_state.run_results is not None:
     elif not enable_backtest or not trades:
         st.info("請先啟用模擬回測功能並產生已平倉交易，才能與交易紀錄比對。")
     else:
-        # 交易紀錄的實際買賣配對：假設同一檔股票的紀錄依日期排序後，買入/賣出交替出現 (FIFO 配對)，
+        # 交易紀錄的實際買賣配對：同一檔股票的紀錄依日期排序後，用「張數感知的 FIFO 配對」——
+        # 每筆買入視為一個持倉批次(帶「剩餘張數」)，賣出時依先進先出、按「賣出張數」逐批扣減，
+        # 一筆賣出可能只吃掉某批買入的一部分張數，剩下的張數繼續留在佇列裡等下一筆賣出配對。
         # 依「進出手法」判斷買賣方向：優先比對是否為 SELL_LABELS 清單內的賣出型訊號，其餘文字才用是否含「賣」字判斷。
         # 若你的紀錄慣例不同，這裡的配對邏輯可能需要調整。
-        # 尚未有對應賣出紀錄的買入，會以「最新收盤價」計算目前報酬率，並標註為「未平倉」一併納入比對。
+        #
+        # 2026-08-26 修正：原本的配對邏輯把「一筆買入」與「一筆賣出」視為 1:1 完整配對，
+        # 完全沒看「買賣張數」——只要出現下一筆賣出紀錄，不論賣出張數是多少，就整批買入標記
+        # 為「已平倉」。例如 3441 買入 3 張、只賣出 1 張，結果被誤判成「3 張整批已平倉」，
+        # 完全沒有顯示剩下 2 張其實還「未平倉」。改成下面的張數感知 FIFO 配對後：
+        # 賣出 1 張時，只會從買入批次的 3 張中扣掉 1 張、產生 1 張「已平倉」紀錄，
+        # 剩餘 2 張留在佇列中，迴圈跑完後才會以最新收盤價計算未實現損益、標註為「未平倉」。
+        # 尚未有對應賣出紀錄的買入(或賣出後剩餘的張數)，會以「最新收盤價」計算目前報酬率，
+        # 並標註為「未平倉」一併納入比對。
         journal_for_stock["交易日期_dt"] = pd.to_datetime(journal_for_stock["交易日期"])
         journal_for_stock = journal_for_stock.sort_values("交易日期_dt")
         journal_for_stock["動作"] = journal_for_stock["進出手法"].apply(classify_journal_action)
@@ -1913,50 +1923,71 @@ if st.session_state.run_results is not None:
                 pass
             return 1.0  # 未填寫張數時，比對預設以 1 張計算
 
+        _SHARE_EPS = 1e-9
         journal_trades = []
-        pending_buy = None
+        open_lots = []  # FIFO 佇列：尚未(完全)配對到賣出的買入批次，每筆帶「剩餘張數」
+        oversell_notes = []  # 記錄「賣出張數超過目前持有張數」的異常，事後提示使用者
         for _, jr in journal_for_stock.iterrows():
+            shares = _journal_shares(jr)
             if jr["動作"] == "買入":
-                if pending_buy is not None and latest_price is not None:
-                    # 前一筆買入尚未有對應賣出紀錄，視為未平倉先納入比對
-                    buy_price = float(pending_buy["進出場價格"])
-                    pnl_pct = (latest_price - buy_price) / buy_price * 100 if buy_price else 0
-                    journal_trades.append({
-                        "買入日期": pending_buy["交易日期"], "買入手法": pending_buy["進出手法"],
-                        "買入張數": _journal_shares(pending_buy), "買入價": buy_price,
-                        "賣出日期": "-", "賣出手法": "-", "賣出張數": None, "賣出價": None,
-                        "狀態": "未平倉", "報酬率(%)": round(pnl_pct, 2),
-                    })
-                pending_buy = jr
-            elif jr["動作"] == "賣出" and pending_buy is not None:
-                buy_price = float(pending_buy["進出場價格"])
-                sell_price = float(jr["進出場價格"])
-                pnl_pct = (sell_price - buy_price) / buy_price * 100 if buy_price else 0
-                journal_trades.append({
-                    "買入日期": pending_buy["交易日期"], "買入手法": pending_buy["進出手法"],
-                    "買入張數": _journal_shares(pending_buy), "買入價": buy_price,
-                    "賣出日期": jr["交易日期"], "賣出手法": jr["進出手法"],
-                    "賣出張數": _journal_shares(jr), "賣出價": sell_price,
-                    "狀態": "已平倉", "報酬率(%)": round(pnl_pct, 2),
+                open_lots.append({
+                    "date": jr["交易日期"], "method": jr["進出手法"],
+                    "price": float(jr["進出場價格"]), "remaining": shares,
                 })
-                pending_buy = None
+            elif jr["動作"] == "賣出":
+                sell_price = float(jr["進出場價格"])
+                sell_remaining = shares
+                while sell_remaining > _SHARE_EPS and open_lots:
+                    lot = open_lots[0]
+                    matched = min(sell_remaining, lot["remaining"])
+                    buy_price = lot["price"]
+                    pnl_pct = (sell_price - buy_price) / buy_price * 100 if buy_price else 0
+                    journal_trades.append({
+                        "買入日期": lot["date"], "買入手法": lot["method"],
+                        "買入張數": matched, "買入價": buy_price,
+                        "賣出日期": jr["交易日期"], "賣出手法": jr["進出手法"],
+                        "賣出張數": matched, "賣出價": sell_price,
+                        "狀態": "已平倉", "報酬率(%)": round(pnl_pct, 2),
+                    })
+                    lot["remaining"] -= matched
+                    sell_remaining -= matched
+                    if lot["remaining"] <= _SHARE_EPS:
+                        open_lots.pop(0)
+                if sell_remaining > _SHARE_EPS:
+                    # 賣出張數超過目前手上所有買入批次剩餘張數之和：可能紀錄有缺漏買入、
+                    # 或張數填寫有誤，這裡不硬湊配對，只記錄異常供畫面提示，避免產生假資料。
+                    oversell_notes.append(
+                        f"{jr['交易日期']} 賣出「{jr['進出手法']}」{sell_remaining:g} 張，"
+                        f"超過當時持有張數，無法完全配對"
+                    )
 
-        # 迴圈跑完後，若還有尚未配對到賣出的買入(通常是最後一筆)，同樣視為未平倉納入
-        if pending_buy is not None and latest_price is not None:
-            buy_price = float(pending_buy["進出場價格"])
-            pnl_pct = (latest_price - buy_price) / buy_price * 100 if buy_price else 0
-            journal_trades.append({
-                "買入日期": pending_buy["交易日期"], "買入手法": pending_buy["進出手法"],
-                "買入張數": _journal_shares(pending_buy), "買入價": buy_price,
-                "賣出日期": "-", "賣出手法": "-", "賣出張數": None, "賣出價": None,
-                "狀態": "未平倉", "報酬率(%)": round(pnl_pct, 2),
-            })
+        # 迴圈跑完後，佇列裡剩下的張數(不論是完全沒賣出、或賣出後只成交一部分)，
+        # 同樣視為未平倉納入比對，以最新收盤價計算目前報酬率。
+        if latest_price is not None:
+            for lot in open_lots:
+                if lot["remaining"] <= _SHARE_EPS:
+                    continue
+                buy_price = lot["price"]
+                pnl_pct = (latest_price - buy_price) / buy_price * 100 if buy_price else 0
+                journal_trades.append({
+                    "買入日期": lot["date"], "買入手法": lot["method"],
+                    "買入張數": lot["remaining"], "買入價": buy_price,
+                    "賣出日期": "-", "賣出手法": "-", "賣出張數": None, "賣出價": None,
+                    "狀態": "未平倉", "報酬率(%)": round(pnl_pct, 2),
+                })
+
+        if oversell_notes:
+            st.warning("⚠️ 交易紀錄比對發現張數異常，以下賣出紀錄無法完全配對到買入張數：\n" + "\n".join(oversell_notes))
 
         if not journal_trades:
             st.info("交易紀錄中尚無可比對的買入紀錄。")
         else:
             df_journal_trades = pd.DataFrame(journal_trades)
             df_journal_trades = df_journal_trades[["買入日期", "買入手法", "買入張數", "買入價", "賣出日期", "賣出手法", "賣出張數", "賣出價", "狀態", "報酬率(%)"]]
+            # FIFO 配對後，同一批買入若被拆成「已平倉」+「未平倉」兩段，兩段是分開append的
+            # (已平倉在配對當下就加入、未平倉統一在迴圈跑完後才加入)，這裡依「買入日期」重新
+            # 排序，讓表格維持依買入時間先後的直覺順序，同一天買入的排在一起、方便對照。
+            df_journal_trades = df_journal_trades.sort_values("買入日期", kind="stable").reset_index(drop=True)
             df_backtest_trades = pd.DataFrame(trades)
             n_open = (df_journal_trades["狀態"] == "未平倉").sum()
             n_closed = (df_journal_trades["狀態"] == "已平倉").sum()
