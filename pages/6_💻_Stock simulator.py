@@ -636,23 +636,13 @@ def journal_summary_dialog():
     m3.metric("平均報酬率 (含未平倉)", f"{avg_all:.2f} %" if pd.notna(avg_all) else "-")
     m4.metric("勝率 (含未平倉)", f"{win_rate_all:.1f} %" if win_rate_all is not None else "-")
 
-    st.markdown("**依「進出手法」分類的績效**（只計入已能算出報酬率的筆數）")
-    df_scored = df_all.loc[has_pnl]
-    if df_scored.empty:
-        st.caption("目前沒有可計算報酬率的紀錄。")
-    else:
-        method_stats = df_scored.groupby("買入手法").agg(
-            筆數=("報酬率(%)", "count"),
-            平均報酬率=("報酬率(%)", "mean"),
-        )
-        method_stats["勝率"] = df_scored.groupby("買入手法")["報酬率(%)"].apply(lambda s: (s > 0).mean() * 100)
-        method_stats = method_stats.reset_index().sort_values("平均報酬率", ascending=False)
-        method_stats["平均報酬率"] = method_stats["平均報酬率"].round(2)
-        method_stats["勝率"] = method_stats["勝率"].round(1)
-        st.dataframe(method_stats, use_container_width=True, hide_index=True)
-
+    # ============ 全部交易明細（可篩選股票代碼 / 狀態 / 買入日期區間）============
     st.markdown("**全部交易明細**")
-    fcol1, fcol2 = st.columns(2)
+    buy_dates_all = pd.to_datetime(df_all["買入日期"], errors="coerce")
+    min_buy_date = buy_dates_all.min().date() if buy_dates_all.notna().any() else datetime.now(timezone(timedelta(hours=8))).date()
+    today_date = datetime.now(timezone(timedelta(hours=8))).date()
+
+    fcol1, fcol2, fcol3 = st.columns([1, 1, 1.4])
     filter_codes = fcol1.multiselect(
         "篩選股票代碼 (預設全部)", options=sorted(df_all["股票代碼"].unique().tolist()),
         key="journal_summary_filter_codes",
@@ -661,12 +651,44 @@ def journal_summary_dialog():
         "篩選狀態", options=["已平倉", "未平倉"], default=["已平倉", "未平倉"],
         key="journal_summary_filter_status",
     )
+    # 篩選依「買入日期」區間，預設從最早一筆買入紀錄到今天，涵蓋全部紀錄；
+    # 結束日期預設為今日，方便直接把區間往前拉就能看「最近幾天」的紀錄。
+    date_range = fcol3.date_input(
+        "篩選買入日期區間",
+        value=(min_buy_date, today_date),
+        key="journal_summary_filter_date_range",
+    )
+
     df_show = df_all.copy()
     if filter_codes:
         df_show = df_show[df_show["股票代碼"].isin(filter_codes)]
     if filter_status:
         df_show = df_show[df_show["狀態"].isin(filter_status)]
+    # date_input 給範圍值時，使用者只點選了區間其中一端 (還沒點第二端) 的當下會回傳
+    # 長度為1的 tuple，這裡先不套用日期篩選，避免中途出現「暫時性」的錯誤篩選結果，
+    # 等使用者把兩端都選好 (長度為2) 才實際套用。
+    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        start_d, end_d = date_range
+        show_buy_dates = pd.to_datetime(df_show["買入日期"], errors="coerce")
+        df_show = df_show[(show_buy_dates.dt.date >= start_d) & (show_buy_dates.dt.date <= end_d)]
+
     st.dataframe(df_show.sort_values("買入日期", ascending=False), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    with st.expander("📈 依「進出手法」分類的績效（只計入已能算出報酬率的筆數）", expanded=False):
+        df_scored = df_all.loc[has_pnl]
+        if df_scored.empty:
+            st.caption("目前沒有可計算報酬率的紀錄。")
+        else:
+            method_stats = df_scored.groupby("買入手法").agg(
+                筆數=("報酬率(%)", "count"),
+                平均報酬率=("報酬率(%)", "mean"),
+            )
+            method_stats["勝率"] = df_scored.groupby("買入手法")["報酬率(%)"].apply(lambda s: (s > 0).mean() * 100)
+            method_stats = method_stats.reset_index().sort_values("平均報酬率", ascending=False)
+            method_stats["平均報酬率"] = method_stats["平均報酬率"].round(2)
+            method_stats["勝率"] = method_stats["勝率"].round(1)
+            st.dataframe(method_stats, use_container_width=True, hide_index=True)
 
     if st.button("關閉", use_container_width=True, key="journal_summary_close_btn"):
         st.rerun()
