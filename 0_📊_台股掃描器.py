@@ -356,6 +356,48 @@ def format_volatility(val):
     try: return f"{float(val):.2f}%"
     except Exception: return val
 
+# ===== 讀取「已匯出的掃描結果 Excel」工具（方便瀏覽舊檔案，不需要重新掃描）=====
+def read_uploaded_scan_excel(uploaded_file):
+    """讀取使用者上傳的掃描結果 .xlsx，回傳 {分頁名稱: DataFrame}（依原始分頁順序）。"""
+    try:
+        sheets = pd.read_excel(uploaded_file, sheet_name=None, engine="openpyxl")
+        return {str(name): df for name, df in sheets.items() if df is not None}
+    except Exception as e:
+        st.error(f"❌ 讀取 Excel 失敗：{e}")
+        return {}
+
+def render_scan_excel_sheet(df: pd.DataFrame):
+    """把上傳 Excel 的單一分頁，用跟即時掃描結果一致的樣式（連結欄位、顏色、格式化）呈現。"""
+    if df is None or df.empty:
+        st.caption("（此分頁沒有資料）")
+        return
+
+    display_df = df.copy()
+    if "代碼" in display_df.columns:
+        display_df["代碼"] = display_df["代碼"].astype(str).apply(yahoo_quote_url)
+    if "漲跌%" in display_df.columns:
+        display_df["漲跌%"] = pd.to_numeric(display_df["漲跌%"], errors="coerce").apply(format_color)
+    if "成交量(張)" in display_df.columns:
+        display_df["成交量(張)"] = display_df["成交量(張)"].apply(format_volume)
+    if "波動率%" in display_df.columns:
+        display_df["波動率%"] = display_df["波動率%"].apply(format_volatility)
+
+    column_config = {}
+    if "代碼" in display_df.columns:
+        column_config["代碼"] = st.column_config.LinkColumn("代碼", display_text=r"https://tw.stock.yahoo.com/quote/(.*)")
+    if "股票名稱" in display_df.columns:
+        column_config["股票名稱"] = st.column_config.TextColumn("股票名稱")
+    if "訊號分數" in display_df.columns:
+        column_config["訊號分數"] = st.column_config.NumberColumn("訊號分數", format="%.1f")
+    if "RS Rating" in display_df.columns:
+        column_config["RS Rating"] = st.column_config.NumberColumn("RS Rating", format="%.1f", help="全市場 RS超額報酬% 的百分位排名 (0~100，100=最強)")
+    if "大盤相比(強/弱)" in display_df.columns:
+        column_config["大盤相比(強/弱)"] = st.column_config.TextColumn("大盤相比(強/弱)", help="綜合 RS超額報酬%／RS Rating／MA排列(個股vs大盤)／RS創新高 四項訊號的簡化判斷：強／持平／弱")
+    if "訊號說明" in display_df.columns:
+        column_config["訊號說明"] = st.column_config.TextColumn("訊號說明", width="large")
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True, column_config=column_config)
+
 def render_scan_progress_card(placeholder, pct: float, status_text: str = "掃描進度"):
     pct = max(0.0, min(float(pct), 100.0))
     placeholder.markdown(
@@ -396,6 +438,24 @@ else:
     st.sidebar.caption(f"股票分組共 {len(st.session_state.stock_groups)} 組，請至「股票列表編輯器」頁面新增/編輯。")
 
 st.caption(f"更新時間：{tw_now.strftime('%Y-%m-%d %H:%M:%S')}｜價格來源：{active_price_source}")
+
+# ===== 讀取已匯出的掃描結果 Excel（上傳舊檔案瀏覽，不需要重新掃描）=====
+with st.expander("📂 讀取已匯出的掃描結果 Excel（上傳舊檔案瀏覽，不需要重新掃描）", expanded=False):
+    uploaded_scan_excel = st.file_uploader(
+        "上傳掃描結果 Excel 檔案（.xlsx）",
+        type=["xlsx"],
+        key="uploaded_scan_excel_file",
+        help="可上傳先前用「📁 Download → 下載 Excel」匯出的掃描結果檔案，或其他備份的掃描結果 .xlsx，用表格方式方便瀏覽，不會影響下方即時掃描結果。",
+    )
+    if uploaded_scan_excel is not None:
+        uploaded_sheets = read_uploaded_scan_excel(uploaded_scan_excel)
+        if uploaded_sheets:
+            non_empty_count = sum(1 for df in uploaded_sheets.values() if df is not None and not df.empty)
+            st.success(f"✅ 已讀取「{uploaded_scan_excel.name}」，共 {len(uploaded_sheets)} 個分頁（{non_empty_count} 個有資料）。")
+            uploaded_tabs = st.tabs([f"{name}（{0 if df is None else len(df)}）" for name, df in uploaded_sheets.items()])
+            for tab, (sheet_name, sheet_df) in zip(uploaded_tabs, uploaded_sheets.items()):
+                with tab:
+                    render_scan_excel_sheet(sheet_df)
 
 rise_threshold = st.number_input("儀表板漲幅達標門檻 (%)", min_value=0.0, max_value=10.0, value=7.0, step=0.5, format="%.2f")
 
