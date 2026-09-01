@@ -721,12 +721,19 @@ if should_run_scan:
                 if "漲幅達標" in signal_types and "漲幅達標" in selected_signal_names and passes_volume_filter:
                     signal_buckets["漲幅達標"].append(row.copy())
 
+                # 「跌停」分頁：同樣獨立於 SIGNAL_SCORE_MIN 訊號分數門檻之外。
+                # 跌停 (kind="sell") 在 scoring.py 裡是 -20 分的風險/賣出型態訊號，
+                # 用「進場品質分數」去篩選一檔股票該不該出現在跌停分頁本來就不合理——
+                # 只要「跌停」訊號有觸發、有被勾選、且成交量符合下限，就列入，不看 signal_score。
+                if "跌停" in signal_types and "跌停" in selected_signal_names and passes_volume_filter:
+                    signal_buckets["跌停"].append(row.copy())
+
                 if is_selected_signal:
                     all_signal_rows.append(row.copy())
                     if signal_score >= PRIORITY_SCORE_MIN: signal_buckets["優先追蹤"].append(row.copy())
                     append_signal_tracking(row, scan_today_str)
                     for sig in signal_types:
-                        if sig == "漲幅達標":
+                        if sig in ("漲幅達標", "跌停"):
                             continue  # 已在上面獨立處理，這裡跳過避免重複加入同一筆資料
                         if sig in signal_buckets and sig in selected_signal_names: signal_buckets[sig].append(row.copy())
 
