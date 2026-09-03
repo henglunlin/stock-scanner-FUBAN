@@ -311,6 +311,9 @@ twse_conn = get_twse_conn()
 # 2026-08-24新增：db檔案的mtime，當作下面查詢快取(st.cache_data)的失效依據——
 # 直接內嵌計算(不呼叫下面才定義的_etf_db_mtime()函式)，避免函式定義順序問題。
 etf_db_mtime = os.path.getmtime(ETF_DB_PATH) if os.path.exists(ETF_DB_PATH) else 0.0
+# 2026-09-03新增：twse_ohlcv.db的mtime，供「金額估算」的收盤價查詢快取(cached_close_prices)
+# 當失效依據，邏輯跟etf_db_mtime一樣。
+twse_db_mtime = os.path.getmtime(TWSE_DB_PATH) if os.path.exists(TWSE_DB_PATH) else 0.0
 
 active_etf_name_map = etf_watchlist.load_active_etf_name_map(ACTIVE_ETF_CSV)
 all_active_codes = sorted(active_etf_name_map.keys())
@@ -333,6 +336,95 @@ def etf_label(code: str) -> str:
 # 剩不滿一張的零股在這幾張表裡不特別處理，直接四捨五入)。
 def shares_series_to_lots(series: pd.Series) -> pd.Series:
     return (series / 1000).round(0)
+
+
+# --------------------------------------------------------------------------
+# 金額估算工具 (2026-09-03新增，供「多數ETF共同買賣」「指定ETF買賣狀況」的
+# 儀表板卡片使用)
+# --------------------------------------------------------------------------
+# ⚠️ etf_holdings.db 本身沒有存「成交金額」，只有股數/權重異動。這裡用
+# 「異動當天(change_date)這檔股票在 twse_ohlcv.db 的收盤價」估算金額
+# (股數變化 × 收盤價)，這是「用市值變化推估」的近似值，不是ETF基金公司實際
+# 申報的成交金額(實際成交價可能跟當天收盤價有落差)——畫面上會註明「估算」。
+def format_twd_amount(value) -> str:
+    """把台幣金額(可能是None/NaN)格式化成「+23.1億」/「-842萬」這種簡短字串，
+    金額不到千的直接顯示數字。None/NaN回傳「—」。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    sign = "+" if value > 0 else ("-" if value < 0 else "")
+    abs_v = abs(value)
+    if abs_v >= 1e8:
+        return f"{sign}{abs_v / 1e8:.1f}億"
+    if abs_v >= 1e4:
+        return f"{sign}{abs_v / 1e4:,.0f}萬"
+    if abs_v == 0:
+        return "0"
+    return f"{sign}{abs_v:,.0f}"
+
+
+@st.cache_data(show_spinner=False)
+def cached_close_prices(_twse_conn, twse_mtime: float, stock_codes: tuple, date: str) -> dict:
+    """批次查詢一批股票代碼在指定日期的收盤價，回傳 {股票代碼: 收盤價} dict。
+    查不到的股票代碼不會出現在dict裡(呼叫端用.get()處理缺值)。"""
+    if _twse_conn is None or not stock_codes:
+        return {}
+    placeholders = ",".join("?" * len(stock_codes))
+    q = f"SELECT SecurityCode, Close FROM ohlcv_data WHERE Date = ? AND SecurityCode IN ({placeholders})"
+    try:
+        df = pd.read_sql(q, _twse_conn, params=[date] + list(stock_codes))
+    except Exception:
+        return {}
+    return dict(zip(df["SecurityCode"], df["Close"]))
+
+
+def add_estimated_value_column(changes_df: pd.DataFrame, twse_conn, twse_mtime: float) -> pd.DataFrame:
+    """幫一份「異動明細」DataFrame(需含stock_code/change_date/shares_change欄位)
+    加上一欄「est_value」(估算金額 = 股數變化 × 當天收盤價)。查不到收盤價的列
+    (twse_conn是None、股票不在twse_ohlcv.db、或該天沒有K線資料，例如興櫃/停牌)
+    「est_value」會是NaN，呼叫端加總時用.sum(skipna=True)会自動略過。"""
+    out = changes_df.copy()
+    if twse_conn is None or out.empty:
+        out["est_value"] = float("nan")
+        return out
+    out["est_value"] = float("nan")
+    for change_date, group in out.groupby("change_date"):
+        price_map = cached_close_prices(twse_conn, twse_mtime, tuple(sorted(group["stock_code"].unique())), change_date)
+        for idx in group.index:
+            code = out.at[idx, "stock_code"]
+            price = price_map.get(code)
+            shares_chg = out.at[idx, "shares_change"]
+            if price is not None and pd.notna(shares_chg):
+                out.at[idx, "est_value"] = float(shares_chg) * float(price)
+    return out
+
+
+def aggregate_change_values(changes_val: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """把已經加上est_value欄位的異動明細，依group_col(stock_code或etf_code)分組加總，
+    回傳欄位：group_col、gross_buy(該組加碼估算金額加總，只計正值)、
+    gross_sell(該組減碼估算金額加總，只計負值)、net(淨額=gross_buy+gross_sell)。
+    查不到收盤價的NaN列在.sum()時會被自動忽略(pandas預設skipna=True)，
+    不會讓整組因為一筆缺值就變成NaN。"""
+    if changes_val.empty:
+        return pd.DataFrame(columns=[group_col, "gross_buy", "gross_sell", "net"])
+
+    def _agg(g):
+        vals = g["est_value"]
+        return pd.Series({
+            "gross_buy": vals[vals > 0].sum(),
+            "gross_sell": vals[vals < 0].sum(),
+            "net": vals.sum(),
+        })
+
+    # ⚠️ pandas 2.2+ 的 groupby.apply() 對「group_keys會被一併傳進_agg」這件事
+    # 改了預設行為、加了 include_groups 參數並發出FutureWarning；用try/except
+    # 相容新舊版本(舊版沒有這個參數，傳了會直接TypeError，退回不帶這個參數的呼叫)，
+    # 不影響實際分組加總結果，只是消除警告訊息。
+    try:
+        result = changes_val.groupby(group_col).apply(_agg, include_groups=False)
+    except TypeError:
+        result = changes_val.groupby(group_col).apply(_agg)
+    result = result.reset_index()
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -636,12 +728,87 @@ with tab1:
             if changes.empty:
                 st.info(f"{pick_date} {etf_label(pick_etf)} 沒有偵測到持股異動(或這是第一天被抓取、沒有比較基準)。")
             else:
-                n_buy = (changes["direction"].isin(["加碼", "新納入"])).sum()
-                n_sell = (changes["direction"].isin(["減碼", "全數賣出"])).sum()
-                m1, m2, m3 = st.columns(3)
-                m1.metric("加碼/新納入", f"{n_buy} 檔")
-                m2.metric("減碼/全數賣出", f"{n_sell} 檔")
-                m3.metric("總異動數", f"{len(changes)} 檔")
+                # 2026-09-03新增：「📸 最新快照」卡片，比照使用者提供的參考截圖排版——
+                # 摘要句+加碼/減碼估算金額+新增/加碼/刪除/減碼四項計數+操作按鈕。
+                # ⚠️ 金額是用「異動當天收盤價 × 股數變化」估算出來的市值變化，
+                # 不是ETF基金公司實際申報的成交金額(基金實際成交價可能跟當天收盤價
+                # 有落差)，畫面上會註明「估算」。
+                changes_val = add_estimated_value_column(changes, twse_conn, twse_db_mtime)
+                n_new = int((changes["change_type"] == "新增").sum())
+                n_removed = int((changes["change_type"] == "刪除").sum())
+                n_buy = int((changes["direction"] == "加碼").sum())
+                n_sell = int((changes["direction"] == "減碼").sum())
+                total_buy_val = changes_val.loc[changes_val["est_value"] > 0, "est_value"].sum()
+                total_sell_val = changes_val.loc[changes_val["est_value"] < 0, "est_value"].sum()
+                n_missing_price = int(changes_val["est_value"].isna().sum())
+                base_date = changes["compare_base_date"].iloc[0] if "compare_base_date" in changes.columns and not changes.empty else ""
+
+                with st.container(border=True):
+                    snap_top1, snap_top2 = st.columns([2, 1])
+                    with snap_top1:
+                        st.markdown(f"**📸 最新快照 — {etf_label(pick_etf)}**")
+                    with snap_top2:
+                        st.caption(f"{base_date} → {pick_date}" if base_date else pick_date)
+
+                    st.markdown(
+                        f"最近一次持股異動 **{len(changes)}** 筆　"
+                        f":red[加碼 {format_twd_amount(total_buy_val)}]　"
+                        f":green[減碼 {format_twd_amount(total_sell_val)}]"
+                        f"　*(估算金額，見下方說明)*"
+                    )
+                    snap_c1, snap_c2, snap_c3, snap_c4 = st.columns(4)
+                    snap_c1.metric("新增", f"{n_new}")
+                    snap_c2.metric("加碼", f"{n_buy}")
+                    snap_c3.metric("刪除", f"{n_removed}")
+                    snap_c4.metric("減碼", f"{n_sell}")
+                    if n_missing_price:
+                        st.caption(f"⚠️ {n_missing_price} 筆異動在 twse_ohlcv.db 查不到對應收盤價，金額估算已略過這幾筆。")
+
+                    btn1, btn2, btn3 = st.columns(3)
+                    with btn1:
+                        show_history_toggle = st.toggle("📜 查看歷史", key="tab1_show_history_toggle")
+                    with btn2:
+                        csv_bytes = changes.drop(columns=[c for c in ("est_value",) if c in changes.columns]) \
+                            .to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "⬇️ 匯出CSV", data=csv_bytes,
+                            file_name=f"{pick_etf}_{pick_date}_異動明細.csv",
+                            mime="text/csv", key="tab1_export_csv_btn", use_container_width=True,
+                        )
+                    with btn3:
+                        copy_toggle = st.toggle("📋 複製異動清單", key="tab1_copy_list_toggle")
+
+                    if copy_toggle:
+                        copy_lines = []
+                        for r in changes_val.itertuples():
+                            lots_chg = shares_series_to_lots(pd.Series([r.shares_change])).iloc[0]
+                            amt_txt = format_twd_amount(getattr(r, "est_value", None))
+                            copy_lines.append(
+                                f"{r.stock_code} {r.stock_name}　{r.direction}　張數變化{lots_chg:+.0f}張　估算金額{amt_txt}"
+                            )
+                        st.code("\n".join(copy_lines), language=None)
+
+                    if show_history_toggle:
+                        # ⚠️ 不用跨分頁跳轉(Streamlit沒有程式化切換分頁的API，見3️⃣/4️⃣的既有註解)，
+                        # 改成直接在這裡inline顯示這檔ETF自己最近幾次的異動彙總，自成一體。
+                        hist_dates = cached_available_dates(etf_conn, etf_db_mtime, pick_etf)
+                        hist_dates_recent = hist_dates[:10]  # 新到舊排序，取最近10次快照
+                        hist_rows = []
+                        for hd in hist_dates_recent:
+                            hd_changes = cached_holding_changes(etf_conn, etf_db_mtime, change_date=hd, etf_code=pick_etf)
+                            if hd_changes.empty:
+                                continue
+                            hd_val = add_estimated_value_column(hd_changes, twse_conn, twse_db_mtime)
+                            hist_rows.append({
+                                "日期": hd,
+                                "異動筆數": len(hd_changes),
+                                "加碼估算金額": format_twd_amount(hd_val.loc[hd_val["est_value"] > 0, "est_value"].sum()),
+                                "減碼估算金額": format_twd_amount(hd_val.loc[hd_val["est_value"] < 0, "est_value"].sum()),
+                            })
+                        if hist_rows:
+                            st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("這檔ETF目前沒有更早的異動歷史可以顯示。")
 
                 display_cols = [
                     "stock_code", "stock_name", "change_type", "direction",
@@ -769,6 +936,68 @@ with tab2:
             # 順手記住這次的門檻設定，下次打開網頁不用重設(不強制存GitHub，只更新本機檔案)
             cfg = etf_watchlist.save_watchlist_config(WATCHLIST_CONFIG_PATH, cfg["tracked_etfs"], min_etf_count)
             st.session_state.etf_watchlist_cfg = cfg
+
+        # 2026-09-03新增：「📊 今日主動圈快照」儀表板——沿用上面已選好的
+        # common_date / scope_codes / scope_choice，不重複開新的日期/範圍選項。
+        dash_changes = cached_holding_changes(etf_conn, etf_db_mtime, change_date=common_date, etf_codes=scope_codes)
+        if dash_changes.empty:
+            st.info(f"{common_date} 在目前範圍({scope_choice})內沒有任何持股異動紀錄。")
+        else:
+            dash_changes_val = add_estimated_value_column(dash_changes, twse_conn, twse_db_mtime)
+            n_missing_price_dash = int(dash_changes_val["est_value"].isna().sum())
+
+            stock_agg = aggregate_change_values(dash_changes_val, "stock_code")
+            etf_agg = aggregate_change_values(dash_changes_val, "etf_code")
+
+            total_buy_dash = dash_changes_val.loc[dash_changes_val["est_value"] > 0, "est_value"].sum()
+            total_sell_dash = dash_changes_val.loc[dash_changes_val["est_value"] < 0, "est_value"].sum()
+            n_etf_involved = dash_changes_val["etf_code"].nunique()
+
+            leader_line = ""
+            if not etf_agg.empty and etf_agg["net"].max() > 0:
+                top_etf_row = etf_agg.sort_values("net", ascending=False).iloc[0]
+                leader_line = f"，其中 **{etf_label(top_etf_row['etf_code'])}** 淨加碼金額最高(約 {format_twd_amount(top_etf_row['net'])})"
+
+            with st.container(border=True):
+                st.markdown(f"**📊 今日主動圈快照 — {common_date}（{scope_choice}，共 {n_etf_involved} 檔ETF有異動）**")
+                st.markdown(
+                    f"今天共 **{len(dash_changes)}** 筆持股異動{leader_line}。"
+                    f"（⚠️ 金額皆為「股數變化 × 當天收盤價」的估算值，非各基金實際申報金額；"
+                    f"目前資料沒有產業別分類，暫不提供產業加碼統計）"
+                )
+                dash_c1, dash_c2 = st.columns(2)
+                with dash_c1:
+                    st.metric("總加碼估算金額", format_twd_amount(total_buy_dash))
+                with dash_c2:
+                    st.metric("總減碼估算金額", format_twd_amount(total_sell_dash))
+                if n_missing_price_dash:
+                    st.caption(f"⚠️ {n_missing_price_dash} 筆異動查不到對應收盤價，已從金額估算中略過。")
+
+                st.divider()
+                q1, q2, q3, q4 = st.columns(4)
+
+                def _render_top3(container, title, df, key_col, label_func, ascending):
+                    with container:
+                        st.markdown(f"**{title}**")
+                        sub = df.sort_values("net", ascending=ascending).head(3)
+                        if sub.empty:
+                            st.caption("無資料")
+                            return
+                        for _, r in sub.iterrows():
+                            st.markdown(f"{label_func(r[key_col])}　:red[{format_twd_amount(r['net'])}]" if r["net"] >= 0
+                                        else f"{label_func(r[key_col])}　:green[{format_twd_amount(r['net'])}]")
+                            st.caption(f"加碼{format_twd_amount(r['gross_buy'])} / 減碼{format_twd_amount(r['gross_sell'])}")
+
+                _render_top3(q1, "🔺 同步淨加碼 Top3(個股)", stock_agg, "stock_code",
+                             lambda c: f"{c} {dash_changes_val[dash_changes_val['stock_code']==c]['stock_name'].iloc[0]}",
+                             ascending=False)
+                _render_top3(q2, "🔻 同步淨減碼 Top3(個股)", stock_agg, "stock_code",
+                             lambda c: f"{c} {dash_changes_val[dash_changes_val['stock_code']==c]['stock_name'].iloc[0]}",
+                             ascending=True)
+                _render_top3(q3, "🔺 ETF 淨加碼 Top3", etf_agg, "etf_code", etf_label, ascending=False)
+                _render_top3(q4, "🔻 ETF 淨減碼 Top3", etf_agg, "etf_code", etf_label, ascending=True)
+
+            st.divider()
 
         common_df = cached_common_changes(etf_conn, etf_db_mtime, common_date, scope_codes, min_etf_count)
         if common_df.empty:
@@ -929,45 +1158,74 @@ with tab3:
                 ))
 
                 if not events_df.empty:
-                    bullish_dates, bullish_y, bullish_text = [], [], []
-                    bearish_dates, bearish_y, bearish_text = [], [], []
+                    # 2026-09-03再修正：改成跟「6_Stock simulator.py」B/S標記完全一樣的
+                    # 「實色底色文字方塊 + 箭頭」樣式(claude/圖表標記與回測功能優化_實作記錄_0903.md)，
+                    # 取代原本「三角形marker旁邊直接貼文字(bottom/top center)」的做法——
+                    # 原本的做法文字位置由plotly自動貼在marker旁邊，K棒密集時文字仍常常
+                    # 貼到隔壁蠟燭。改成 fig.add_annotation()，文字方塊用固定像素距離
+                    # (ax=0/ay)撐開到蠟燭範圍外、箭頭指回錨點，並比照同一份記錄裡「同一套
+                    # 防重疊堆疊機制」的精神：同一小段日期範圍內有多筆標記時依序往外疊，
+                    # 不會疊在同一個位置看不清楚。
+                    # 錨點沿用上面已經修正過的當天Low(加碼/買)/High(減碼/賣)。
+                    dates_list = ohlcv_df.index.tolist()
+                    ANNOTATION_CLUSTER_WINDOW = 2  # 跟Stock simulator同一份記錄裡的分組寬度一致
+                    ANNOTATION_BASE_OFFSET = 28
+                    ANNOTATION_STACK_STEP = 22
+                    ann_slot_count = {}
+
+                    bullish_dates, bullish_y = [], []
+                    bearish_dates, bearish_y = [], []
+
                     for _, ev in events_df.iterrows():
                         d = ev["change_date"]
                         if d not in ohlcv_df.index:
                             continue
-                        y = ohlcv_df.loc[d, "High"] if ev["direction"] in ("加碼", "新納入") else ohlcv_df.loc[d, "Low"]
+                        is_bullish = ev["direction"] in ("加碼", "新納入")
+                        y = ohlcv_df.loc[d, "Low"] if is_bullish else ohlcv_df.loc[d, "High"]
                         label = ev["direction"]
-                        if ev["direction"] in ("加碼", "新納入"):
+                        color = MARK_COLOR_BUY if is_bullish else MARK_COLOR_SELL
+
+                        if is_bullish:
                             bullish_dates.append(d)
                             bullish_y.append(y)
-                            bullish_text.append(label)
                         else:
                             bearish_dates.append(d)
                             bearish_y.append(y)
-                            bearish_text.append(label)
 
-                    # 2026-08-24調整：標記/文字都放大(原本三角形12px/文字9px在密集K棒裡太不明顯，
-                    # 使用者反應看不清楚)，並加白色描邊讓三角形跟K棒顏色接近時也能分辨出來。
+                        try:
+                            pos = dates_list.index(d)
+                        except ValueError:
+                            pos = 0
+                        slot_key = (pos // ANNOTATION_CLUSTER_WINDOW, is_bullish)
+                        slot = ann_slot_count.get(slot_key, 0)
+                        ann_slot_count[slot_key] = slot + 1
+                        offset = ANNOTATION_BASE_OFFSET + slot * ANNOTATION_STACK_STEP
+                        ay = offset if is_bullish else -offset
+
+                        fig.add_annotation(
+                            x=d, y=y, text=label, showarrow=True, arrowhead=1,
+                            arrowcolor=color, font=dict(color="white", size=11),
+                            bgcolor=color, ax=0, ay=ay,
+                        )
+
+                    # 保留小三角形marker(不附文字)，純粹標出錨點位置+提供圖例，
+                    # 實際的方向文字已經改由上面的 add_annotation 負責顯示。
                     if bullish_dates:
                         fig.add_trace(go.Scatter(
-                            x=bullish_dates, y=bullish_y, mode="markers+text",
+                            x=bullish_dates, y=bullish_y, mode="markers",
                             marker=dict(
-                                symbol="triangle-up", size=20, color=MARK_COLOR_BUY,
+                                symbol="triangle-up", size=14, color=MARK_COLOR_BUY,
                                 line=dict(width=1.5, color="white"),
                             ),
-                            text=bullish_text, textposition="top center",
-                            textfont=dict(size=15, color=MARK_COLOR_BUY),
                             name=f"{chart_etf_code} 加碼/新納入",
                         ))
                     if bearish_dates:
                         fig.add_trace(go.Scatter(
-                            x=bearish_dates, y=bearish_y, mode="markers+text",
+                            x=bearish_dates, y=bearish_y, mode="markers",
                             marker=dict(
-                                symbol="triangle-down", size=20, color=MARK_COLOR_SELL,
+                                symbol="triangle-down", size=14, color=MARK_COLOR_SELL,
                                 line=dict(width=1.5, color="white"),
                             ),
-                            text=bearish_text, textposition="bottom center",
-                            textfont=dict(size=15, color=MARK_COLOR_SELL),
                             name=f"{chart_etf_code} 減碼/全數賣出",
                         ))
                 else:
