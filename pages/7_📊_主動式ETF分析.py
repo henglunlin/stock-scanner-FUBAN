@@ -1203,7 +1203,7 @@ with tab3:
                         ay = offset if is_bullish else -offset
 
                         fig.add_annotation(
-                            x=d, y=y, text=label, showarrow=True, arrowhead=1, arrowsize=0.6,
+                            x=d, y=y, text=label, showarrow=True, arrowhead=2, arrowsize=0.4,
                             arrowcolor=color, font=dict(color="white", size=11),
                             bgcolor=color, ax=0, ay=ay,
                         )
