@@ -1991,6 +1991,34 @@ def run_backtest_simulation(
 
 
 # --------------------------------------------------------------------------
+# 圖表標記防重疊 (2026-09-03)：K線圖上總共有 4 套各自獨立的文字標記系統
+# (①一般訊號標記 ②趨勢線突破/跌破的觸發標籤 ③模擬回測 B/S 標記 ④交易紀錄菱形標記)，
+# 原本各自只在「自己這套系統內、同一天」做防重疊錯開，彼此之間互不相通，導致行情轉折時
+# (常常正好是多套系統同時觸發的時候) 疊出一團文字。這裡改用一個「全部共用」的堆疊計數器：
+# 用 display_pos(日期在圖表可視範圍內的整數位置) // ANNOTATION_CLUSTER_WINDOW 分組，讓
+# 相鄰1~2個交易日內、不管來自哪一套系統的標記，都算進同一疊，依序往外一層一層疊上去；
+# 且一律固定 ax=0（不再左右歪斜），純粹用 ay 垂直堆疊，畫出來才會是整齊的一排文字，
+# 而不是東一個西一個的散開。買入方向(direction="down")往下疊、賣出方向("up")往上疊。
+# --------------------------------------------------------------------------
+ANNOTATION_CLUSTER_WINDOW = 2
+ANNOTATION_BASE_AY = 26
+ANNOTATION_STEP_AY = 24
+
+
+def _next_annotation_slot(stack_state, display_pos, d, direction, cluster_window=ANNOTATION_CLUSTER_WINDOW):
+    bucket = (display_pos.get(d, 0) // cluster_window, direction)
+    slot = stack_state.get(bucket, 0)
+    stack_state[bucket] = slot + 1
+    return slot
+
+
+def _stacked_ay(stack_state, display_pos, d, direction, base=ANNOTATION_BASE_AY, step=ANNOTATION_STEP_AY):
+    slot = _next_annotation_slot(stack_state, display_pos, d, direction)
+    sign = 1 if direction == "down" else -1
+    return (base + slot * step) * sign
+
+
+# --------------------------------------------------------------------------
 # RUN: 讀取資料 + 執行訊號判斷 + 執行回測
 # --------------------------------------------------------------------------
 if run_clicked:
@@ -2157,11 +2185,15 @@ with chart_placeholder:
             fig.add_hline(y=35, line=dict(color="#27ae60", width=1, dash="dash"), annotation_text="35", annotation_position="right", row=3, col=1)
         fig.update_yaxes(title_text=sub_indicator, row=3, col=1)
 
+        # 2026-09-03：display_dates/display_pos 提前到這裡計算(原本在訊號標記迴圈之後)，
+        # 因為下面統一的「防重疊堆疊計數器」annotation_stack 需要用 display_pos 判斷哪些日期
+        # 算「鄰近」。annotation_stack 由本區塊內全部 4 套標記系統(訊號標記/趨勢線觸發標籤/
+        # B-S標記/交易紀錄菱形)共用，見函式定義處說明。
+        display_dates = display_df.index.tolist()
+        display_pos = {dt: i for i, dt in enumerate(display_dates)}
+        annotation_stack = {}
+
         color_idx = 0
-        # 2026-09-03：同一天若有多個訊號標記(尤其是「觸發日」的文字標籤)疊在一起會互相蓋住文字，
-        # 這裡用 signal_mark_day_count 記錄「這個日期目前已經放了幾個標記」，每多放一個就把
-        # ay(垂直距離)、ax(水平位移)依序遞增錯開，讓同一天多個訊號的文字不會完全重疊。
-        signal_mark_day_count = {}
         for key, res in results.items():
             # trendline_breakout / asc_trendline_breakdown 的 marks 是
             # (tier_key, anchor1_date, anchor2_date, tier_hit) + ("scan", date) 的特殊結構，
@@ -2172,35 +2204,39 @@ with chart_placeholder:
 
             label = st.session_state.signal_registry[key]["label"]
 
-            # 若為賣出訊號，字在K線上方(ay負值)往下指；買入訊號，字在K線下方(ay正值)往上指
+            # 若為賣出訊號，字在K線上方往下指；買入訊號，字在K線下方往上指
             if label in SELL_LABELS:
                 color = "#27ae60" # 綠色
                 y_col = "High"
-                ay_dir = -1
+                direction = "up"
             else:
                 color = MARK_COLORS[color_idx % len(MARK_COLORS)]
                 color_idx += 1
                 y_col = "Low"
-                ay_dir = 1
+                direction = "down"
 
             last_idx = len(res.marks) - 1
             for i, d in enumerate(res.marks):
                 if d not in display_df.index: continue
                 is_trigger = (i == last_idx)
 
-                offset_n = signal_mark_day_count.get(d, 0)
-                signal_mark_day_count[d] = offset_n + 1
+                if is_trigger:
+                    # 只有「觸發日」才顯示文字標籤，因此只有它需要納入堆疊計數，
+                    # 統一固定 ax=0，靠 ay 垂直堆疊排整齊。
+                    ay_val = _stacked_ay(annotation_stack, display_pos, d, direction)
+                    fig.add_annotation(
+                        x=d, y=display_df.loc[d, y_col], text=label, showarrow=True,
+                        arrowhead=2, arrowcolor=color, font=dict(color=color, size=12),
+                        ax=0, ay=ay_val, row=1, col=1
+                    )
+                else:
+                    # 非觸發日：只畫小箭頭不顯示文字，不佔用堆疊版位
+                    fig.add_annotation(
+                        x=d, y=display_df.loc[d, y_col], text="", showarrow=True,
+                        arrowhead=1, arrowcolor=color, ax=0,
+                        ay=22 if direction == "down" else -22, row=1, col=1
+                    )
 
-                ay_val = (40 if is_trigger else 22) * ay_dir + (offset_n * 16 * ay_dir)
-                ax_val = offset_n * 12
-
-                fig.add_annotation(
-                    x=d, y=display_df.loc[d, y_col], text=label if is_trigger else "", showarrow=True,
-                    arrowhead=2 if is_trigger else 1, arrowcolor=color, font=dict(color=color, size=12),
-                    ax=ax_val, ay=ay_val, row=1, col=1
-                )
-
-        display_dates = display_df.index.tolist()
         tres = results.get(TREND_SIGNAL_KEY)
         if tres is not None and tres.marks:
             scan_d = None
@@ -2228,7 +2264,7 @@ with chart_placeholder:
                         x=scan_d, y=display_df.loc[scan_d, "Close"],
                         text=style["hit_label"], showarrow=True, arrowhead=2,
                         arrowcolor=style["color"], font=dict(color=style["color"], size=12),
-                        ax=0, ay=30, row=1, col=1,
+                        ax=0, ay=_stacked_ay(annotation_stack, display_pos, scan_d, "down"), row=1, col=1,
                     )
 
         # ===== 上升趨勢線跌破 (asc_trendline_breakdown)：畫出支撐線 + 跌破標籤 =====
@@ -2265,7 +2301,7 @@ with chart_placeholder:
                         x=scan_d, y=display_df.loc[scan_d, "Close"],
                         text=style["hit_label"], showarrow=True, arrowhead=2,
                         arrowcolor=style["color"], font=dict(color=style["color"], size=12),
-                        ax=0, ay=-30, row=1, col=1,
+                        ax=0, ay=_stacked_ay(annotation_stack, display_pos, scan_d, "up"), row=1, col=1,
                     )
 
         if enable_backtest:
@@ -2273,6 +2309,8 @@ with chart_placeholder:
             # 避免箭頭指向的點剛好落在K線蠟燭實體內部造成重疊、看不清楚。
             # 同時原本用「日期: 價格」的 dict 會讓同一天第2筆以後的交易直接覆蓋掉第1筆(資料遺失)，
             # 改成「日期: [價格清單]」，同一天多筆時合併顯示為「B×2」這種形式，不再遺失任何一筆。
+            # ay 一律改用跟其他標記系統共用的 annotation_stack 堆疊計數器(見函式定義處說明)，
+            # 讓 B/S 標記與訊號標記/趨勢線標籤/交易紀錄菱形彼此之間也會互相錯開，不再各畫各的。
             buy_markers = {}
             sell_markers = {}
             for t in trades:
@@ -2286,7 +2324,7 @@ with chart_placeholder:
                 fig.add_annotation(
                     x=d, y=display_df.loc[d, "Low"], text=text, showarrow=True, arrowhead=1,
                     arrowcolor="#e74c3c", font=dict(color="white", size=10), bgcolor="#e74c3c",
-                    ax=0, ay=30, row=1, col=1,
+                    ax=0, ay=_stacked_ay(annotation_stack, display_pos, d, "down"), row=1, col=1,
                 )
             for d, prices in sell_markers.items():
                 if d not in display_df.index: continue
@@ -2294,19 +2332,19 @@ with chart_placeholder:
                 fig.add_annotation(
                     x=d, y=display_df.loc[d, "High"], text=text, showarrow=True, arrowhead=1,
                     arrowcolor="#2ecc71", font=dict(color="white", size=10), bgcolor="#2ecc71",
-                    ax=0, ay=-30, row=1, col=1,
+                    ax=0, ay=_stacked_ay(annotation_stack, display_pos, d, "up"), row=1, col=1,
                 )
 
         # ============ 交易紀錄 (Trading Journal) 標記：實際手動交易的買/賣點 ============
         # 用菱形符號區分於上方模擬回測的 B/S 方框標記，避免混淆「模擬」與「實際」交易
-        # 顏色改用藍色系；位移距離加大，避免跟模擬買賣訊號(B/S方框)的位置重疊
+        # 顏色改用藍色系
         # 2026-09-03：菱形點本身維持在真實成交價(jp)不動 —— 這是使用者實際成交的價格，
-        # 移到Low/High會失真；只調整旁邊的文字標籤，比照上面訊號標記(#2)的邏輯，同一天
-        # 多筆交易時依序把ay(距離)、ax(水平位移)遞增錯開，避免文字互相重疊蓋住。
+        # 移到Low/High會失真；只調整旁邊的文字標籤，一樣改用共用的 annotation_stack 堆疊計數器，
+        # 讓交易紀錄跟其他 3 套標記系統統一排版；因為交易紀錄是本區塊最後畫的，
+        # 天然會疊在最外層(離K線最遠)，不會蓋住比較靠近價格的訊號/B-S標記。
         journal_df_all = st.session_state.get("journal_log_df", pd.DataFrame(columns=JOURNAL_COLUMNS))
         journal_for_stock = journal_df_all[journal_df_all["股票代碼"].astype(str) == str(code)] if not journal_df_all.empty else journal_df_all
         if not journal_for_stock.empty:
-            journal_day_count = {}
             for _, jr in journal_for_stock.iterrows():
                 jd = jr["交易日期"]
                 if jd not in display_df.index:
@@ -2325,15 +2363,12 @@ with chart_placeholder:
                     showlegend=False,
                 ), row=1, col=1)
 
-                offset_n = journal_day_count.get(jd, 0)
-                journal_day_count[jd] = offset_n + 1
-                ay_dir = 1 if not is_sell else -1
-                ay_val = (85 + offset_n * 18) * ay_dir
-                ax_val = offset_n * 14
+                direction = "down" if not is_sell else "up"
+                ay_val = _stacked_ay(annotation_stack, display_pos, jd, direction, base=60)
 
                 fig.add_annotation(
                     x=jd, y=jp, text=method, showarrow=True, arrowhead=1, arrowcolor=color,
-                    font=dict(color=color, size=10), ax=ax_val, ay=ay_val, row=1, col=1,
+                    font=dict(color=color, size=10), ax=0, ay=ay_val, row=1, col=1,
                 )
 
         # 查價線(垂直十字線)設定：
