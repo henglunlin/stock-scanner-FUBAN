@@ -86,3 +86,99 @@ jobs:
             git add trendline_levels.json
           fi
           git diff --quiet && git diff --staged --quiet || (git commit -m "Sync latest twse_ohlcv.db + trendline_levels.json from scanner" && git push origin ${TARGET_BRANCH})
+
+      # ================================================================
+      # henglunlin-stock-monitor_verII（React 新版）
+      # ================================================================
+      # ⚠️ 這一段跟上面兩個目標有兩點不同，都是刻意的：
+      #
+      # 1. **stock_groups.json 絕對不碰。**
+      #    _verII 的分組由它自己的「股票分類編輯」介面維護，按儲存時後端直接用
+      #    GitHub API 推上去，_verII 就是那個檔案的唯一真實來源。從這裡蓋進去
+      #    會把當天編好的分組洗掉，而且不會有任何錯誤訊息——只會發現分組莫名
+      #    其妙變回舊的。所以下面用**逐檔 git add**，不用 git add -A，
+      #    再加一道 diff 檢查當安全網。
+      #
+      # 2. **共用程式碼從 target_repo_2（FUBAN）複製，不是從 scanner 自己。**
+      #    scanner 這個 repo 自己的 signal_module 已經跟 FUBAN／_verII 岔開了
+      #    （14 支內容不同，而且 scanner 沒有 precomputed_trendline_breakout.py
+      #    與 priority.py）。從 scanner 推過去會直接弄壞 _verII 的趨勢線訊號與
+      #    優先序。FUBAN 那份跟 _verII 是逐位元組一致的，所以來源用 FUBAN。
+      #    「統一在這支 workflow 推」的目標不變，只是搬運的來源是 FUBAN。
+      #
+      # trendline_levels.json 用 _verII **自己的** stock_groups.json 重算一次，
+      # 不共用 FUBAN 的結果——兩個 repo 的股票清單已經不一樣了，共用會讓
+      # _verII 新增的股票沒有趨勢線資料，而且畫面上是空的、不會報錯。
+      - name: Push DB + 共用檔到 henglunlin-stock-monitor_verII（不含 stock_groups.json）
+        env:
+          TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+          TARGET_REPO: "henglunlin/henglunlin-stock-monitor_verII"
+          TARGET_BRANCH: "main"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p target_repo_3
+          git clone https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${TARGET_REPO}.git target_repo_3
+
+          # 最新的行情資料庫
+          cp twse_ohlcv.db target_repo_3/
+
+          # 共用程式碼與資料檔：來源是 FUBAN 的 clone（見上面第 2 點）。
+          # 清單刻意很短——只推 _verII 沒有自己維護的東西。
+          if [ -d target_repo_2/signal_module ]; then
+            rsync -a --delete \
+              --exclude='__pycache__/' \
+              target_repo_2/signal_module/ target_repo_3/signal_module/
+          else
+            echo "::warning::找不到 target_repo_2/signal_module，略過訊號模組同步"
+          fi
+          # TWstocklistname2.txt 刻意不推：那份股票代碼／名稱對照表由 _verII 自己管理。
+          for f in target_price_list.json precompute_trendlines.py; do
+            if [ -f "target_repo_2/$f" ]; then
+              rsync -a "target_repo_2/$f" "target_repo_3/$f"
+            else
+              echo "::warning::FUBAN 沒有 $f，略過"
+            fi
+          done
+
+          cd target_repo_3
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # 用 _verII 自己的 stock_groups.json 重算趨勢線
+          if [ -f "precompute_trendlines.py" ]; then
+            pip install --quiet pandas requests
+            python precompute_trendlines.py \
+              || echo "::warning::_verII 的 precompute_trendlines.py 執行失敗，本次略過 trendline_levels.json"
+          else
+            echo "::warning::target_repo_3 找不到 precompute_trendlines.py，略過趨勢線預先計算"
+          fi
+
+          # 安全網：stock_groups.json 一個位元組都不該變。變了就讓 workflow 失敗，
+          # 而不是安靜地把使用者當天編的分組送出去。失敗看得到，靜默覆蓋看不到。
+          if ! git diff --quiet -- stock_groups.json; then
+            echo "::error::_verII 的 stock_groups.json 被這一步改動了，這不該發生。"
+            echo "::error::該檔案由 _verII 的分類編輯器維護，這支 workflow 只能讀、不能寫。"
+            git --no-pager diff --stat -- stock_groups.json
+            exit 1
+          fi
+
+          # 逐檔 add。刻意不用 git add -A —— 即使將來有人在上面多加了複製動作，
+          # 沒有列在這裡的檔案也進不了 commit。
+          # ⚠️ 用 if 不用 `[ -f x ] && git add x`：在 set -e 底下，最後一行的
+          #    測試失敗會讓整個 step 以非 0 結束，變成「檔案剛好不存在就整支掛掉」。
+          git add twse_ohlcv.db
+          for p in signal_module target_price_list.json \
+                   precompute_trendlines.py trendline_levels.json
+          do
+            if [ -e "$p" ]; then git add "$p"; fi
+          done
+
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "沒有變動，不產生 commit"
+          else
+            git commit -m "Sync twse_ohlcv.db / signal_module / trendline_levels.json from scanner"
+            git push origin ${TARGET_BRANCH}
+          fi
