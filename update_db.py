@@ -9,11 +9,25 @@ from typing import Any
 
 import benchmark_utils
 
+# 本機執行時從專案根目錄的 .env 讀取 TELEGRAM_BOT_TOKEN 等環境變數
+# （在 GitHub Actions 上這些值是由 secrets 直接注入，沒有 .env 檔，這段會自動略過）。
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TWSE_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 TPEX_URL = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+
+# 執行環境標記：GitHub Actions 會自動設 GITHUB_ACTIONS=true，其餘（GMK 排程）視為 LHL 伺服器。
+# Telegram 訊息用它來區分是哪一邊跑的，避免兩邊同時在跑時分不出來。
+IS_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+RUN_TAG = "【GitHub Actions】" if IS_GITHUB_ACTIONS else "【LHL 伺服器】"
+RUN_ICON = "☁️" if IS_GITHUB_ACTIONS else "🖥️"
 DB_NAME = "twse_ohlcv.db"
 
 # ======== 新增 Telegram 推播函數 ========
@@ -196,9 +210,10 @@ if __name__ == "__main__":
     # 如果這兩天之中至少有一天有資料，就發送 Telegram 推播
     if has_valid_data:
         success_msg = (
-            f"✅ <b>自動資料庫更新成功</b>\n" +
+            f"{RUN_ICON} <b>{RUN_TAG}資料庫更新成功</b>\n" +
             "\n".join(summary_lines) +
-            f"\n🤖 Github Actions 已將資料推回 Repo。"
+            ("\n🤖 GitHub Actions 已將資料推回 Repo。" if IS_GITHUB_ACTIONS
+             else "\n🏠 已寫入 LHL 伺服器本機 twse_ohlcv.db。")
         )
         send_telegram_message(success_msg)
     else:
